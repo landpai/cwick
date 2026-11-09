@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>cwick · 本地对话</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236f8cff'/%3E%3Ctext x='16' y='23' font-family='-apple-system,sans-serif' font-size='19' font-weight='700' fill='%230b0d12' text-anchor='middle'%3Ec%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/web/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <div class="logo">c</div>
+      <div class="brand-text">
+        <strong>cwick</strong>
+        <span id="brandSub">GLM-5.3-Flash</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item is-active" data-view="chat">
+        <span class="ico">◍</span><span>对话</span>
+      </button>
+      <button class="nav-item" data-view="apps">
+        <span class="ico">▦</span><span>应用</span>
+      </button>
+      <button class="nav-item" data-view="models">
+        <span class="ico">⇩</span><span>模型</span>
+      </button>
+      <button class="nav-item" data-view="logs">
+        <span class="ico">≡</span><span>日志</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <span class="ico">⚙</span><span>设置</span>
+      </button>
+    </nav>
+
+    <div class="rail-section" id="sessionSection">
+      <div class="rail-head">
+        <span>会话</span>
+        <button id="newChat" class="ghost-btn" title="新建会话 (Ctrl/⌘+K)">＋</button>
+      </div>
+      <div id="sessionList" class="sessions"></div>
+    </div>
+
+    <div class="rail-foot">
+      <div class="mem">
+        <div class="mem-row"><span>常驻内存</span><span id="memLabel" class="mono">—</span></div>
+        <div class="bar"><i id="memBar"></i></div>
+      </div>
+      <div class="chips">
+        <span id="backendChip" class="chip">backend —</span>
+        <span id="ctxChip" class="chip">ctx —</span>
+      </div>
+      <div class="link-row">
+        <a href="/v1/models" target="_blank" rel="noreferrer">/v1/models</a>
+        <a href="/v1/config" target="_blank" rel="noreferrer">/v1/config</a>
+        <a href="/v1/metrics" target="_blank" rel="noreferrer">/v1/metrics</a>
+        <a href="#" id="apiHelp">API</a>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="title">
+        <h1 id="viewTitle">对话</h1>
+        <p id="viewSub">流式输出 · 思考强度可控 · 同源调用本机 OpenAI 兼容接口</p>
+      </div>
+      <div class="topbar-right">
+        <span id="connPill" class="pill"><i class="dot wait"></i><span>连接中</span></span>
+        <span id="livePill" class="pill mono" title="上一次生成的解码速度">— tok/s</span>
+      </div>
+    </header>
+
+    <!-- ---------------- chat ---------------- -->
+    <section id="chatView" class="view view-chat">
+      <div id="messages" class="messages">
+        <div class="empty" id="emptyState">
+          <div class="empty-logo">c</div>
+          <h2>在这台 Mac 上直接对话</h2>
+          <p>页面由 cwick 自己托管，请求发往同源的 <code>/v1/chat/completions</code>、
+             <code>/v1/responses</code> 或 <code>/v1/messages</code>（下方"接口"可选）。
+             模型全程本地运行，权重走 SSD 流式，对话不出机器。</p>
+          <div class="examples">
+            <button class="example" data-prompt="用三句话解释 Mixture-of-Experts 为什么能在低内存机器上跑大模型。">解释 MoE 与低内存</button>
+            <button class="example" data-prompt="写一个 C 函数，把 UTF-8 字符串按标点切分成句子，要求不破坏多字节字符。">写一段 C 代码</button>
+            <button class="example" data-prompt="现在是 2026 年，帮我规划一个为期两周的 Metal 推理内核优化计划，按天拆解。">做一份计划</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer-wrap">
+        <div class="queue-note" id="queueNote" hidden>
+          <i class="spinner"></i><span id="queueText">等待生成槽…</span>
+          <button id="leaveQueue" class="link-btn">撤销</button>
+        </div>
+        <div class="composer" id="composer">
+          <textarea id="input" rows="1" placeholder="给 cwick 发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+          <div class="composer-side">
+            <button id="sendBtn" class="send" title="发送 (Enter)">
+              <span aria-hidden="true">↑</span>
+            </button>
+            <button id="stopBtn" class="stop" hidden title="停止生成 (Esc)">■</button>
+          </div>
+        </div>
+        <div class="controls">
+          <label class="field" title="这一轮对话调用的接口：两者都走同一个引擎，只是请求/响应的信封不同">
+            <span>接口</span>
+            <select id="apiSel">
+              <option value="chat" selected>chat/completions</option>
+              <option value="responses">responses</option>
+              <option value="messages">messages</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>思考强度</span>
+            <select id="effort">
+              <option value="off">关</option>
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+              <option value="ultra">超高</option>
+              <option value="extreme" selected>极致</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>最大输出</span>
+            <input id="maxTokens" type="number" min="16" max="1000000" step="64" value="2048">
+          </label>
+          <label class="switch"><input id="streamToggle" type="checkbox" checked><span>流式</span></label>
+          <label class="switch" title="声明 get_current_time / add_numbers / system_info，模型调用时由页面在本地执行"><input id="toolToggle" type="checkbox"><span>示例工具</span></label>
+          <span class="spacer"></span>
+          <span id="genStats" class="gen-stats mono"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------- apps ---------------- -->
+    <section id="appsView" class="view view-apps" hidden>
+      <div class="apps-market" id="appMarket">
+        <div class="apps-intro">
+          <div>
+            <h2>应用市场</h2>
+            <p>应用代码放在 <code>apps/&lt;id&gt;/</code>，由 <code>apps/manifest.json</code>
+               登记并编译进 cwick 二进制；每个应用都在自己的 iframe 里调用同源 OpenAI 接口。</p>
+          </div>
+          <div class="apps-intro-side">
+            <span id="appApiState" class="pill mono"><i class="dot wait"></i>API 检查中</span>
+            <button id="appRefresh" class="min-btn">刷新</button>
+          </div>
+        </div>
+        <div id="appGrid" class="app-grid">
+          <div class="app-loading muted">读取 <code>/apps/manifest.json</code>…</div>
+        </div>
+      </div>
+
+      <div class="app-host" id="appHost" hidden>
+        <div class="app-host-bar">
+          <button id="appBack" class="min-btn">← 应用市场</button>
+          <div class="app-host-title">
+            <h2 id="appHostTitle">应用</h2>
+            <p id="appHostSub">由 cwick 托管</p>
+          </div>
+          <span class="spacer"></span>
+          <a id="appOpenTab" class="min-btn" href="#" target="_blank" rel="noreferrer">新窗口打开</a>
+        </div>
+        <iframe id="appFrame" class="app-frame" title="cwick 应用"
+                src="about:blank" allow="clipboard-write"></iframe>
+      </div>
+    </section>
+
+    <!-- ---------------- logs ---------------- -->
+    <section id="logsView" class="view view-logs" hidden>
+      <div class="logbar">
+        <div class="logbar-left">
+          <label class="field">
+            <span>来源</span>
+            <select id="logSrc">
+              <option value="all">全部</option>
+              <option value="out">stdout</option>
+              <option value="err">stderr</option>
+            </select>
+          </label>
+          <label class="field grow">
+            <span>过滤</span>
+            <input id="logQuery" type="search" placeholder="包含关键字 / req 12 / memory" autocomplete="off">
+          </label>
+        </div>
+        <div class="logbar-right">
+          <label class="switch small"><input id="logWrap" type="checkbox"><span>换行</span></label>
+          <label class="switch small"><input id="logFollow" type="checkbox" checked><span>跟随</span></label>
+          <button id="logPause" class="min-btn">暂停</button>
+          <button id="logClear" class="min-btn">清屏</button>
+          <button id="logSave" class="min-btn">下载</button>
+        </div>
+      </div>
+
+      <div id="logBody" class="log-body"></div>
+
+      <div class="log-foot">
+        <span id="logCount" class="mono">0 行</span>
+        <span id="logDrop" class="mono muted" hidden></span>
+        <span class="spacer"></span>
+        <span id="logState" class="mono">未连接</span>
+        <span class="mono muted">GET /v1/logs/stream</span>
+      </div>
+    </section>
+
+    <!-- ---------------- model library ---------------- -->
+    <section id="modelsView" class="view view-models" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>本地模型</h3>
+            <p>已下载到 <code id="hubRootLabel">./models</code> 的权重；下载中的任务单独列在下面</p>
+          </div>
+          <button id="hubRefresh" class="min-btn">刷新</button>
+        </div>
+        <div id="hubLocal" class="hub-grid">
+          <div class="model-row muted">读取中…</div>
+        </div>
+        <div id="hubLocalNote" class="note" hidden></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>正在下载</h3>
+            <p>进度、速率与剩余时间每秒刷新；暂停或中断后从 <code>.incomplete</code> 断点续传</p>
+          </div>
+          <span id="hubPoll" class="mono muted"></span>
+        </div>
+        <div id="hubJobs" class="hub-jobs">
+          <div class="model-row muted">没有下载任务</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>检索模型</h3>
+            <p>从 <code id="hubEndpointLabel">hf-mirror</code> 只读检索，下载由本机服务端执行，权重落到 <code>./models</code></p>
+          </div>
+        </div>
+        <div class="hub-search">
+          <input id="hubQuery" type="search" autocomplete="off" spellcheck="false"
+                 placeholder="模型名或组织，例如 Qwen3 / MiniMax / deepseek">
+          <button id="hubSearchBtn" class="min-btn accent">检索</button>
+        </div>
+        <div id="hubSearchNote" class="note" hidden></div>
+        <div id="hubResults" class="hub-results">
+          <div class="model-row muted">输入关键词开始检索</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------- settings (console merged in) ---------------- -->
+    <section id="settingsView" class="view view-settings" hidden>
+      <div class="cards">
+        <div class="card accent">
+          <div class="card-label">解码速度</div>
+          <div class="card-value" id="mTokS">—</div>
+          <div class="card-foot" id="mTokSFoot">来自 cwick:decode_step_seconds</div>
+        </div>
+        <div class="card">
+          <div class="card-label">首字延迟 TTFT</div>
+          <div class="card-value" id="mTtft">—</div>
+          <div class="card-foot">vllm:time_to_first_token_seconds</div>
+        </div>
+        <div class="card">
+          <div class="card-label">每输出 token</div>
+          <div class="card-value" id="mTpot">—</div>
+          <div class="card-foot">vllm:time_per_output_token_seconds</div>
+        </div>
+        <div class="card">
+          <div class="card-label">累计 tokens</div>
+          <div class="card-value" id="mTokens">—</div>
+          <div class="card-foot" id="mTokensFoot">prompt / generation</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>监控趋势</h3>
+            <p>每 2 秒采样 <code>/v1/metrics</code> · 速率取相邻两次采样的差值，不是累计均值 · 保留最近 4 分钟</p>
+          </div>
+          <div class="trend-head">
+            <span class="pill mono" id="trendSpan">采集中…</span>
+            <label class="switch small"><input id="liveToggle" type="checkbox" checked><span>实时刷新</span></label>
+            <a class="min-btn" href="/v1/metrics" target="_blank" rel="noreferrer">Prometheus 原文</a>
+            <button id="trendClear" class="min-btn">清空</button>
+          </div>
+        </div>
+        <div class="trend-grid">
+          <div class="trend-cell">
+            <div class="trend-title"><span>解码速度 · tok/s</span><b id="trendTokS" class="mono">—</b></div>
+            <canvas id="chartTokS" width="600" height="130"></canvas>
+            <div class="trend-axis" id="axisTokS">—</div>
+          </div>
+          <div class="trend-cell">
+            <div class="trend-title"><span>进程常驻 · GiB</span><b id="trendMem" class="mono">—</b></div>
+            <canvas id="chartMem" width="600" height="130"></canvas>
+            <div class="trend-axis" id="axisMem">—</div>
+          </div>
+          <div class="trend-cell">
+            <div class="trend-title"><span>缓存命中率 · %</span><b id="trendHit" class="mono">—</b></div>
+            <canvas id="chartHit" width="600" height="130"></canvas>
+            <div class="trend-axis" id="axisHit">专家 #6f8cff · 前缀 #9b7bff</div>
+          </div>
+          <div class="trend-cell">
+            <div class="trend-title"><span>首字延迟 · s</span><b id="trendTtft" class="mono">—</b></div>
+            <canvas id="chartTtft" width="600" height="130"></canvas>
+            <div class="trend-axis" id="axisTtft">—</div>
+          </div>
+        </div>
+        <div class="note" id="trendNote" hidden></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>Prometheus 指标</h3>
+            <p>直读 <code>/v1/metrics</code> 原文的全部序列 · 点任意指标为它单独画趋势 · 计数器可切成每秒增量</p>
+          </div>
+          <div class="trend-head">
+            <span class="pill mono" id="pmCount">—</span>
+            <label class="switch small" title="对 counter 按每秒增量绘制；gauge 保持原始值"><input id="pmRate" type="checkbox"><span>每秒增量</span></label>
+            <button id="pmClear" class="min-btn">清空选择</button>
+          </div>
+        </div>
+        <div class="pm-tools">
+          <input id="pmQuery" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="筛选指标名，例如 cache / tokens / seconds">
+          <span class="mono muted" id="pmSelNote">未选择指标</span>
+        </div>
+        <div id="pmCharts" class="pm-charts">
+          <div class="pm-empty muted">从下方列表点选指标，即可为它单独画一条趋势线（最多 4 个）。</div>
+        </div>
+        <div class="pm-list-head">
+          <span class="mono muted">序列</span>
+          <span class="mono muted">类型 / 说明</span>
+          <span class="mono muted">当前值</span>
+          <span></span>
+        </div>
+        <div id="pmList" class="pm-list"><div class="muted">等待第一次指标采样…</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>内存与缓存</h3>
+            <p>80% 常驻上限，其余由 F_NOCACHE SSD 流式补齐</p>
+          </div>
+          <span class="pill mono" id="mUptimePill">—</span>
+        </div>
+        <div class="meters">
+          <div class="meter">
+            <div class="meter-row"><span>进程常驻</span><span id="mMemLabel" class="mono">—</span></div>
+            <div class="bar tall"><i id="mMemBar"></i></div>
+          </div>
+          <div class="meter">
+            <div class="meter-row"><span>专家缓存命中率</span><span id="mHitLabel" class="mono">—</span></div>
+            <div class="bar tall"><i id="mHitBar" class="green"></i></div>
+          </div>
+          <div class="meter">
+            <div class="meter-row"><span>前缀缓存命中率</span><span id="mPfxLabel" class="mono">—</span></div>
+            <div class="bar tall"><i id="mPfxBar" class="violet"></i></div>
+          </div>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span>请求 运行 / 排队</span><b id="mReq" class="mono">—</b></div>
+          <div class="kv"><span>SSD 流式 / token</span><b id="mStream" class="mono">—</b></div>
+          <div class="kv"><span>解码步数</span><b id="mSteps" class="mono">—</b></div>
+          <div class="kv"><span>运行时长</span><b id="mUptime" class="mono">—</b></div>
+          <div class="kv"><span>预填充进度</span><b id="mPrefill" class="mono">—</b></div>
+          <div class="kv"><span>已完成请求</span><b id="mSuccess" class="mono">—</b></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div><h3>模型信息</h3><p>编译期与运行期配置，来自 cwick:model_info 与 /v1/config</p></div>
+          <span class="pill mono" id="mBackend">—</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span>模型</span><b id="mModel">—</b></div>
+          <div class="kv"><span>稀疏度</span><b id="mSparse" class="mono">—</b></div>
+          <div class="kv"><span>层数</span><b id="mLayers" class="mono">—</b></div>
+          <div class="kv"><span>上下文窗口</span><b id="mCtx" class="mono">—</b></div>
+          <div class="kv"><span>权重精度</span><b id="mSpine" class="mono">—</b></div>
+          <div class="kv"><span>指标端点</span><b><a href="/v1/metrics" target="_blank" rel="noreferrer">Prometheus</a></b></div>
+        </div>
+        <div class="model-info-note">
+          <span class="mono muted">cwick:model_info 全部标签</span>
+          <div id="modelInfoAll" class="label-list mono">等待第一次指标采样…</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>本地模型</h3>
+            <p>切换会释放当前常驻权重并清空前缀缓存；生成中会被拒绝（409）</p>
+          </div>
+          <button id="modelsRefresh" class="min-btn">刷新</button>
+        </div>
+        <div id="modelList" class="model-list">
+          <div class="model-row muted">读取中…</div>
+        </div>
+        <div id="switchNote" class="note" hidden></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>生成参数</h3>
+            <p>存在本机浏览器里，对话页与这里共用同一份设置</p>
+          </div>
+        </div>
+        <div class="set-grid">
+          <label class="row">
+            <span>对话接口</span>
+            <select id="setApi">
+              <option value="chat">/v1/chat/completions</option>
+              <option value="responses">/v1/responses</option>
+              <option value="messages">/v1/messages</option>
+            </select>
+          </label>
+          <label class="row">
+            <span>思考强度</span>
+            <select id="setEffort">
+              <option value="off">关</option>
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+              <option value="ultra">超高</option>
+              <option value="extreme">极致</option>
+            </select>
+          </label>
+          <label class="row">
+            <span>最大输出 token</span>
+            <input id="setMaxTokens" type="number" min="16" max="1000000" step="64" value="2048">
+          </label>
+          <label class="row switch"><span>流式输出</span><input id="setStream" type="checkbox"></label>
+          <label class="row switch"><span>声明示例工具</span><input id="setTools" type="checkbox"></label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>安全</h3>
+            <p>单用户登录；会话 Cookie 只在 cwick 内存中，不落盘</p>
+          </div>
+          <button id="logoutBtn" class="min-btn">退出登录</button>
+        </div>
+        <div id="authState" class="note">读取登录状态…</div>
+
+        <div class="key-panel">
+          <div class="key-head">
+            <h4>API 密钥（外部 Agent 接入本机 cwick）</h4>
+            <p>长期有效的 Bearer 密钥，适合粘贴到 Cursor / Claude Code / OpenAI SDK 脚本里。
+               这是<b>对外提供</b>访问凭证；控制台自身只访问本机同源接口，不会把对话发往外部服务。
+               会话 Cookie 只在内存、重启即失效，密钥不会。</p>
+          </div>
+          <div class="key-new">
+            <input id="keyName" type="text" autocomplete="off" spellcheck="false"
+                   maxlength="48" placeholder="名字，例如 cursor / claude-code">
+            <button id="keyCreate" class="min-btn accent" type="button">新建密钥</button>
+            <button id="keyRefresh" class="min-btn" type="button">刷新</button>
+          </div>
+          <div id="keyList" class="key-list">
+            <div class="muted">读取中…</div>
+          </div>
+          <div id="keySecret" class="key-secret" hidden>
+            <code id="keySecretText"></code>
+            <button id="keyCopy" class="min-btn" type="button">复制</button>
+            <span class="muted">只显示这一次 —— 服务端只保留它的哈希</span>
+          </div>
+          <div id="keyNote" class="note">
+            用法：<code>Authorization: Bearer &lt;key&gt;</code> 或 <code>X-API-Key: &lt;key&gt;</code>。
+            密钥本身不能新建密钥（会被 401 拒绝），只能在登录后在这里撤销。
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>运行配置</h3>
+            <p>由启动命令行决定，进程内只读；改这些值需要重启 cwick</p>
+          </div>
+          <button id="configRefresh" class="min-btn">刷新</button>
+        </div>
+        <div class="kv-grid" id="cfgGrid">
+          <div class="kv"><span>监听</span><b id="cfgListen" class="mono">—</b></div>
+          <div class="kv"><span>生成槽</span><b id="cfgSlots" class="mono">—</b></div>
+          <div class="kv"><span>上下文窗口</span><b id="cfgCtx" class="mono">—</b></div>
+          <div class="kv"><span>max_tokens 上限</span><b id="cfgMaxTok" class="mono">—</b></div>
+          <div class="kv"><span>请求体上限</span><b id="cfgReqBytes" class="mono">—</b></div>
+          <div class="kv"><span>前缀缓存</span><b id="cfgPfx" class="mono">—</b></div>
+          <div class="kv"><span>日志采集</span><b id="cfgLogs" class="mono">—</b></div>
+          <div class="kv"><span>Web / 详细 / 追踪</span><b id="cfgFlags" class="mono">—</b></div>
+          <div class="kv"><span>模型库</span><b id="cfgLibrary" class="mono">—</b></div>
+          <div class="kv"><span>目录服务</span><b id="cfgCatalog" class="mono">—</b></div>
+        </div>
+        <div class="note">
+          <span class="mono muted">模型目录</span>
+          <div id="cfgDirs" class="dir-list mono">—</div>
+          <div class="muted">用 <code>--models-dir</code> 追加扫描目录（最多 8 个），
+            目录里需要有 <code>config.json</code> 与权重文件才会被识别。</div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="statusbar">
+      <span id="statusText" class="mono">就绪</span>
+      <span class="spacer"></span>
+      <span class="mono muted">cwick serve --web</span>
+    </footer>
+  </main>
+</div>
+
+<dialog id="apiDialog" class="dialog">
+  <h3>接入方式</h3>
+  <p>这个页面只访问本机同源接口。下面这个地址是给外部客户端连本机 cwick 用的：</p>
+  <pre><code id="apiBase">http://127.0.0.1:8000/v1</code></pre>
+  <p class="muted">curl 示例（chat/completions）</p>
+  <pre><code>curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"你好"}]}'</code></pre>
+  <p class="muted">同一台服务也答 Responses 协议（Codex 等客户端用这个）</p>
+  <pre><code>curl http://127.0.0.1:8000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","input":"你好","stream":true}'</code></pre>
+  <p class="muted">以及 Anthropic 的 Messages 协议（Claude Code 用这个）</p>
+  <pre><code>curl http://127.0.0.1:8000/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","max_tokens":128,"stream":true,
+       "messages":[{"role":"user","content":"你好"}]}'</code></pre>
+  <form method="dialog"><button class="send wide">知道了</button></form>
+</dialog>
+
+<script src="/web/app.js"></script>
+</body>
+</html>

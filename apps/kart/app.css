@@ -1,0 +1,277 @@
+/* cwick app: 3D 泡泡卡丁车 — a Möbius-strip racer whose obstacles are chosen by
+ * the resident model. Standalone H5 served from /apps/kart/; the visual
+ * language matches the other cwick apps (dark panel page, canvas stage on the
+ * left, telemetry column on the right). */
+:root {
+  --bg: #070a0f;
+  --panel: #0f141c;
+  --panel-2: #151b25;
+  --line: #202836;
+  --line-soft: #171d27;
+  --text: #e9edf4;
+  --muted: #8a94a6;
+  --faint: #596173;
+  --accent: #56d8ff;
+  --accent-soft: rgba(86, 216, 255, 0.12);
+  --pink: #ff7fd0;
+  --green: #3ddc97;
+  --amber: #f5b95c;
+  --red: #ff6f7d;
+  --violet: #a78bfa;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter",
+          "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+* { box-sizing: border-box; }
+/* `hidden` has to beat the layout rules below: the share sheet is a flex box. */
+.hidden, [hidden] { display: none !important; }
+
+html, body {
+  margin: 0; min-height: 100%; background: var(--bg); color: var(--text);
+  font-family: var(--sans); font-size: 14px; -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+ul { margin: 0; padding: 0; list-style: none; }
+button, select { font: inherit; color: inherit; }
+
+/* ---------------------------------------------------------------- shell -- */
+.app { display: flex; flex-direction: column; min-height: 100vh; }
+
+.head {
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px 18px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #0d1219, #0a0e14);
+}
+.back { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.back:hover { color: var(--text); text-decoration: none; }
+.title { flex: 1; min-width: 0; }
+.title h1 { font-size: 16px; display: flex; align-items: center; gap: 8px; }
+.title h1 span {
+  font-size: 10px; font-weight: 600; letter-spacing: 1px; color: var(--accent);
+  border: 1px solid rgba(86, 216, 255, 0.35); border-radius: 4px; padding: 1px 5px;
+}
+.title p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+.score { display: flex; gap: 16px; color: var(--muted); font-size: 12px; }
+.score b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+.stage {
+  flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 14px; padding: 14px; min-height: 0;
+}
+.screen {
+  position: relative; border: 1px solid var(--line); border-radius: 14px;
+  overflow: hidden; background: #04070b; min-height: 0;
+  box-shadow: 0 18px 50px -30px #000 inset;
+}
+#cv { display: block; width: 100%; height: 100%; }
+
+/* ------------------------------------------------------------------ hud -- */
+.hud {
+  position: absolute; left: 14px; top: 12px; display: flex; gap: 8px;
+  flex-wrap: wrap; pointer-events: none;
+}
+.chip {
+  display: flex; align-items: baseline; gap: 4px; padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.09); border-radius: 9px;
+  background: rgba(6, 10, 16, 0.62); backdrop-filter: blur(6px);
+  font-size: 11px; color: var(--muted);
+}
+.chip b {
+  font-size: 16px; color: var(--text); font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.chip.mode { color: var(--accent); border-color: rgba(86, 216, 255, 0.28); }
+
+/* -------------------------------------------------------------- overlay -- */
+.overlay {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; padding: 22px;
+  background: radial-gradient(60% 55% at 50% 45%, rgba(4, 8, 14, 0.72), rgba(4, 8, 14, 0.94));
+}
+.overlay.off { display: none; }
+.panel {
+  width: min(440px, 100%); text-align: center; padding: 26px 24px;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: linear-gradient(180deg, rgba(19, 25, 35, 0.96), rgba(11, 15, 22, 0.96));
+  box-shadow: 0 30px 70px -40px #000;
+}
+.panel h2 { font-size: 20px; margin-bottom: 10px; }
+.panel .sub { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 6px 0; }
+.panel .keys { color: var(--faint); font-size: 12px; margin: 14px 0 0; }
+#btnStart {
+  margin-top: 16px; padding: 11px 26px; border: 0; border-radius: 10px;
+  background: linear-gradient(180deg, #63deff, #2ea8d6); color: #04121a;
+  font-weight: 700; cursor: pointer;
+}
+#btnStart:hover { filter: brightness(1.08); }
+
+/* ----------------------------------------------------------------- touch -- */
+.touch { position: absolute; inset: auto 0 74px 0; display: none; justify-content: space-between; padding: 0 14px; }
+.touch button {
+  width: 74px; height: 58px; border-radius: 14px; cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.12); color: var(--text);
+  background: rgba(8, 12, 18, 0.66); backdrop-filter: blur(6px); font-size: 15px;
+}
+.touch button:active { background: rgba(86, 216, 255, 0.22); }
+#tBoost { flex: 0 0 96px; color: var(--accent); }
+
+/* ------------------------------------------------------------------ foot -- */
+.foot {
+  position: absolute; left: 12px; right: 12px; bottom: 12px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.sel { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.sel select {
+  padding: 5px 8px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: rgba(10, 14, 20, 0.9); color: var(--text);
+}
+.ghost {
+  padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px;
+  border: 1px solid var(--line); background: rgba(10, 14, 20, 0.9); color: var(--muted);
+}
+.ghost:hover { color: var(--text); border-color: #2b3546; }
+.ghost.wide { width: 100%; margin-top: 10px; }
+
+/* ----------------------------------------------------------------- side --- */
+.side {
+  display: flex; flex-direction: column; min-height: 0;
+  border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+  background: linear-gradient(180deg, #0e131b, #0b0f16);
+}
+.side-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 13px 15px; border-bottom: 1px solid var(--line-soft);
+}
+.side-head h2 { font-size: 13px; }
+.side-head p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-top: 6px; }
+.dot.on { background: var(--green); box-shadow: 0 0 0 3px rgba(61, 220, 151, 0.16); }
+.dot.busy { background: var(--amber); box-shadow: 0 0 0 3px rgba(245, 185, 92, 0.16); }
+
+.tabs { display: flex; gap: 2px; padding: 8px 10px 0; }
+.tab {
+  flex: 1; padding: 7px 6px; cursor: pointer; font-size: 12px;
+  border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0;
+  background: transparent; color: var(--muted);
+}
+.tab.on { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+.pane { display: none; padding: 12px; overflow-y: auto; min-height: 0; flex: 1; }
+.pane.on { display: flex; flex-direction: column; gap: 12px; }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.cell {
+  padding: 9px 10px; border: 1px solid var(--line-soft); border-radius: 9px;
+  background: var(--panel);
+}
+.cell span { display: block; color: var(--muted); font-size: 10px; letter-spacing: 0.3px; }
+.cell b {
+  display: block; margin-top: 4px; font-size: 17px; font-variant-numeric: tabular-nums;
+}
+.cell b i { font-style: normal; font-size: 11px; color: var(--muted); margin-left: 3px; }
+.cell.accent b { color: var(--accent); }
+.cell.pink b { color: var(--pink); }
+.cell.green b { color: var(--green); }
+
+.bars { display: flex; flex-direction: column; gap: 6px; }
+.bar-row { display: grid; grid-template-columns: 46px 1fr 26px; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); }
+.bar { height: 6px; border-radius: 3px; background: #1b2230; overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; transition: width 0.3s; }
+.bar-row b { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+
+.block { border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.block.grow { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.block h3 { font-size: 11px; color: var(--muted); letter-spacing: 0.4px; margin-bottom: 7px; font-weight: 600; }
+.mono { font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--text); margin: 0; word-break: break-word; }
+.note { color: var(--faint); font-size: 11.5px; margin: 6px 0 0; }
+
+.feed { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; min-height: 60px; }
+.feed li {
+  font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--muted);
+  padding: 6px 8px; border-radius: 7px; background: #0d131b;
+  border-left: 2px solid var(--line);
+}
+.feed li b { color: var(--text); font-weight: 600; }
+.feed li.agent { border-left-color: var(--accent); }
+.feed li.local { border-left-color: var(--faint); }
+.feed li.hit { border-left-color: var(--red); }
+.feed li.pick { border-left-color: var(--green); }
+.feed li.lap { border-left-color: var(--violet); }
+
+.games { display: flex; flex-direction: column; gap: 6px; max-height: 190px; overflow-y: auto; }
+.games li {
+  padding: 7px 9px; border: 1px solid var(--line-soft); border-radius: 8px;
+  background: var(--panel); cursor: pointer; font-size: 11.5px; color: var(--muted);
+  display: flex; justify-content: space-between; gap: 8px;
+}
+.games li:hover { border-color: #2a3444; }
+.games li.on { border-color: rgba(86, 216, 255, 0.45); background: #101a24; }
+.games li b { color: var(--text); font-weight: 600; }
+.games li span { font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------ responsive -- */
+@media (max-width: 1080px) {
+  .stage { grid-template-columns: minmax(0, 1fr) 330px; }
+}
+@media (max-width: 900px) {
+  .stage { grid-template-columns: 1fr; grid-template-rows: minmax(260px, 54vh) auto; }
+  .side { max-height: none; }
+  .title p { display: none; }
+  .score { display: none; }
+  .touch { display: flex; inset: auto 0 64px 0; }
+  .touch button { width: 62px; height: 46px; border-radius: 12px; font-size: 14px; }
+  #tBoost { flex: 0 0 78px; }
+  .foot { font-size: 11px; }
+  .pane { max-height: 42vh; }
+  /* While a sheet is up (start / paused / summary) the driving controls would
+   * sit on top of its button — and they do nothing until the race starts. */
+  .overlay:not(.off) ~ .touch,
+  .overlay:not(.off) ~ .foot { display: none; }
+  .overlay { overflow-y: auto; align-items: flex-start; padding: 10px; }
+  .panel { margin: auto; max-height: 100%; }
+}
+@media (max-width: 560px) {
+  .head { padding: 9px 12px; gap: 10px; }
+  .stage { padding: 9px; gap: 9px; grid-template-rows: minmax(240px, 52vh) auto; }
+  .chip b { font-size: 14px; }
+  .chip { padding: 5px 8px; }
+  .foot .ghost { padding: 5px 9px; }
+  .panel { padding: 18px 14px; }
+  .panel h2 { font-size: 17px; }
+  .panel .sub { font-size: 12px; line-height: 1.5; margin: 4px 0; }
+  .panel .keys { margin-top: 10px; font-size: 11px; }
+  #btnStart { margin-top: 10px; padding: 10px 20px; }
+}
+
+/* ---------------- share / QR ----------------
+ * The button asks GET /v1/share?app=kart for an address a phone on the same
+ * Wi-Fi can reach, then renders it through GET /v1/share/qr as a PNG. If the
+ * listener is loopback-only the server says so and the sheet explains why
+ * there is no code. */
+.share-dialog {
+  border: 1px solid var(--line); border-radius: 18px; padding: 0;
+  background: var(--panel); color: var(--text); width: min(440px, calc(100% - 28px));
+}
+.share-dialog::backdrop { background: rgba(4, 6, 10, 0.72); backdrop-filter: blur(3px); }
+.share-head { display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; padding: 18px 18px 12px; border-bottom: 1px solid var(--line-soft); }
+.share-head h3 { margin: 0; font-size: 16px; }
+.share-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.share-close { border: 0; background: transparent; color: var(--faint);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 2px 6px; }
+.share-close:hover { color: var(--text); }
+.share-body { padding: 16px 18px 20px; display: flex; flex-direction: column;
+  align-items: center; gap: 12px; text-align: center; }
+.share-body img { width: min(280px, 72vw); height: auto; border-radius: 10px;
+  background: #fff; padding: 8px; image-rendering: pixelated; }
+.share-link { display: flex; align-items: center; gap: 8px; width: 100%; }
+.share-link code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; text-align: left; font-size: 10.5px; padding: 7px 9px;
+  border: 1px solid var(--line-soft); border-radius: 8px; background: #080b11;
+  color: #c3cede; }
+.share-note { margin: 0; color: var(--faint); font-size: 10.5px; line-height: 1.6; }
+.share-note.bad { color: var(--amber); }
+/* the header is a flex row without wrap: the button keeps its width and the
+ * title gives way, which is what keeps it on one line at 900-1100 px */
+#share { flex: 0 0 auto; white-space: nowrap; }

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "name": "cwick apps",
+  "apps": [
+    {
+      "id": "tictactoe",
+      "name": "九宫格井字棋",
+      "tag": "H5",
+      "icon": "井",
+      "version": "1.0.0",
+      "entry": "/apps/tictactoe/index.html",
+      "description": "人机对战，你执 X 先手。每一步棋盘都会发给 cwick，由模型决定 O 的落子；右侧栏实时展示请求、模型原文、决策理由与耗时。",
+      "meta": "3 × 3 · 人机 · 决策回放 · localStorage"
+    },
+    {
+      "id": "kart",
+      "name": "3D 泡泡卡丁车",
+      "tag": "H5",
+      "icon": "车",
+      "version": "3.0.0",
+      "entry": "/apps/kart/index.html",
+      "description": "H5 3D 跑圈小游戏：莫比乌斯环赛道，跑满一圈会翻面。前方路障只有一个来源——当前模型：每颗都由 /v1/systemone 在“种类 × 车道”的 12 个选项里实时选出，前方距离按速度由本地算出，模型不答路上就不放东西（没有本地随机兜底）。右侧栏展示模型决策统计与卡丁车跑圈数据，全部写入服务端 sqlite。",
+      "meta": "3D · 莫比乌斯 · AI 实时放路障 · 跑圈 · sqlite"
+    }
+  ]
+}

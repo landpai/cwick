@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>3D 泡泡卡丁车 · cwick app</title>
+<link rel="stylesheet" href="/apps/kart/app.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="head">
+    <a class="back" href="/#apps" target="_top">← cwick</a>
+    <div class="title">
+      <h1>3D 泡泡卡丁车 <span>跑圈</span></h1>
+      <p id="status">莫比乌斯环赛道 · 路障全部由当前模型实时生成</p>
+    </div>
+    <div class="score">
+      <span>最佳 <b id="bestScore">0</b> 分</span>
+      <span>最多 <b id="bestLap">0</b> 圈</span>
+    </div>
+    <button id="share" class="ghost" type="button">分享 / 二维码</button>
+  </header>
+
+  <main class="stage">
+    <div class="screen">
+      <canvas id="cv"></canvas>
+
+      <div class="hud">
+        <div class="chip"><b id="hSpeed">0</b><span>km/h</span></div>
+        <div class="chip"><b id="hLap">0</b><span>圈</span></div>
+        <div class="chip"><b id="hScore">0</b><span>分</span></div>
+        <div class="chip mode" id="hMode">待命</div>
+      </div>
+
+      <div class="overlay" id="overlay">
+        <div class="panel">
+          <h2>3D 泡泡卡丁车</h2>
+          <p class="sub">一条旋转半圈粘起来的赛道：跑满一圈会<b>翻面</b>，内侧变外侧。</p>
+          <p class="sub">前方路障只由一个来源产生——<b>当前模型</b>。它读着你的圈数、速度、
+            碰撞数、前方路况与莫比乌斯环翻面状态；每次决策都会重新洗牌选项、换一个随机加压点，
+            让模型<b>实时随机地</b>把跑圈难度拉满，选出下一颗路障的类型与车道。距离由车速派生，
+            保证看得见、来得及躲；模型不答，路上就不放东西。</p>
+          <button id="btnStart">开始跑圈</button>
+          <p class="keys">← → / A D 转向 · 空格加速 · 手机可拖动转向</p>
+        </div>
+      </div>
+
+      <div class="touch" id="touch">
+        <button id="tLeft" aria-label="左转">◀</button>
+        <button id="tBoost" aria-label="加速">加速</button>
+        <button id="tRight" aria-label="右转">▶</button>
+      </div>
+
+      <div class="foot">
+        <label class="sel">画质
+          <select id="quality">
+            <option value="0.72">流畅</option>
+            <option value="1" selected>标准</option>
+            <option value="1.35">锐利</option>
+          </select>
+        </label>
+        <button id="btnStop" class="ghost">结束本局</button>
+        <button id="btnPause" class="ghost">暂停</button>
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="side-head">
+        <div>
+          <h2>AI 路障 · 卡丁车统计</h2>
+          <p id="sideStatus">等待开始</p>
+        </div>
+        <span class="dot" id="live"></span>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab on" data-tab="ai">AI 路障</button>
+        <button class="tab" data-tab="car">卡丁车</button>
+        <button class="tab" data-tab="hist">历史</button>
+      </nav>
+
+      <section class="pane on" id="tab-ai">
+        <div class="grid" id="aiStats"></div>
+        <div class="bars" id="typeBars"></div>
+        <div class="block">
+          <h3>最近一次决策</h3>
+          <p class="mono" id="aiLast">—</p>
+        </div>
+        <div class="block grow">
+          <h3>决策流</h3>
+          <ul class="feed" id="feed"></ul>
+        </div>
+      </section>
+
+      <section class="pane" id="tab-car">
+        <div class="grid" id="carStats"></div>
+        <div class="block">
+          <h3>本局</h3>
+          <p class="mono" id="runLine">—</p>
+        </div>
+        <div class="block">
+          <h3>生涯</h3>
+          <p class="mono" id="lifeLine">—</p>
+        </div>
+        <div class="block grow">
+          <h3>最近事件</h3>
+          <ul class="feed" id="eventFeed"></ul>
+        </div>
+      </section>
+
+      <section class="pane" id="tab-hist">
+        <div class="block">
+          <h3>已完成的对局</h3>
+          <ul class="games" id="games"></ul>
+          <p class="note" id="histEmpty">还没有历史记录。</p>
+        </div>
+        <div class="block grow">
+          <h3>回放</h3>
+          <ul class="feed" id="replay"></ul>
+        </div>
+        <button class="ghost wide" id="btnClear">清空历史</button>
+      </section>
+    </aside>
+  </main>
+</div>
+<dialog id="shareDialog" class="share-dialog">
+  <div class="share-head">
+    <div>
+      <h3>手机扫码继续跑圈</h3>
+      <p>手机与这台 Mac 连同一个 Wi-Fi，扫描后即可独立打开这个应用。</p>
+    </div>
+    <button id="shareClose" class="share-close" type="button" aria-label="关闭">×</button>
+  </div>
+  <div class="share-body">
+    <img id="qrImg" alt="应用二维码" width="280" height="280" hidden>
+    <div class="share-link">
+      <code id="shareUrl">正在读取服务地址…</code>
+      <button id="copyShare" class="ghost" type="button">复制链接</button>
+    </div>
+    <p id="shareNote" class="share-note"></p>
+  </div>
+</dialog>
+<script src="/apps/kart/app.js"></script>
+</body>
+</html>

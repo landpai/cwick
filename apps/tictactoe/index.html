@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>九宫格井字棋 · cwick app</title>
+<link rel="stylesheet" href="/apps/tictactoe/app.css">
+</head>
+<body>
+<div class="app">
+  <header class="head">
+    <a class="back" href="/#apps" target="_top">← cwick</a>
+    <div class="title">
+      <h1>九宫格井字棋 <span>H5</span></h1>
+      <p id="status">你执 X，先手。点击棋盘落子。</p>
+    </div>
+    <div class="score" aria-label="战绩">
+      <span>你 <b id="win">0</b></span>
+      <span>平 <b id="draw">0</b></span>
+      <span>机器 <b id="loss">0</b></span>
+    </div>
+    <button id="share" class="btn" type="button">分享 / 二维码</button>
+    <button id="newGame" class="btn accent" type="button">新一局</button>
+  </header>
+
+  <main class="body">
+    <section class="board-wrap">
+      <div id="board" class="board" role="grid" aria-label="九宫格井字棋棋盘"></div>
+      <div class="foot">
+        <span id="turn" class="pill"><i class="dot"></i><span>轮到你（X）</span></span>
+        <span id="modelLabel" class="mono muted">模型 —</span>
+        <span class="spacer"></span>
+        <button id="resetScore" class="link" type="button">清空战绩</button>
+      </div>
+      <p class="note">
+        棋盘编号 0–8（行优先）。<b>你执 X，先手</b>；机器 = O。机器每一手都是一次真实的
+        <code>/v1/systemone</code> 决策：把棋盘与各空格的战术事实（立即成三、拦截、后续制胜点、
+        可用连线）交给当前模型，问它<b>落在哪一格赢的概率最大</b>，一次 prefill 读出每个空格的
+        概率，取最高者落子，不生成任何文本。本机 320B 模型每次落子通常需要 1–3 分钟，请耐心等待。
+      </p>
+    </section>
+
+    <aside class="side">
+      <div class="side-head">
+        <div>
+          <h2>对局决策</h2>
+          <p>人机双方的落子与依据 · 模型对每个空格的胜率读数</p>
+        </div>
+        <div class="side-tabs" role="tablist">
+          <button id="tabNow" class="tab is-active" type="button" role="tab">当前对局</button>
+          <button id="tabHistory" class="tab" type="button" role="tab">历史回放</button>
+        </div>
+        <span id="count" class="mono muted">0</span>
+      </div>
+      <div class="side-note">
+        <span id="storeBadge" class="chip mono" title="对局与战绩的存储位置">存储 —</span>
+        <span class="spacer"></span>
+        <button id="clearHistory" class="link" type="button">清空历史</button>
+      </div>
+      <div id="log" class="log">
+        <div class="muted empty">开局后，这里会记录每一步：你落子形成的威胁、发给模型的棋盘与各格战术事实、模型对每个空格的胜率读数、实际落子、耗时与兜底判断。</div>
+      </div>
+      <div id="history" class="log" hidden>
+        <div class="muted empty">正在读取服务端的对局历史…</div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<dialog id="shareDialog" class="share-dialog">
+  <div class="share-head">
+    <div>
+      <h3>手机扫码继续下棋</h3>
+      <p>手机与这台 Mac 连同一个 Wi-Fi，扫描后即可独立打开这个应用。</p>
+    </div>
+    <button id="shareClose" class="share-close" type="button" aria-label="关闭">×</button>
+  </div>
+  <div class="share-body">
+    <img id="qrImg" alt="应用二维码" width="280" height="280" hidden>
+    <div class="share-link">
+      <code id="shareUrl">正在读取服务地址…</code>
+      <button id="copyShare" class="btn" type="button">复制链接</button>
+    </div>
+    <p id="shareNote" class="share-note"></p>
+  </div>
+</dialog>
+
+<script src="/apps/tictactoe/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "id": "tictactoe",
+  "name": "九宫格井字棋",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "description": "3x3 tic-tac-toe against the local model; the board, move history and decision trail are rendered beside the game.",
+  "storage": "server sqlite via /v1/apps/tictactoe (games + events + state), localStorage:cwick.ttt.v1 fallback"
+}

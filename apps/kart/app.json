@@ -1,0 +1,8 @@
+{
+  "id": "kart",
+  "name": "泡泡卡丁车",
+  "version": "3.0.0",
+  "entry": "index.html",
+  "description": "Lap-running 3D kart on a Mobius strip. The resident model is the only source of obstacles: each one is a /v1/systemone decision (a 12-way choice of obstacle kind and lane) placed ahead in real time, with the option letters shuffled, a fresh variation seed and a random pressure point so every decision aims to maximise lap difficulty. The sidebar shows obstacle statistics, kart statistics and the decision variation; every spawn, hit and lap is stored in sqlite.",
+  "storage": "server sqlite via /v1/apps/kart (games + events + state), localStorage:cwick.kart.v3 fallback"
+}
