@@ -20,6 +20,7 @@
  */
 #include "cwick.h"
 #include "json.h"
+#include "models.h"
 #include "util.h"
 
 #include <stdlib.h>
@@ -528,6 +529,22 @@ cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
     if (!model_type) model_type = cwick_json_str(cwick_json_get(root, "model_type"));
     if (!model_type) { cwick_json_free(root); return CWICK_ERR_CONTRACT; }
     snprintf(spec->model_type, sizeof(spec->model_type), "%s", model_type);
+
+    /* The remaining parser is the GLM geometry contract. Without this guard an
+     * unknown architecture is silently measured against that contract and dies
+     * on whichever GLM-only field it happens to reach first: a nested config
+     * whose `text_config.pad_token_id` is null reported "missing pad_token_id"
+     * even though the outer object had one, which says nothing about the real
+     * problem (there are no kernels for that architecture). Refuse by name. */
+    if (!cwick_model_type_supported(model_type)) {
+        cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
+                        "unsupported model_type \"%s\": this build implements the "
+                        "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 kernels only; "
+                        "downloading a checkpoint does not make it loadable",
+                        model_type);
+        cwick_json_free(root);
+        return CWICK_ERR_UNSUPPORTED;
+    }
 
     if (strcmp(model_type, "deepseek_v41") == 0 ||
         strcmp(model_type, "deepseek_v41_text") == 0) {

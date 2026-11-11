@@ -113,11 +113,16 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   `/v1/systemone` 决策；状态在服务端而不是 localStorage。
 - 模型库（`hub.c`）：权重落 `./models/<owner>/<name>/`，`.incomplete` + Range 断点续传，
   后台任务表 + 目录只读检索；五个 `/v1/hub/*` 端点都在生成槽位之前应答。
+  `DELETE /v1/hub/models/<name>` 删除已下载 checkpoint（递归、realpath 限制在库根内、
+  拒绝常驻模型与正在下载的目录），同一请求内把 catalog 条目一并移除。
   `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` 覆盖目录服务地址；启动时扫描 `./models` 进 catalog。
 - 鉴权：PBKDF2 单用户登录 + Bearer + HttpOnly cookie；`--api-key NAME` 给
   Agent 平台签发具名 key（只存哈希），`POST|GET|DELETE /v1/auth/keys` 管理。
-- 热切换：`POST /v1/models/switch`，生成或排队中返回 409。
-- `make test`：**613 项断言，当前全 PASS**（`./tests/test_cwick` 每项一行 `ok:`）。
+- 热切换：`POST /v1/models/switch` 先做只读的模型契约 dry-run，通过后才释放旧模型。未知架构或
+  config 不合法返回 400 且常驻模型不动；生成或排队中返回 409。`/v1/models` 与
+  `/v1/hub/models` 都报 `supported`（发现目录时算好缓存，轮询不会在生成锁内读文件），
+  `cwick:model_loaded` 是实时 1/0 指标。
+- `make test`：**651 项断言，当前全 PASS**（`./tests/test_cwick` 每项一行 `ok:`）。
 - `cwick doctor`、`download_model.sh`（断点续传、>100 GiB、一行进度）。
 
 ### ⚠️ 已知但还算能用
@@ -174,7 +179,7 @@ web/              控制台源码：index.html / app.js / app.css / login.html
 apps/             两个 H5 应用 + manifest.json
 models/           在线下载的权重（gitignore，启动时扫描）
 docs/             架构、存储、性能、决策、服务端、精度、DeepSeek 移植（中英各一份）
-tests/test_cwick.c 613 项断言
+tests/test_cwick.c 651 项断言
 tools/            独立 C 探针：内核基准、分层测试、模型运行器
 start.sh          推荐入口：前缀缓存 + web + 局域网 + 三个模型目录 + 密码
 ```
@@ -201,7 +206,7 @@ start.sh          推荐入口：前缀缓存 + web + 局域网 + 三个模型�
 
 ```sh
 git clone <repo> cwick && cd cwick
-make && make test                      # 约 12 s，613 项
+make && make test                      # 约 12 s，651 项
 
 ./download_model.sh deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     -o ./deepseek-ai/DeepSeek-V4.1-Flash-1017 \

@@ -202,7 +202,8 @@ decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)
 
 `--web` 由二进制自己提供单页控制台——磁盘上没有静态资源，没有第二个进程，和 API 同端口。五个标签页：**对话**（流式，端点在 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 之间由面板上的**接口**选择切换，三者走同一条渲染路径，reasoning 与 tool calls 分区显示）、**应用**（应用市场）、**模型**（模型库）、**日志**（本进程的 stdout/stderr，环形缓冲，所以浏览器能跟住一个长期运行的 serve）、**设置**（控制台与设置合一）。设置页同时承载实时 `/v1/metrics`：解码速度、常驻内存、专家/前缀缓存命中率、TTFT 的四分钟趋势图；还有一个 Prometheus 指标浏览器：列出 `/v1/metrics` 全部序列的
 HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）为它单独画趋势，计数器还能切成每秒
-增量；再加 `cwick:model_info` 的全部标签、生成参数自定义、只读运行配置，以及本地模型切换。所有请求都是同源的，**没有**把控制台指向外部 OpenAI 兼容地址的选项；仍可签发具名 API key 供其他客户端接入本机 cwick。
+增量；再加 `cwick:model_info` 的全部标签、`cwick:model_loaded` 实时状态位、生成参数自定义、
+只读运行配置，以及本地模型切换（本构建无法装载的条目标为不支持且不可选）。所有请求都是同源的，**没有**把控制台指向外部 OpenAI 兼容地址的选项；仍可签发具名 API key 供其他客户端接入本机 cwick。
 
 **模型**标签页列出 `./models` 下已下载的权重、正在下载的任务（进度、速率、ETA），并提供模型目录的只读检索。下载由服务端后台执行：可暂停、继续、失败重试、取消；中断留下的部分文件在重启后用 Range 请求续传。单分片超过 100 GiB、整个仓库几百 GiB 全程用 64 位尺寸处理。五个接口与落盘布局见 `docs/SERVER.zh-CN.md`。
 
@@ -247,8 +248,8 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/models` | 常驻模型，加上 `--models-dir` 下找到的可切换模型 |
-| POST | `/v1/models/switch` | 卸一个、映射另一个；生成或排队中返回 409 |
+| GET | `/v1/models` | 常驻模型，加上 `--models-dir` 下找到的模型；每条带 `supported` / `unsupported_reason` |
+| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409 |
 | POST | `/v1/completions` | 纯文本补全，流式或非流式 |
 | POST | `/v1/chat/completions` | messages、`stream`、`tools`、`reasoning_effort` |
 | POST | `/v1/responses` | Responses 方言：输入 `input` items，输出 `response` 对象 / `response.*` 事件 |
@@ -256,6 +257,7 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | POST | `/v1/systemone` | 一次 prefill 读出类型化决策（choice / score / noul），需要 `--jev`；也可用 `/inference/v1/systemone` |
 | GET | `/v1/systemone` | 当前决策适配器：家族、prompt 语法、可读字母、各项上限 |
 | GET | `/v1/hub/models` | `./models` 下已下载的 checkpoint，含大小与完整状态 |
+| DELETE | `/v1/hub/models/<name>` | 删除已下载的 checkpoint（递归，限制在 `./models` 内）；常驻模型或正在下载时返回 409 |
 | GET | `/v1/hub/downloads` | 下载任务实时状态：进度、速率、ETA、错误 |
 | GET | `/v1/hub/search?q=…` | 模型目录只读检索（默认 hf-mirror） |
 | POST | `/v1/hub/download` | 启动/续传 `{"repo":"owner/name"}` 到 `./models/owner/name` |
@@ -392,7 +394,7 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 Beta，且变化很快。每个改动都先在这台机器上量过才留下，输掉的那些写在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) 里——包括那些看起来显而易见的。
 
 ```sh
-make test        # 613 项断言：引擎、采样、前缀缓存、服务端、web UI、应用
+make test        # 651 项断言：引擎、采样、前缀缓存、服务端、web UI、应用
 make bench       # 不加载 checkpoint 也能测内核
 ```
 
@@ -446,7 +448,7 @@ cwick/
 ├── apps/              两个 H5 应用与 manifest.json
 ├── models/            在线下载的权重（.gitignore）
 ├── docs/              架构、存储、性能、决策、服务端、精度
-├── tests/             test_cwick.c——613 项检查
+├── tests/             test_cwick.c——651 项检查
 ├── tools/             独立的 C 探针：内核、分层测试、模型运行器
 ├── start.sh           推荐入口（前缀缓存 + web + 局域网 + 密码）
 └── download_model.sh  可断点续传的 checkpoint 下载

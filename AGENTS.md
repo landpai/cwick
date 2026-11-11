@@ -146,12 +146,20 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   localStorage.
 - Model library (`hub.c`): `./models/<owner>/<name>/`, resumable `.incomplete` files,
   a background job table, read-only catalog search; five `/v1/hub/*` endpoints are
-  answered before the generation slot. `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` override
-  the catalog host; `./models` is scanned into the catalog at startup.
+  answered before the generation slot. `DELETE /v1/hub/models/<name>` removes a
+  downloaded checkpoint (recursive, realpath-confined to the root, refuses the
+  resident model and an active download), and the catalog entry is dropped in the
+  same request. `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` override the catalog host;
+  `./models` is scanned into the catalog at startup.
 - Auth: PBKDF2 single-user login + Bearer + HttpOnly cookie; `--api-key NAME` mints a named
   key for agent platforms (hash only), managed via `POST|GET|DELETE /v1/auth/keys`.
-- Model switching: `POST /v1/models/switch`, 409 while a request is generating or queued.
-- `make test`: **613 assertions, all PASS** (`./tests/test_cwick` prints one `ok:` per check).
+- Model switching: `POST /v1/models/switch` runs a read-only model-contract dry
+  run before releasing anything. Unknown architectures and broken configs are
+  400 with the resident model untouched; 409 while a request is generating or
+  queued. `/v1/models` and `/v1/hub/models` report `supported` (cached at
+  discovery, so the polled list does no I/O under the generation lock), and
+  `cwick:model_loaded` is the live 1/0 gauge.
+- `make test`: **651 assertions, all PASS** (`./tests/test_cwick` prints one `ok:` per check).
 - `cwick doctor` and `download_model.sh` (resume, >100 GiB, one progress line).
 
 ### ⚠️ Known, and still usable
@@ -217,7 +225,7 @@ apps/             two H5 apps + manifest.json
 models/           downloaded checkpoints (gitignored, scanned at startup)
 docs/             architecture, storage, performance, decisions, server, precision,
                   DeepSeek port (each in English and Chinese)
-tests/test_cwick.c 613 assertions
+tests/test_cwick.c 651 assertions
 tools/            standalone C probes: kernel benchmarks, layer tests, model runners
 start.sh          recommended entry point: prefix cache + web + LAN + three model dirs
                   + password
@@ -251,7 +259,7 @@ start.sh          recommended entry point: prefix cache + web + LAN + three mode
 
 ```sh
 git clone <repo> cwick && cd cwick
-make && make test                      # ~12 s, 613 checks
+make && make test                      # ~12 s, 651 checks
 
 ./download_model.sh deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     -o ./deepseek-ai/DeepSeek-V4.1-Flash-1017 \

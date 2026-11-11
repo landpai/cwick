@@ -2524,18 +2524,28 @@
       return;
     }
     catalog.forEach(function (m) {
-      var loaded = !!(m.cwick && m.cwick.loaded);
+      var cw = m.cwick || {};
+      var loaded = !!cw.loaded;
+      /* Older servers omit the field; treat those as switchable so the UI
+       * stays usable against a binary that has not been rebuilt yet. */
+      var supported = cw.supported !== false;
+      var why = cw.unsupported_reason || '该模型架构没有对应的推理内核';
       var row = document.createElement('div');
       row.className = 'model-row' + (loaded ? ' is-loaded' : '');
       row.dataset.id = m.id;
       row.innerHTML =
         '<div class="mr-main">' +
           '<div class="mr-name">' + esc(m.id) + '</div>' +
-          '<div class="mr-root">' + esc((m.cwick && m.cwick.root) || '') + '</div>' +
+          '<div class="mr-root" title="' + esc(supported ? '' : why) + '">' +
+            esc(cw.root || '') + '</div>' +
         '</div><div class="mr-side">' +
           (loaded ? '<span class="tag-loaded">常驻</span>' : '') +
-          '<button class="btn-switch" type="button"' + (loaded ? ' disabled' : '') +
-          '>' + (loaded ? '使用中' : '切换') + '</button></div>';
+          (supported ? '' : '<span class="hub-badge warn" title="' +
+            esc(why) + '">不支持</span>') +
+          '<button class="btn-switch" type="button"' +
+            ((loaded || !supported) ? ' disabled' : '') +
+          '>' + (loaded ? '使用中' : (supported ? '切换' : '不支持')) +
+          '</button></div>';
       box.appendChild(row);
     });
   }
@@ -2573,7 +2583,7 @@
   }
 
   async function switchModel(id) {
-    setSwitchNote('正在切换到 ' + id + '：先释放常驻权重，再映射新权重…', '');
+    setSwitchNote('正在校验并切换到 ' + id + '…', '');
     var btns = document.querySelectorAll('#modelList .btn-switch');
     for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
     try {
@@ -2656,10 +2666,14 @@
     box.innerHTML = hub.local.map(function (m) {
       var ready = !!m.complete;
       var huge = m.bytes >= 100 * 1073741824;
+      var supported = m.supported !== false;
+      var why = m.unsupported_reason || '该模型架构没有对应的推理内核';
       return '<div class="hub-card ' + (ready ? 'is-ready' : 'is-partial') + '">' +
         '<div class="hub-title">' + esc(m.id) +
           (ready ? '<span class="hub-badge ok">完整</span>'
                  : '<span class="hub-badge warn">未下载完</span>') +
+          (ready && !supported
+            ? '<span class="hub-badge warn" title="' + esc(why) + '">不支持</span>' : '') +
           (huge ? '<span class="hub-badge info">超大权重</span>' : '') +
         '</div>' +
         '<div class="hub-sub">' + esc(m.repo) + ' · ' + esc(m.path) + '</div>' +
@@ -2671,8 +2685,13 @@
               fmtBytes(m.partial_bytes) + '</b></span>' : '') +
         '</div>' +
         '<div class="hub-actions">' +
-          (ready ? '<button class="min-btn accent" type="button" data-hub-switch="' +
-                    esc(m.repo) + '">设为常驻</button>' : '') +
+          (ready && supported
+            ? '<button class="min-btn accent" type="button" data-hub-switch="' +
+              esc(m.repo) + '">设为常驻</button>'
+            : (ready ? '<span class="hub-badge info" title="' + esc(why) +
+                '">架构未适配，不能切换</span>' : '')) +
+          '<button class="min-btn danger" type="button" data-hub-delete="' +
+            esc(m.repo) + '" title="删除本地权重（不可恢复）">删除</button>' +
         '</div></div>';
     }).join('');
   }
@@ -2850,8 +2869,46 @@
     }
   }
 
+  async function hubDelete(repo) {
+    var m = (hub.local || []).filter(function (x) {
+      return x.repo === repo || x.id === repo;
+    })[0];
+    var files = m ? (m.files || 0) + (m.partial_files || 0) : 0;
+    var bytes = m ? (m.bytes || 0) + (m.partial_bytes || 0) : 0;
+    var what = (files ? files + ' 个文件' : '全部文件') +
+               (bytes ? '、' + fmtBytes(bytes) : '');
+    /* Irreversible, and the server deletes recursively: ask first, and say
+     * exactly what is about to disappear. */
+    if (!window.confirm('删除本地模型 ' + repo + '？\n\n将移除 ' + what +
+                        '，此操作不可恢复。')) return;
+    hubLocalNote('正在删除 ' + repo + '…', false);
+    try {
+      var j = await hubReq('/v1/hub/models/' + encodeURIComponent(repo),
+                           { method: 'DELETE' });
+      if (!j) return;
+      hubLocalNote('✓ 已删除 ' + repo + '（释放 ' + fmtBytes(j.bytes || 0) + '）', false);
+      setStatus('已删除本地模型：' + repo);
+      await hubLoadLocal();
+      await loadModelList();
+      await loadModel();
+    } catch (e) {
+      hubLocalNote('✗ 删除失败：' + (e && e.message ? e.message : e), true);
+    }
+  }
+
   async function hubSwitch(repo) {
-    hubLocalNote('正在切换到 ' + repo + '：先释放常驻权重，再映射新权重…', false);
+    /* The completed-download list has a switch button too, but only the
+     * inventory carries the compatibility verdict. Check here as well so a
+     * click there never sends a request the server must refuse. */
+    var local = (hub.local || []).filter(function (x) {
+      return x.repo === repo || x.id === repo;
+    })[0];
+    if (local && local.supported === false) {
+      hubLocalNote('✗ 未发起切换：' +
+        (local.unsupported_reason || '该模型架构没有对应的推理内核'), true);
+      return;
+    }
+    hubLocalNote('正在校验并切换到 ' + repo + '…', false);
     try {
       var j = await hubReq('/v1/models/switch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3042,7 +3099,9 @@
     });
     $('hubLocal').addEventListener('click', function (e) {
       var b = e.target.closest('[data-hub-switch]');
-      if (b && !b.disabled) hubSwitch(b.dataset.hubSwitch);
+      if (b && !b.disabled) { hubSwitch(b.dataset.hubSwitch); return; }
+      var d = e.target.closest('[data-hub-delete]');
+      if (d && !d.disabled) hubDelete(d.dataset.hubDelete);
     });
     $('hubJobs').addEventListener('click', function (e) {
       var sw = e.target.closest('[data-hub-switch]');

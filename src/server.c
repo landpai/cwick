@@ -5135,11 +5135,22 @@ static char *models_json(server_ctx *srv) {
         char *jid = json_str_alloc(served_name(e));
         char *jroot = json_str_alloc(e->root);
         if (!jid || !jroot) { free(jid); free(jroot); continue; }
+        /* The reason is only useful when the answer is no; a client that
+         * checks `supported` never has to parse it. */
+        char extra[512] = "";
+        if (!e->supported) {
+            char *jwhy = json_str_alloc(e->unsupported_reason);
+            snprintf(extra, sizeof(extra), ",\"unsupported_reason\":%s",
+                     jwhy ? jwhy : "\"\"");
+            free(jwhy);
+        }
         sbuf_putf(&b,
                   "%s{\"id\":%s,\"object\":\"model\",\"created\":%lld,"
-                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,\"loaded\":%s}}",
+                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,"
+                  "\"loaded\":%s,\"supported\":%s%s}}",
                   i ? "," : "", jid, (long long)now_unix(), jroot,
-                  loaded ? "true" : "false");
+                  loaded ? "true" : "false",
+                  e->supported ? "true" : "false", extra);
         free(jid);
         free(jroot);
     }
@@ -5177,10 +5188,20 @@ static char *model_json_one(server_ctx *srv, const char *id) {
     char *jroot = json_str_alloc(hit->root);
     srv_buf b = {0};
     if (jid && jroot) {
+        char extra[512] = "";
+        if (!hit->supported) {
+            char *jwhy = json_str_alloc(hit->unsupported_reason);
+            snprintf(extra, sizeof(extra), ",\"unsupported_reason\":%s",
+                     jwhy ? jwhy : "\"\"");
+            free(jwhy);
+        }
         sbuf_putf(&b,
                   "{\"id\":%s,\"object\":\"model\",\"created\":%lld,"
-                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,\"loaded\":%s}}",
-                  jid, (long long)now_unix(), jroot, loaded ? "true" : "false");
+                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,"
+                  "\"loaded\":%s,\"supported\":%s%s}}",
+                  jid, (long long)now_unix(), jroot,
+                  loaded ? "true" : "false",
+                  hit->supported ? "true" : "false", extra);
     }
     free(jid);
     free(jroot);
@@ -5253,6 +5274,33 @@ static void hub_send_error(int fd, int code, const char *msg) {
     hub_send_json(fd, code, out);
 }
 
+/* /v1/models is the list of switchable roots. When a checkpoint is deleted
+ * from the library its catalog entry has to go with it, or the list keeps
+ * advertising a root that no longer exists and every switch to it answers
+ * 400. The delete is already on disk when this runs, so a concurrent reader
+ * sees either the entry (and gets a 404/400 from the switch) or no entry. */
+static void catalog_drop_root(server_ctx *srv, const char *root) {
+    pthread_mutex_lock(&srv->gen_lock);
+    for (size_t i = 0; i < srv->catalog.n; i++) {
+        if (strcmp(srv->catalog.v[i].root, root) != 0) continue;
+        memmove(&srv->catalog.v[i], &srv->catalog.v[i + 1],
+                (srv->catalog.n - i - 1) * sizeof(*srv->catalog.v));
+        srv->catalog.n--;
+        break;
+    }
+    pthread_mutex_unlock(&srv->gen_lock);
+}
+
+/* Deleting the weights a running engine has mapped would leave it reading
+ * files that no longer exist. Refuse and tell the caller to switch first. */
+static bool path_is_resident(server_ctx *srv, const char *root) {
+    pthread_mutex_lock(&srv->gen_lock);
+    const cwick_model_entry *cur = resident_entry(srv);
+    bool same = cur && strcmp(cur->root, root) == 0;
+    pthread_mutex_unlock(&srv->gen_lock);
+    return same;
+}
+
 /* Answers every model-library request under /v1/hub/, or returns -1 for any
  * are control-plane reads: they are served before the generation slot is
  * taken, so a catalog that is slow to answer cannot hold up a chat request.
@@ -5266,6 +5314,7 @@ static int hub_route(server_ctx *srv, int fd, const char *method,
     const char *leaf = ponly + 8;
     char err[256] = "";
     char *json = NULL;
+    int fail_status = 400;
 
     if (strcmp(method, "GET") == 0 && strcmp(leaf, "search") == 0) {
         char q[256] = "";
@@ -5286,6 +5335,40 @@ static int hub_route(server_ctx *srv, int fd, const char *method,
     } else if (strcmp(method, "GET") == 0 && strcmp(leaf, "downloads") == 0) {
         json = cwick_hub_downloads(srv->hub, err, sizeof(err));
         snprintf(detail, detailcap, "download queue");
+    } else if (strcmp(method, "DELETE") == 0 &&
+               strncmp(leaf, "models/", 7) == 0 && leaf[7]) {
+        /* Deleting a downloaded checkpoint. The id may be owner/name or a
+         * bare directory name, and is percent-decoded like a model id. */
+        if (strlen(leaf + 7) >= 256) {
+            hub_send_error(fd, 400, "model name is too long");
+            snprintf(detail, detailcap, "delete -> 400 (name too long)");
+            return 400;
+        }
+        char name[256];
+        url_decode_segment(leaf + 7, name, sizeof(name));
+        char target[CWICK_HUB_PATH_MAX];
+        if (!cwick_hub_model_dir(srv->hub, name, target, sizeof(target))) {
+            hub_send_error(fd, 404, "no such local model");
+            snprintf(detail, detailcap, "delete %.60s -> 404", name);
+            return 404;
+        }
+        if (path_is_resident(srv, target)) {
+            hub_send_error(fd, 409,
+                           "the resident model cannot be deleted; switch to "
+                           "another model first");
+            snprintf(detail, detailcap, "delete %.60s -> 409 (resident)", name);
+            return 409;
+        }
+        json = cwick_hub_delete(srv->hub, name, &fail_status, err, sizeof(err));
+        if (!json) {
+            hub_send_error(fd, fail_status, err[0] ? err : "delete failed");
+            snprintf(detail, detailcap, "delete %.60s -> %d: %s",
+                     name, fail_status, err);
+            return fail_status;
+        }
+        /* Disk first, then the catalog, so the two never disagree. */
+        catalog_drop_root(srv, target);
+        snprintf(detail, detailcap, "deleted local model %.80s", name);
     } else if (strcmp(method, "POST") == 0 && strcmp(leaf, "download") == 0) {
         cwick_error je;
         cwick_error_clear(&je);
@@ -5331,9 +5414,9 @@ static int hub_route(server_ctx *srv, int fd, const char *method,
     }
 
     if (!json) {
-        hub_send_error(fd, 400, err[0] ? err : "model library error");
-        snprintf(detail, detailcap, "model library -> 400: %s", err);
-        return 400;
+        hub_send_error(fd, fail_status, err[0] ? err : "model library error");
+        snprintf(detail, detailcap, "model library -> %d: %s", fail_status, err);
+        return fail_status;
     }
     hub_send_json(fd, 200, json);
     free(json);
@@ -5369,6 +5452,42 @@ static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
  * model a queued request was validated against is being destroyed. */
 static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
                             char *msg, size_t msgcap) {
+    /* Validate the target *before* anything is released. The old sequence
+     * tore down the engine, tokenizer, Metal arena and prefix cache first and
+     * only then tried to load the replacement: a repository with no kernels
+     * took the whole instance down with a 500, and every later switch saw
+     * "(none)" as the resident model. Both checks here are read-only and run
+     * outside the generation lock, so metrics and chat requests keep flowing
+     * while a config is parsed. */
+    char support_why[256];
+    if (!cwick_model_root_supported(target->root, support_why,
+                                    sizeof(support_why))) {
+        snprintf(msg, msgcap, "cannot switch to %s: %s",
+                 served_name(target), support_why);
+        CWICK_INFO("model", "%s", msg);
+        return 400;
+    }
+    char cfg[CWICK_MODEL_ROOT_MAX + 32];
+    if (snprintf(cfg, sizeof(cfg), "%s/config.json", target->root) >=
+        (int)sizeof(cfg)) {
+        snprintf(msg, msgcap, "cannot switch to %s: model root is too long",
+                 served_name(target));
+        return 400;
+    }
+    cwick_model_spec dry;
+    cwick_error derr;
+    cwick_error_clear(&derr);
+    cwick_status dry_st = cwick_model_spec_load(cfg, &dry, &derr);
+    cwick_model_spec_free(&dry);
+    if (dry_st != CWICK_OK) {
+        snprintf(msg, msgcap,
+                 "cannot switch to %s: its config does not satisfy the model "
+                 "contract (%s); the resident model was left untouched",
+                 served_name(target), cwick_error_message(&derr));
+        CWICK_INFO("model", "%s", msg);
+        return 400;
+    }
+
     char why[256];
     pthread_mutex_lock(&srv->gen_lock);
     if (srv->swapping) {
@@ -5479,7 +5598,10 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
                  cwick_error_message(&e));
         CWICK_INFO("model", "%s", msg);
         /* No model until someone loads one. Every generation endpoint now
-         * answers 503 rather than pretending the switch worked. */
+         * answers 503 rather than pretending the switch worked. The gauge has
+         * to say so too: model_info is a static label and would otherwise keep
+         * naming the checkpoint that was just released. */
+        cwick_metrics_set_model_loaded(false);
         srv->swapping = false;
         return 500;
     }
@@ -5521,6 +5643,7 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
             if (srv->eng[i]) { cwick_engine_free(srv->eng[i]); srv->eng[i] = NULL; }
         }
         if (srv->live_engine) *srv->live_engine = NULL;
+        cwick_metrics_set_model_loaded(false);
         srv->swapping = false;
         return 500;
     }

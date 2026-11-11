@@ -37,6 +37,14 @@ typedef struct {
      * better name exists. */
     char alias[CWICK_MODEL_ID_MAX];
     char root[CWICK_MODEL_ROOT_MAX];
+    /* Computed once when the checkpoint is discovered, so /v1/models and the
+     * model library can say "not loadable" without reading config.json while
+     * holding the generation lock (they are polled alongside live requests).
+     * This is the list of architectures with kernels in this build, not a
+     * promise that no further architecture can ever be added: registering a
+     * new one means adding its kernels and one line to the type table. */
+    bool supported;
+    char unsupported_reason[192];
 } cwick_model_entry;
 
 typedef struct {
@@ -59,6 +67,18 @@ void cwick_models_list_dedupe_ids(cwick_model_list *l);
  * -> "glm-5.3-flash"). Returns false (and leaves `out` empty) for anything
  * else, meaning the checkpoint's own model_type should be used as-is. */
 bool cwick_model_served_alias(const char *root, char *out, size_t cap);
+
+/* Does this build have kernels for `model_type`? Three checkpoint families
+ * plus the small synthetic fixtures `cwick setup` writes. Anything else is
+ * refused by name rather than falling through to the default geometry parser
+ * and failing on an unrelated field. */
+bool cwick_model_type_supported(const char *model_type);
+
+/* Read-only compatibility probe for a checkpoint directory: parses
+ * `config.json` (the same outer/inner `model_type` precedence the loader
+ * uses) and answers whether a switch to it could ever succeed. On false,
+ * `why` gets a short client-facing reason. No weights are opened. */
+bool cwick_model_root_supported(const char *root, char *why, size_t whycap);
 
 /* Does `dir` look like a cwick checkpoint root? True when `config.json` sits
  * next to a converted `resident/tensors` tree or the released HF shards

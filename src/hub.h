@@ -26,6 +26,10 @@
 
 typedef struct cwick_hub cwick_hub;
 
+/* Longest path the library composes. Public so the server can hand
+ * cwick_hub_model_dir() a buffer of the right size. */
+#define CWICK_HUB_PATH_MAX 1024
+
 /* `root` is where checkpoints live (the caller passes "./models"); `endpoint`
  * is the catalog host, default "https://hf-mirror.com" when NULL or empty.
  * Returns NULL only if libcurl cannot be initialised. */
@@ -66,6 +70,24 @@ char *cwick_hub_download_action(cwick_hub *h, const char *id,
  * Used by POST /v1/models/switch so a freshly downloaded checkpoint is
  * switchable in the same process that downloaded it. */
 char *cwick_hub_local_path(cwick_hub *h, const char *wanted);
+
+/* Resolve `owner/name`, a bare directory name, or a flat `./models/<name>`
+ * entry to the directory that holds it. The answer is guaranteed to exist,
+ * to sit strictly inside the library root after symlinks are resolved, and
+ * never to be the root itself. Read-only; the switch and delete paths share
+ * it so they agree on what a "local model" is. */
+bool cwick_hub_model_dir(cwick_hub *h, const char *wanted,
+                         char *out, size_t outcap);
+
+/* DELETE /v1/hub/models/<name> — remove a downloaded checkpoint (complete or
+ * partially downloaded) from the library. Refused with 409 while a download
+ * worker is still writing into that directory, because deleting its files
+ * under the worker would turn a resumable transfer into a corrupt one.
+ * Returns a JSON object on success; NULL with `err` and `*status` on failure
+ * (404 unknown, 409 busy, 400 invalid). Removal is recursive, irreversible,
+ * does not follow symlinks, and cannot escape the library root. */
+char *cwick_hub_delete(cwick_hub *h, const char *wanted, int *status,
+                       char *err, size_t errcap);
 
 /* The library root, for the startup banner and /v1/config. */
 const char *cwick_hub_root(const cwick_hub *h);

@@ -315,8 +315,10 @@ stdout and stderr (a bounded ring, so the browser follows a running serve), and
 four-minute trend charts (decode speed, footprint, both cache hit rates, TTFT),
 a Prometheus series browser that lists every exported metric with its HELP/TYPE
 and current value and can plot any four of them on private axes (raw value or
-per-second delta), every label from `cwick:model_info`, generation preferences,
-read-only runtime config and switching the resident local model. Every request is same-origin;
+per-second delta), every label from `cwick:model_info`, the live
+`cwick:model_loaded` bit, generation preferences, read-only runtime config and
+switching the resident local model (entries this build cannot load are shown
+as unsupported and cannot be selected). Every request is same-origin;
 there is no option to point the console at an external OpenAI-compatible
 service. Named API keys can still be minted for other clients to call *this*
 cwick instance (see authentication below).
@@ -397,8 +399,8 @@ writes to `./models`; it is in `.gitignore`.
 
 | method | path | notes |
 |---|---|---|
-| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` |
-| POST | `/v1/models/switch` | unload one, map another; 409 while generating or queued |
+| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir`; each entry carries `supported` / `unsupported_reason` |
+| POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued |
 | POST | `/v1/completions` | raw text completion, streaming or not |
 | POST | `/v1/chat/completions` | messages, `stream`, `tools`, `reasoning_effort` |
 | POST | `/v1/responses` | Responses dialect: `input` items in, a `response` object / `response.*` events out |
@@ -406,6 +408,7 @@ writes to `./models`; it is in `.gitignore`.
 | POST | `/v1/systemone` | typed decisions (choice / score / noul) read from one prefill; requires `--jev`; also `/inference/v1/systemone` |
 | GET | `/v1/systemone` | the live decision adapter: family, prompt grammar, readable letters, limits |
 | GET | `/v1/hub/models` | checkpoints already under `./models`, with size and completeness |
+| DELETE | `/v1/hub/models/<name>` | delete a downloaded checkpoint (recursive, confined to `./models`); 409 for the resident model or an active download |
 | GET | `/v1/hub/downloads` | live download jobs: progress, rate, ETA, state, error |
 | GET | `/v1/hub/search?q=…` | read-only search over the model catalog (default hf-mirror) |
 | POST | `/v1/hub/download` | start/resume `{"repo":"owner/name"}` into `./models/owner/name` |
@@ -626,7 +629,7 @@ kept, and the ones that lost are written down in
 [docs/DECISIONS.md](docs/DECISIONS.md) — including the ones that looked obvious.
 
 ```sh
-make test        # 613 checks: engines, sampler, prefix cache, server, web UI, apps
+make test        # 651 checks: engines, sampler, prefix cache, server, web UI, apps
 make bench       # kernel timings without loading a checkpoint
 ```
 
@@ -699,7 +702,7 @@ cwick/
 ├── web/               console source: index.html, app.js, app.css, login.html
 ├── apps/              two H5 apps plus manifest.json
 ├── docs/              architecture, storage, performance, decisions, server, precision
-├── tests/             test_cwick.c — 613 checks
+├── tests/             test_cwick.c — 651 checks
 ├── tools/             standalone C probes: kernels, layer tests, model runners
 ├── start.sh           recommended entry point (prefix cache + web + LAN + password)
 └── download_model.sh  resumable checkpoint download

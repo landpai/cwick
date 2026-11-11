@@ -8,8 +8,10 @@ OpenAI API.
 ## Endpoints
 
 - `GET /v1/models` (and `/models`) — every local model this instance knows about,
-  resident first. Each entry carries `cwick.root` and `cwick.loaded`, so a client
-  can tell *what is answering* from *what could be*.
+  resident first. Each entry carries `cwick.root`, `cwick.loaded` and
+  `cwick.supported` (plus `cwick.unsupported_reason` when false), so a client
+  can tell *what is answering* from *what could be* and from *what can never
+  be loaded by this build*.
 - `GET /v1/models/<id>` (and `/models/<id>`) — one entry in that shape, or 404
   `code:"model_not_found"`. This is OpenAI's retrieve-model call; agent
   frameworks probe it once with the name from their config, so answering it
@@ -26,6 +28,8 @@ OpenAI API.
   events) out. Same engine and the same adapter rule; see **Messages API**
   below.
 - `GET /v1/metrics` (and `/metrics`) — Prometheus text, vLLM naming.
+  `cwick:model_loaded` (1/0) is the live residency bit; `cwick:model_info`
+  keeps the labels of the last successfully loaded checkpoint.
 - `POST /v1/auth/login`, `GET /v1/auth/status`, `POST /v1/auth/logout` — the
   single-user login endpoints. Login accepts `{"password":"..."}`, sets the
   HttpOnly `cwick_session` cookie and returns a Bearer token. When a password is
@@ -35,7 +39,9 @@ OpenAI API.
   Read-only: everything in it is a lifetime choice (see below).
 - `POST /v1/models/switch` — replace the resident model with another catalog
   entry, without a restart. A checkpoint downloaded after startup is discovered
-  on demand here, so no refresh call is needed.
+  on demand here, so no refresh call is needed. An architecture this build has
+  no kernels for, or a config that fails the model contract, is refused with a
+  400 *before* anything is released (see **Switching the resident model**).
 - `GET /v1/hub/models`, `GET /v1/hub/downloads`, `GET /v1/hub/search?q=…`,
   `POST /v1/hub/download`,
   `POST /v1/hub/download/<id>/<pause|resume|retry|cancel>` — the local model
@@ -483,6 +489,19 @@ nothing is loaded until a switch asks for it. A directory qualifies if it holds
 `architectures[0]`, then the directory name, de-duplicated as `@2`, `@3`, … The
 resident entry is never renamed, so `data[0]` stays stable.
 
+**"Downloaded" is not "loadable".** Every entry in `/v1/models` and
+`/v1/hub/models` carries `supported`, plus `unsupported_reason` when it is
+false. The library fetches any repository, but only architectures with kernels
+in this build can become resident. The verdict comes from `config.json`'s
+`model_type` (the inner `text_config` one when present, exactly as the loader
+reads it) and is computed once when the directory is discovered — a polled
+model list therefore never parses config files while holding the generation
+lock. The Web console disables the switch button for an unsupported entry.
+This build implements the GLM-5.3, DeepSeek-V4.1 and MiniMax-M3.1 kernels plus
+the small `cwick setup` checkpoints; registering a further architecture means
+adding its kernels and one line to the type table, not a claim that the list
+is closed forever.
+
 Release checkpoints additionally advertise a *served name* derived from their
 directory basename, because `model_type` is a training-run artifact no client
 would guess (`glm5_next`, `deepseek_v41_text`): `zai-org/GLM-5.3-Flash` serves
@@ -503,14 +522,29 @@ curl -s localhost:8000/v1/models/switch \
 | 200 | `switched` | the new model is resident and serving |
 | 200 | `already_resident` | a no-op: that root is already loaded |
 | 404 | — | no catalog entry with that id |
+| 400 | `error` | the target architecture has no kernels here, or its config fails the model contract; **the resident model is untouched** |
 | 409 | `error` | a slot is busy, a request is queued, the tokenizer is held, or a swap is running |
-| 500 | `error` | the replacement engine or its tokenizer failed to load |
+| 500 | `error` | the replacement engine or its tokenizer failed to load after teardown |
+
+**Validation precedes teardown.** A switch first re-reads the target's
+`config.json` and runs the full model-contract check as a dry run; only after
+that passes does it release the old engine, tokenizer, Metal arena and prefix
+cache. An unknown `model_type` is refused with a 400 that names it instead of
+falling through to the default geometry parser and failing on an unrelated
+field (a nested config with a null `text_config.pad_token_id` used to report
+"missing pad_token_id" even when the outer object had one). In both 400 cases
+nothing is released: the resident model keeps serving, `cwick:model_loaded`
+stays 1, and the log has no `switching to` / `released` lines.
 
 While a swap is in progress, generation requests are answered 503
 `code:"model_switch"` rather than queued: the model they were validated against
-is being torn down. If the replacement fails, the server keeps running with no
-model and answers 503 `code:"no_model"` until another switch succeeds — it never
-falls back to a half-initialised engine.
+is being torn down. If the replacement fails *after* teardown (corrupt weights,
+a missing tensor, a tokenizer that cannot load), the server keeps running with
+no model and answers 503 `code:"no_model"` until another switch succeeds — it
+never falls back to a half-initialised engine. `cwick:model_loaded` is `0` in
+that state. `cwick:model_info` deliberately keeps its last labels because
+metric names and labels must stay stable across a process lifetime, so a
+dashboard must use the gauge to distinguish "serving" from "no model".
 
 `GET /v1/config` reports what the process is running with:
 
@@ -777,7 +811,8 @@ talks to the remote host itself, which also avoids CORS entirely.
 | method | path | answer |
 |---|---|---|
 | GET | `/v1/hub/search?q=<text>&limit=<n>` | `{"models":[…],"count":N,"endpoint":…,"error":…}` — a small projection of the remote catalog: id, downloads, likes, tags, pipeline tag, gated/private. `limit` is 1–50 (default 12). |
-| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` — every directory under the library root, with bytes, file count, partial bytes, `complete` and `resumable`. |
+| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` — every directory under the library root, with bytes, file count, partial bytes, `complete`, `resumable`, `supported` and (when false) `unsupported_reason`. |
+| DELETE | `/v1/hub/models/<name>` | remove a downloaded checkpoint. 200 `{"deleted":true,"path":…,"bytes":N,"files":N}`; 404 for an unknown or unsafe name; 409 for the resident model or a directory an active download is still writing. |
 | GET | `/v1/hub/downloads` | `{"jobs":[…]}` — the live job table: state, progress, bytes, files, current file, rate, ETA and error. |
 | POST | `/v1/hub/download` | body `{"repo":"owner/name"}` → one job object. Idempotent for an already-active repository. |
 | POST | `/v1/hub/download/<id>/<action>` | `pause`, `resume`, `retry` or `cancel` → the updated job object. |
@@ -792,6 +827,19 @@ holding the full repository id. The startup scan registers both a flat
 download finished earlier is switchable at startup, and one finished during
 this process is discovered by `POST /v1/models/switch` on demand. A directory
 is only "complete" when `config.json` exists and no `.incomplete` file remains.
+
+**Deleting.** `DELETE /v1/hub/models/<name>` accepts `owner/name`, a bare
+directory name, or a flat `./models/<name>` entry. The name is percent-decoded
+and refused if it contains `..`, a backslash, an absolute path, or an empty or
+`.` component; the resolved directory must sit strictly inside the library root
+after symlinks are resolved, and the root itself is never deletable. Removal is
+recursive and does not follow symlinks. The resident checkpoint is refused with
+409 (switch away first) — deleting weights a running engine has mapped would
+break it — and a directory a download worker is still writing is refused with
+409 (cancel the job) so a resumable transfer never becomes a corrupt one. On
+success the catalog entry is dropped in the same request, so `/v1/models` and
+the disk agree, and finished jobs pointing at the removed directory are marked
+`canceled` instead of continuing to claim `done`.
 
 **Resume.** Each in-flight file is written to `<target>.incomplete` and renamed
 only when its size matches the listing. A pause, an error, a killed process and
@@ -810,5 +858,6 @@ host as `model_catalog`.
 
 What these endpoints deliberately do *not* do: load weights, change the
 resident model, or prune/quantize a checkpoint. Downloading a repository whose
-architecture the engine does not implement is allowed — it will simply fail at
-switch time with the engine's ordinary contract error.
+architecture the engine does not implement is allowed — it stays visible in the
+inventory with `supported:false`, and a switch to it is refused with a 400
+that names the architecture *before* the resident checkpoint is unloaded.

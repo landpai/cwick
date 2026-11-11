@@ -44,6 +44,11 @@ bool cwick_models_list_add(cwick_model_list *l, const char *id, const char *root
     if (cwick_model_served_alias(root, e->alias, sizeof(e->alias)) &&
         strcmp(e->alias, e->id) == 0)
         e->alias[0] = '\0';   /* no better name than what it calls itself */
+    /* One small config read at discovery time, not on every catalog poll. */
+    char why[192];
+    e->supported = cwick_model_root_supported(root, why, sizeof(why));
+    if (!e->supported)
+        snprintf(e->unsupported_reason, sizeof(e->unsupported_reason), "%s", why);
     return true;
 }
 
@@ -232,6 +237,68 @@ bool cwick_model_dir_probe(const char *dir, char *id_out, size_t id_cap) {
     }
     return true;
 }
+
+/* ------------------------------------------------------------------ */
+/* Architecture compatibility                                          */
+/* ------------------------------------------------------------------ */
+#define TYPE_HAS_PREFIX(mt, lit) (strncmp((mt), (lit), sizeof(lit) - 1) == 0)
+
+bool cwick_model_type_supported(const char *mt) {
+    if (!mt || !*mt) return false;
+    if (strcmp(mt, "deepseek_v41") == 0 ||
+        strcmp(mt, "deepseek_v41_text") == 0) return true;
+    if (TYPE_HAS_PREFIX(mt, "minimax_m3")) return true;
+    if (strcmp(mt, "glm5_next") == 0 ||
+        strcmp(mt, "glm-5.3-flash") == 0) return true;
+    /* `cwick setup` writes tiny checkpoints that use the same kernels. */
+    if (TYPE_HAS_PREFIX(mt, "glm_5_3_flash_synthetic") ||
+        TYPE_HAS_PREFIX(mt, "glm-5.3-flash-synthetic")) return true;
+    return false;
+}
+
+bool cwick_model_root_supported(const char *root, char *why, size_t whycap) {
+    if (why && whycap) why[0] = '\0';
+    if (!root || !*root) {
+        if (why && whycap) snprintf(why, whycap, "empty model root");
+        return false;
+    }
+    char cfg[MAX_PATH];
+    if (snprintf(cfg, sizeof(cfg), "%s/config.json", root) >= (int)sizeof(cfg)) {
+        if (why && whycap) snprintf(why, whycap, "model root is too long");
+        return false;
+    }
+    char *text = read_small_file(cfg, 1u << 20);
+    if (!text) {
+        if (why && whycap) snprintf(why, whycap, "cannot read %s", cfg);
+        return false;
+    }
+    cwick_error err;
+    cwick_error_clear(&err);
+    json_value *j = cwick_json_parse(text, strlen(text), &err);
+    free(text);
+    if (!j) {
+        if (why && whycap) snprintf(why, whycap, "%s is not valid JSON", cfg);
+        return false;
+    }
+    const char *outer = cwick_json_str(cwick_json_get(j, "model_type"));
+    const char *inner = NULL;
+    json_value *tc = cwick_json_get(j, "text_config");
+    if (tc && tc->kind == JSON_OBJECT)
+        inner = cwick_json_str(cwick_json_get(tc, "model_type"));
+    /* The loader unwraps `text_config` first and only then falls back to the
+     * outer object; the compatibility answer must use the same precedence or
+     * a nested config would be advertised as supported and then refused. */
+    const char *mt = inner ? inner : outer;
+    bool ok = cwick_model_type_supported(mt);
+    if (!ok && why && whycap)
+        snprintf(why, whycap,
+                 "unsupported model_type \"%s\": this build implements the "
+                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 kernels only",
+                 mt ? mt : "(missing)");
+    cwick_json_free(j);
+    return ok;
+}
+#undef TYPE_HAS_PREFIX
 
 int cwick_models_scan_dir(const char *dir, cwick_model_list *l) {
     if (!dir || !*dir) return 0;

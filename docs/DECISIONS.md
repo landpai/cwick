@@ -2701,3 +2701,122 @@ per dialect (chat omits the optional `system_fingerprint`/`service_tier`; no `co
 **Coverage.** 626 assertions, thirteen of them new: the two refusal classes, a JSON object state,
 the four unsupported fields (and the two accepted "off" spellings), the required `instructions`,
 the score level range, and `noul` criteria in object and array form.
+
+## 49. A downloaded model is not necessarily a loadable model
+
+The 11-10 serve log ended with five `POST /v1/models/switch` calls to a freshly
+downloaded 18 GiB checkpoint, every one a 500 `config is missing/invalid
+pad_token_id`, followed by a server answering 503 `no_model` to every chat
+request. The download itself was fine (19 files, no partials). Three separate
+things were wrong.
+
+**The diagnosis was misleading.** `cwick_model_spec_load()` unwraps
+`text_config` and reads every field from the inner object. The outer object had
+`pad_token_id=248055`, the inner one had `null`; `model_type=qwen3_5_text`
+matched neither specialised branch, so it was measured against the default
+geometry contract and died on an unrelated GLM-only field. The real reason — a
+dense, mixed linear-attention, vision checkpoint with no kernels in this build
+— never appeared in the error. `q_lora_rank`, `kv_lora_rank` and the MoE fields
+are missing too, so editing the config could never have worked.
+
+**The swap had the wrong order.** `srv_switch_model()` released the engines,
+tokenizer, Metal arena and all 27 prefix snapshots *before* trying to load the
+replacement. A failure therefore left the instance with no model, and each
+retry logged `releasing (none)`. The first attempt had already unmapped 48
+shards (475 GiB of address space). Metrics made it worse: `cwick:model_info`
+is a static info metric updated only on the success path, so a scraper kept
+seeing the old model name while every chat request returned 503.
+
+**The inventory lied by omission.** Directory discovery only checked for
+`config.json` plus a weight file, and the library's `complete` flag only meant
+"all files arrived". Any repository could be downloaded, appear in the Web
+model tab with a switch button, and then take the server down.
+
+**Four changes.** (1) One shared type table declares the architectures with
+kernels; `cwick_model_spec_load()` now refuses an unknown `model_type` by name
+with `CWICK_ERR_UNSUPPORTED` instead of falling through to the default parser.
+(2) Every `/v1/models` and `/v1/hub/models` entry carries `supported` and,
+when false, `unsupported_reason`. The verdict is computed once at discovery
+and cached in the catalog entry, so a polled model list does no file I/O while
+holding the generation lock — control endpoints and generation stay concurrent.
+The Web console disables those switch buttons. (3) A switch runs a read-only
+`cwick_model_spec_load()` dry run on the target config *first*; an unsupported
+architecture or a broken contract answers 400 and leaves the resident engine,
+tokenizer, arena and prefix cache untouched. (4) `cwick:model_loaded` is a
+live 1/0 gauge, set to 0 when a post-teardown load fails and back to 1 on a
+successful switch; `model_info` keeps its labels because renaming or
+relabelling an exported metric breaks scrapers.
+
+**The list is deliberately not closed.** The type table is the registry of
+*implemented kernels*, not a promise that only three models can ever run:
+adding an architecture means adding its kernels and one line to the table. The
+library still downloads any repository and still lists it; only the "make it
+resident" action is gated.
+
+**What is still not rolled back.** If the config passes but a weight tensor is
+missing or the tokenizer cannot load, the old checkpoint has already been
+released. Rebuilding it would mean a second full load inside the failure path,
+so the instance still answers 503 `no_model` — but now with `model_loaded=0`
+and an explicit 500 detail, and one successful switch restores service.
+
+**Coverage.** 639 assertions, thirteen of them new. Against a live server with
+one resident synthetic checkpoint, one supported spare and two unsupported
+entries: both unsupported switches answered 400 in 0.1 ms with no
+`switching to` or `released` log line, `/v1/models` kept `loaded:true`, chat
+stayed 200 and `model_loaded` stayed 1; the supported switch returned 200 and
+republished the identity; a checkpoint with deliberately missing weights
+returned 500, `model_loaded=0` and 503 on chat; switching back returned 200
+and 1. The compiled-in Web asset matched `web/app.js` byte for byte.
+
+## 50. Deleting a downloaded checkpoint
+
+The model tab could fetch a repository but not remove one: a wrong-architecture
+checkpoint of tens of GiB stayed on disk until someone opened a terminal.
+`DELETE /v1/hub/models/<name>` closes that loop.
+
+**Resolution and removal are separate calls.** `cwick_hub_model_dir()` turns a
+user-supplied name into a directory; `cwick_hub_delete()` removes it. The server
+runs between them, so it can refuse the resident checkpoint (409) without
+teaching the library about the engine, and the switch path uses the same
+resolver — "what is a local model" has one definition. A partial download
+resolves for cleanup but not for switching, because those two questions really
+are different.
+
+**The boundary is realpath, not string matching.** A name is refused if it
+contains `..`, a backslash, an absolute path, or an empty or `.` component; the
+resolved directory must sit strictly inside the library root after symlinks are
+resolved, and the root itself is rejected. Removal uses `lstat` and only
+descends into real directories, so a symlink is unlinked rather than followed.
+Recursion is capped at depth 8.
+
+**One bug the tests found.** `"."` passed the character test (no `..` in it),
+resolved to `<root>/.`, correctly failed the root check — and then fell through
+to the owner lookup, which turned it into `./models/<owner>`. Deleting `"."`
+would have removed an entire owner tree. The fix is a component check that also
+refuses empty components, so `./name`, `owner/` and `a//b` are invalid names
+rather than paths to normalise.
+
+**What is refused.** The resident checkpoint (409): its weights are mapped by
+the running engine. A directory a worker is still writing (409): the user is
+told to cancel the job, which is what stops the thread. Both checks run before
+anything is removed.
+
+**What stays consistent afterwards.** The catalog entry is dropped in the same
+request; otherwise `/v1/models` would keep advertising a root that no longer
+exists and every switch to it would answer 400. Finished jobs pointing at the
+removed directory are marked `canceled` with "local directory deleted", so the
+UI does not keep claiming a completed download whose files are gone.
+
+**What is deliberately not offered.** No trash or soft delete: a checkpoint is
+tens of GiB and a copy is not affordable, so the confirmation lives in the Web
+console (file count and size spelled out) and the server performs an
+irreversible removal. No background deletion job either: unlinking a directory
+tree is metadata work, and the request returns the freed byte count when it is
+done.
+
+**Coverage.** 651 assertions, twelve of them new: resolution of owner/name,
+bare and flat names; refusal of `..`, absolute paths and `.`; a successful
+delete that reports two files and leaves no directory; 404 for a missing name;
+404 for a traversing name. Against a live server: three layouts deleted with
+200 and the right byte count, `/v1/hub/models` and `/v1/models` both dropping
+them, the resident checkpoint refused with 409, and `..` / absolute paths 404.

@@ -57,6 +57,13 @@ void cwick_metrics_init(const cwick_metrics_info *info);
  * suddenly shows zero requests would be read as a crash. */
 void cwick_metrics_set_model_info(const cwick_metrics_info *info);
 
+/* Live residency: 1 while a checkpoint can serve requests, 0 after a switch
+ * released the old one but failed to load its replacement. `model_info`
+ * describes the last *successfully* loaded checkpoint and is deliberately
+ * static (renaming a metric breaks scrapers), so this gauge is the one a
+ * dashboard must use to tell "serving" from "no model" (HTTP 503). */
+void cwick_metrics_set_model_loaded(bool loaded);
+
 /* ------------------------------------------------------------------ */
 /* Request lifecycle (server side)                                     */
 /* ------------------------------------------------------------------ */

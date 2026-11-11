@@ -183,6 +183,7 @@ static _Atomic uint64_t g_expert_cap;
 static _Atomic uint64_t g_rss;
 static _Atomic uint64_t g_ceiling;
 static _Atomic uint64_t g_context_window;
+static _Atomic uint64_t g_model_loaded;
 static _Atomic uint64_t g_started_ns;
 
 static const cwick_stream *g_stream;     /* sampled at render time */
@@ -220,6 +221,14 @@ void cwick_metrics_init(const cwick_metrics_info *info) {
     }
     g_started_ns = now_ns();
     g_initialised = true;
+    /* init() is called with a loaded checkpoint's identity. */
+    atomic_store_explicit(&g_model_loaded, 1, memory_order_relaxed);
+}
+
+/* See metrics.h: the live residency gauge, written by the model-switch path. */
+void cwick_metrics_set_model_loaded(bool loaded) {
+    atomic_store_explicit(&g_model_loaded, loaded ? 1u : 0u,
+                          memory_order_relaxed);
 }
 
 /* See metrics.h: identity change without touching the accumulators. */
@@ -233,6 +242,7 @@ void cwick_metrics_set_model_info(const cwick_metrics_info *info) {
         if (info->num_layers > 0) g_pf_layers = (uint64_t)info->num_layers;
     }
     g_initialised = true;
+    atomic_store_explicit(&g_model_loaded, 1, memory_order_relaxed);
 }
 
 uint64_t cwick_metrics_request_arrive(void) {
@@ -504,9 +514,22 @@ char *cwick_metrics_render(size_t *out_len) {
                  (long long)g_info.num_experts,
                  (long long)g_info.experts_per_token);
         emit_info(&b, "cwick:model_info",
-                  "Static description of the loaded checkpoint.", lb.p);
+                  "Static description of the last successfully loaded checkpoint.", lb.p);
         free(lb.p);
     }
+    /* A scraper that only reads model_info sees the previous checkpoint's
+     * name forever, even after a failed switch left the instance answering
+     * 503. Publishing the live bit next to it keeps that distinction visible
+     * without renaming the older metric. */
+    emit_help_type(&b, "cwick:model_loaded",
+                   "1 when a checkpoint is resident and can serve requests; "
+                   "0 when a model switch left no checkpoint loaded (503).",
+                   "gauge");
+    buf_addf(&b, "cwick:model_loaded{model=\"");
+    buf_label_escape(&b, model);
+    buf_addf(&b, "\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&g_model_loaded,
+                                                      memory_order_relaxed));
 
     /* ---- request counters (vLLM names) ---- */
     emit_counter(&b, "vllm:prompt_tokens_total",

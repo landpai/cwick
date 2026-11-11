@@ -257,6 +257,30 @@ static void test_contract_and_engine(void) {
         free(text);
     }
 
+    /* An architecture without kernels is refused by name, before the
+     * geometry parser reports an unrelated missing field. A nested config
+     * whose inner pad_token_id is null used to produce the misleading
+     * "config is missing/invalid pad_token_id" even with a valid outer one. */
+    {
+        char foreign[1152];
+        cwick_path_join(foreign, sizeof(foreign), root, "config-foreign.json");
+        const char *fj =
+            "{\"model_type\":\"qwen3_5\",\"pad_token_id\":248055,"
+            "\"text_config\":{\"model_type\":\"qwen3_5_text\","
+            "\"pad_token_id\":null,\"dtype\":\"bfloat16\"}}";
+        CHECK(cwick_write_file(foreign, fj, strlen(fj)) == 0,
+              "contract: a foreign nested config is written");
+        cwick_model_spec fspec;
+        cwick_status st = cwick_model_spec_load(foreign, &fspec, &err);
+        const char *why = cwick_error_message(&err);
+        CHECK(st == CWICK_ERR_UNSUPPORTED &&
+              strstr(why, "unsupported model_type") != NULL &&
+              strstr(why, "qwen3_5_text") != NULL,
+              "contract: unknown architecture is refused by name, not by a GLM-only field");
+        cwick_model_spec_free(&fspec);
+        unlink(foreign);
+    }
+
     /* engine: generate deterministically */
     cwick_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -1492,6 +1516,54 @@ static void test_models(void) {
     CHECK(strcmp(id, "glm_5_3_flash_synthetic") == 0,
           "probe: the id comes from config.json's model_type");
 
+    /* "Looks like a checkpoint" and "can be loaded" are different facts:
+     * the library downloads any repository, but only architectures with
+     * kernels can become resident. */
+    CHECK(cwick_model_type_supported("glm5_next") &&
+          cwick_model_type_supported("glm-5.3-flash") &&
+          cwick_model_type_supported("deepseek_v41") &&
+          cwick_model_type_supported("deepseek_v41_text") &&
+          cwick_model_type_supported("minimax_m3_vl") &&
+          cwick_model_type_supported("glm_5_3_flash_synthetic") &&
+          cwick_model_type_supported("glm-5.3-flash-synthetic-mhc"),
+          "compat: every architecture with kernels in this build is accepted");
+    CHECK(!cwick_model_type_supported("qwen3_5_text") &&
+          !cwick_model_type_supported("llama") &&
+          !cwick_model_type_supported(NULL) &&
+          !cwick_model_type_supported(""),
+          "compat: unknown architectures are refused");
+    {
+        char compat[256], fcfg[320], why[192];
+        snprintf(compat, sizeof(compat), "/tmp/cwick-test-compat-%ld",
+                 (long)getpid());
+        {
+            char cmd[320];
+            snprintf(cmd, sizeof(cmd), "rm -rf %s", compat);
+            if (system(cmd) != 0) { /* best effort */ }
+        }
+        cwick_mkdir_p(compat);
+        snprintf(fcfg, sizeof(fcfg), "%s/config.json", compat);
+        const char *fj =
+            "{\"model_type\":\"qwen3_5\",\"pad_token_id\":248055,"
+            "\"text_config\":{\"model_type\":\"qwen3_5_text\","
+            "\"pad_token_id\":null}}";
+        CHECK(cwick_write_file(fcfg, fj, strlen(fj)) == 0,
+              "compat: a foreign nested config is written");
+        CHECK(cwick_model_root_supported(m1, why, sizeof(why)),
+              "compat: a synthetic checkpoint is switchable");
+        CHECK(!cwick_model_root_supported(compat, why, sizeof(why)) &&
+              strstr(why, "unsupported model_type") != NULL &&
+              strstr(why, "qwen3_5_text") != NULL,
+              "compat: the inner model_type decides, and the reason names it");
+        cwick_model_list fl;
+        cwick_models_list_init(&fl);
+        CHECK(cwick_models_list_add(&fl, "qwen3_5", compat) &&
+              !fl.v[0].supported &&
+              strstr(fl.v[0].unsupported_reason, "qwen3_5_text") != NULL,
+              "compat: the catalog entry caches the verdict and its reason");
+        cwick_models_list_free(&fl);
+    }
+
     /* Served aliases: release checkpoints advertise their familiar names,
      * everything else keeps what its config.json says. */
     char alias[128];
@@ -1544,6 +1616,8 @@ static void test_models(void) {
     bool roots_ok = (strcmp(l.v[0].root, m1) == 0 && strcmp(l.v[1].root, m2) == 0) ||
                     (strcmp(l.v[0].root, m2) == 0 && strcmp(l.v[1].root, m1) == 0);
     CHECK(roots_ok, "scan: entries point at the two model roots");
+    CHECK(l.v[0].supported && l.v[1].supported,
+          "compat: scanned entries carry the cached supported verdict");
     cwick_models_list_free(&l);
     CHECK(cwick_models_scan_dir("/tmp/cwick-test-no-such-dir", &l) == -1,
           "scan: an unreadable directory reports -1 (does not crash)");
@@ -3059,6 +3133,23 @@ static void test_metrics(void) {
     char *body = cwick_metrics_render(&len);
     CHECK(body != NULL && len > 0, "metrics: render produces a payload");
 
+    /* A switch that released the resident checkpoint but failed to load the
+     * replacement must be visible to a scraper; model_info is static and
+     * would keep naming the old checkpoint forever. */
+    CHECK(render_has(body, "# TYPE cwick:model_loaded gauge\n"
+                           "cwick:model_loaded{model=\"glm\\\"5.3\\\\flash\"} 1"),
+          "metrics: a loaded instance publishes model_loaded=1");
+    cwick_metrics_set_model_loaded(false);
+    free(body);
+    body = cwick_metrics_render(&len);
+    CHECK(render_has(body, "cwick:model_loaded{model=\"glm\\\"5.3\\\\flash\"} 0"),
+          "metrics: a failed switch publishes model_loaded=0");
+    cwick_metrics_set_model_loaded(true);
+    free(body);
+    body = cwick_metrics_render(&len);
+    CHECK(render_has(body, "cwick:model_loaded{model=\"glm\\\"5.3\\\\flash\"} 1"),
+          "metrics: a successful switch restores model_loaded=1");
+
     /* static info, with the quote and backslash escaped */
     CHECK(render_has(body, "cwick:model_info{model=\"glm\\\"5.3\\\\flash\","),
           "metrics: info metric escapes label quotes/backslashes");
@@ -3711,6 +3802,9 @@ static void test_hub(void) {
     CHECK(js && strstr(js, "\"complete\":true") != NULL &&
           strstr(js, "acme/tiny") != NULL,
           "hub: a finished checkpoint under owner/name is listed as complete");
+    CHECK(js && strstr(js, "\"supported\":false") != NULL &&
+          strstr(js, "\"unsupported_reason\"") != NULL,
+          "hub: the inventory reports whether the engine can load the checkpoint");
     free(js);
 
     char *p = cwick_hub_local_path(h, "acme/tiny");
@@ -3728,6 +3822,11 @@ static void test_hub(void) {
     p = cwick_hub_local_path(h, "acme/tiny");
     CHECK(p == NULL, "hub: a half-downloaded checkpoint cannot be switched to");
     free(p);
+    {
+        char resolved[1024];
+        CHECK(cwick_hub_model_dir(h, "acme/tiny", resolved, sizeof(resolved)),
+              "hub: a partial download still resolves, so it can be cleaned up");
+    }
     js = cwick_hub_models(h, err, sizeof(err));
     CHECK(js && strstr(js, "\"resumable\":true") != NULL &&
           strstr(js, "\"complete\":false") != NULL,
@@ -3752,6 +3851,50 @@ static void test_hub(void) {
     bad = cwick_hub_download_action(h, "d1", "explode", err, sizeof(err));
     CHECK(bad == NULL, "hub: an unknown action is refused");
     free(bad);
+
+    /* Deleting a checkpoint: resolution and removal are separate calls so the
+     * server can refuse a resident model between them. Both are confined to
+     * the library root. */
+    {
+        char gone[512], gcfg[560], gweight[560], resolved[1024];
+        snprintf(gone, sizeof(gone), "%s/acme/gone", root);
+        snprintf(gcfg, sizeof(gcfg), "%s/config.json", gone);
+        snprintf(gweight, sizeof(gweight), "%s/model.bin", gone);
+        CHECK(cwick_mkdir_p(gone) == 0, "hub: a checkpoint to delete is created");
+        CHECK(cwick_write_file(gcfg, "{}", 2) == 0, "hub: its config is written");
+        CHECK(cwick_write_file(gweight, "12345", 5) == 0,
+              "hub: its weight is written");
+
+        CHECK(cwick_hub_model_dir(h, "acme/gone", resolved, sizeof(resolved)) &&
+              strstr(resolved, "acme/gone") != NULL,
+              "hub: owner/name resolves to a directory that may be deleted");
+        CHECK(cwick_hub_model_dir(h, "gone", resolved, sizeof(resolved)),
+              "hub: a bare name resolves under its owner");
+        CHECK(!cwick_hub_model_dir(h, "..", resolved, sizeof(resolved)) &&
+              !cwick_hub_model_dir(h, "/etc", resolved, sizeof(resolved)) &&
+              !cwick_hub_model_dir(h, ".", resolved, sizeof(resolved)),
+              "hub: traversal, absolute paths and the root itself resolve to nothing");
+
+        int st = 0;
+        char *del = cwick_hub_delete(h, "acme/gone", &st, err, sizeof(err));
+        CHECK(del && strstr(del, "\"deleted\":true") != NULL &&
+              strstr(del, "\"files\":2") != NULL,
+              "hub: delete removes the checkpoint and reports what it freed");
+        free(del);
+        CHECK(!cwick_dir_exists(gone), "hub: the deleted directory is gone");
+        CHECK(!cwick_hub_model_dir(h, "acme/gone", resolved, sizeof(resolved)),
+              "hub: the deleted name no longer resolves");
+
+        st = 0;
+        del = cwick_hub_delete(h, "acme/missing", &st, err, sizeof(err));
+        CHECK(del == NULL && st == 404,
+              "hub: deleting an unknown checkpoint is a 404");
+        st = 0;
+        del = cwick_hub_delete(h, "../escape", &st, err, sizeof(err));
+        CHECK(del == NULL && st == 404,
+              "hub: deleting outside the library is refused");
+        free(del);
+    }
 
     cwick_hub_close(h);
     unlink(cfg); unlink(weights);

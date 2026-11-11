@@ -18,12 +18,14 @@
 #include "cwick.h"
 #include "json.h"
 #include "log.h"
+#include "models.h"
 #include "util.h"
 
 #include <curl/curl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +37,7 @@
 
 #define HUB_MAX_JOBS   8
 #define HUB_MAX_FILES  2048
-#define HUB_PATH_MAX   1024
+#define HUB_PATH_MAX   CWICK_HUB_PATH_MAX
 #define HUB_DEFAULT_ENDPOINT "https://hf-mirror.com"
 
 typedef struct { char *p; size_t len, cap; } hbuf;
@@ -360,6 +362,14 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     snprintf(cfg, sizeof(cfg), "%s/config.json", dir);
     bool has_config = cwick_file_exists(cfg);
     bool complete = has_config && partials == 0 && files > 0;
+    /* "Downloaded" and "loadable" are different facts: the library happily
+     * fetches any repository, but only architectures with kernels can become
+     * resident. Say so in the inventory instead of leaving the switch button
+     * to discover it after the old checkpoint has been released. */
+    char why[192] = "";
+    bool supported = false;
+    if (has_config) supported = cwick_model_root_supported(dir, why, sizeof(why));
+    else snprintf(why, sizeof(why), "config.json is not present yet");
 
     if (!*first) hb_puts(out, ",");
     *first = false;
@@ -367,9 +377,16 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     hb_puts(out, ",\"repo\":");          hb_json_str(out, repo);
     hb_puts(out, ",\"path\":");          hb_json_str(out, dir);
     hb_putf(out, ",\"bytes\":%lld,\"files\":%d,\"partial_bytes\":%lld,"
-                 "\"partial_files\":%d,\"complete\":%s,\"resumable\":%s}",
+                 "\"partial_files\":%d,\"complete\":%s,\"resumable\":%s,"
+                 "\"supported\":%s",
             (long long)bytes, files, (long long)partial_bytes, partials,
-            complete ? "true" : "false", partials > 0 ? "true" : "false");
+            complete ? "true" : "false", partials > 0 ? "true" : "false",
+            supported ? "true" : "false");
+    if (!supported) {
+        hb_puts(out, ",\"unsupported_reason\":");
+        hb_json_str(out, why);
+    }
+    hb_puts(out, "}");
 }
 
 /* A directory that is itself a checkpoint has config.json; one that is still
@@ -454,27 +471,67 @@ static char *checked_path(const char *dir) {
     return cwick_strdup(dir);
 }
 
-char *cwick_hub_local_path(cwick_hub *h, const char *wanted) {
-    if (!h || !wanted || !*wanted) return NULL;
-    if (strstr(wanted, "..") || wanted[0] == '/') return NULL;
+/* A caller-supplied name may only contain the characters a repository or a
+ * directory name can legitimately have. `..` is refused outright rather than
+ * normalised away: there is no reason for a model name to contain it, and a
+ * normaliser is one more thing to get wrong. */
+static bool name_is_safe(const char *wanted) {
+    if (!wanted || !*wanted || strlen(wanted) > 255) return false;
+    if (strstr(wanted, "..") || strchr(wanted, '\\') || wanted[0] == '/')
+        return false;
+    for (const char *p = wanted; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '/' || c == '-' ||
+              c == '_' || c == '.')) return false;
+    }
+    /* Reject empty and "." components. Without this, "." passes the character
+     * test and the one-level owner lookup resolves it to the owner directory:
+     * deleting "." would have removed an unrelated checkpoint tree. */
+    for (const char *p = wanted; *p; ) {
+        const char *slash = strchr(p, '/');
+        size_t n = slash ? (size_t)(slash - p) : strlen(p);
+        if (n == 0 || (n == 1 && p[0] == '.')) return false;
+        if (!slash) break;
+        p = slash + 1;
+    }
+    return true;
+}
+
+/* Strictly inside the library root, after symlinks are resolved. This is the
+ * boundary that makes both delete and switch safe: a symlinked directory
+ * cannot be used to reach the rest of the filesystem, and the root itself is
+ * never a valid answer (deleting it would remove every checkpoint at once). */
+static bool dir_under_root(cwick_hub *h, const char *dir) {
+    char root_rp[PATH_MAX], dir_rp[PATH_MAX];
+    if (!realpath(h->root, root_rp)) return false;
+    if (!realpath(dir, dir_rp)) return false;
+    size_t n = strlen(root_rp);
+    if (strcmp(dir_rp, root_rp) == 0) return false;
+    if (strncmp(dir_rp, root_rp, n) != 0) return false;
+    return dir_rp[n] == '/';
+}
+
+static bool candidate_ok(cwick_hub *h, const char *dir, char *out, size_t cap) {
+    if (!cwick_dir_exists(dir)) return false;
+    if (!dir_under_root(h, dir)) return false;
+    snprintf(out, cap, "%s", dir);
+    return true;
+}
+
+bool cwick_hub_model_dir(cwick_hub *h, const char *wanted,
+                         char *out, size_t outcap) {
+    if (!h || !name_is_safe(wanted) || !out || outcap == 0) return false;
+    char dir[HUB_PATH_MAX];
     const char *base = strrchr(wanted, '/');
     base = base ? base + 1 : wanted;
 
-    /* Two layouts are recognised: a repository kept under its owner
-     * (./models/owner/name, what a download produces) and a flat directory
-     * holding just the name. */
-    char dir[HUB_PATH_MAX];
-    if (snprintf(dir, sizeof(dir), "%s/%s", h->root, wanted) < (int)sizeof(dir)) {
-        char *p = checked_path(dir);
-        if (p) return p;
-    }
-    if (base != wanted &&
-        snprintf(dir, sizeof(dir), "%s/%s", h->root, base) < (int)sizeof(dir)) {
-        char *p = checked_path(dir);
-        if (p) return p;
-    }
-    /* A bare name is ambiguous under an owner/name layout. Look one level
-     * down rather than making the caller guess the owner. */
+    /* The canonical layouts: ./models/owner/name (what a download produces)
+     * and a flat ./models/<name>. */
+    if (snprintf(dir, sizeof(dir), "%s/%s", h->root, wanted) < (int)sizeof(dir) &&
+        candidate_ok(h, dir, out, outcap))
+        return true;
+    /* A bare name under an owner directory. */
     if (!strchr(wanted, '/')) {
         DIR *d = opendir(h->root);
         if (d) {
@@ -483,13 +540,123 @@ char *cwick_hub_local_path(cwick_hub *h, const char *wanted) {
                 if (de->d_name[0] == '.') continue;
                 if (snprintf(dir, sizeof(dir), "%s/%s/%s", h->root,
                              de->d_name, wanted) >= (int)sizeof(dir)) continue;
-                char *p = checked_path(dir);
-                if (p) { closedir(d); return p; }
+                if (candidate_ok(h, dir, out, outcap)) {
+                    closedir(d);
+                    return true;
+                }
             }
             closedir(d);
         }
+        return false;
     }
-    return NULL;
+    /* owner/name when the checkpoint actually sits flat under its basename. */
+    if (base != wanted &&
+        snprintf(dir, sizeof(dir), "%s/%s", h->root, base) < (int)sizeof(dir) &&
+        candidate_ok(h, dir, out, outcap))
+        return true;
+    return false;
+}
+
+char *cwick_hub_local_path(cwick_hub *h, const char *wanted) {
+    char dir[HUB_PATH_MAX];
+    if (!cwick_hub_model_dir(h, wanted, dir, sizeof(dir))) return NULL;
+    return checked_path(dir);
+}
+
+/* Recursive removal that never follows a symlink out of the tree: lstat, and
+ * only a real directory is descended into. Deleting a checkpoint is
+ * irreversible, so this is deliberately the only caller of unlink/rmdir in the
+ * library and it only ever receives a path that passed dir_under_root(). */
+static int remove_tree(const char *path, int depth) {
+    if (depth > 8) return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(path) == 0 ? 0 : -1;
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char p[HUB_PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", path, de->d_name) >=
+            (int)sizeof(p)) {
+            rc = -1;
+            continue;
+        }
+        struct stat cst;
+        if (lstat(p, &cst) != 0) { rc = -1; continue; }
+        if (S_ISDIR(cst.st_mode)) {
+            if (remove_tree(p, depth + 1) != 0) rc = -1;
+        } else if (unlink(p) != 0) {
+            rc = -1;
+        }
+    }
+    closedir(d);
+    if (rmdir(path) != 0) rc = -1;
+    return rc;
+}
+
+char *cwick_hub_delete(cwick_hub *h, const char *wanted, int *status,
+                       char *err, size_t errcap) {
+    if (status) *status = 400;
+    if (!h) {
+        snprintf(err, errcap, "model library is not initialised");
+        return NULL;
+    }
+    char dir[HUB_PATH_MAX];
+    if (!cwick_hub_model_dir(h, wanted, dir, sizeof(dir))) {
+        if (status) *status = 404;
+        snprintf(err, errcap, "no local model named %.120s",
+                 wanted ? wanted : "");
+        return NULL;
+    }
+
+    /* A worker still writing into this directory must not lose its files
+     * underneath it: a resumable transfer would become a corrupt one. The
+     * user's route out is to cancel the job first, which stops the thread. */
+    pthread_mutex_lock(&h->mtx);
+    for (int i = 0; i < h->njobs; i++) {
+        hub_job *j = &h->jobs[i];
+        if (j->thread_running && strcmp(j->dir, dir) == 0) {
+            pthread_mutex_unlock(&h->mtx);
+            if (status) *status = 409;
+            snprintf(err, errcap, "a download is still writing this directory; "
+                                  "cancel it first");
+            return NULL;
+        }
+    }
+    pthread_mutex_unlock(&h->mtx);
+
+    int64_t bytes = 0, partial = 0;
+    int files = 0, partials = 0;
+    dir_stats(dir, &bytes, &files, &partial, &partials, 0);
+
+    if (remove_tree(dir, 0) != 0) {
+        snprintf(err, errcap, "cannot remove every file under %s", dir);
+        return NULL;
+    }
+
+    /* Finished and paused jobs pointing at the removed directory are marked
+     * canceled, so the UI does not keep showing "done" for something that no
+     * longer exists. A running job was refused above. */
+    pthread_mutex_lock(&h->mtx);
+    for (int i = 0; i < h->njobs; i++) {
+        hub_job *j = &h->jobs[i];
+        if (!j->thread_running && strcmp(j->dir, dir) == 0) {
+            j->state = JOB_CANCELED;
+            snprintf(j->error, sizeof(j->error), "%s", "local directory deleted");
+        }
+    }
+    pthread_mutex_unlock(&h->mtx);
+
+    hbuf out = {0};
+    hb_puts(&out, "{\"deleted\":true,\"path\":");
+    hb_json_str(&out, dir);
+    hb_putf(&out, ",\"bytes\":%lld,\"files\":%d}",
+            (long long)(bytes + partial), files + partials);
+    return hb_take(&out);
 }
 
 const char *cwick_hub_root(const cwick_hub *h) { return h ? h->root : ""; }

@@ -6,16 +6,16 @@
 
 ## Endpoint
 
-- `GET /v1/models`（以及 `/models`）—— 本实例知道的每一个本地模型，常驻的排在前面。每个条目带有 `cwick.root` 和 `cwick.loaded`，因此客户端可以区分*正在应答的是什么*与*可能应答的是什么*。
+- `GET /v1/models`（以及 `/models`）—— 本实例知道的每一个本地模型，常驻的排在前面。每个条目带有 `cwick.root`、`cwick.loaded` 和 `cwick.supported`（为 false 时还有 `cwick.unsupported_reason`），因此客户端可以区分*正在应答的是什么*、*可能应答的是什么*，以及*这个构建根本无法装载的是什么*。
 - `GET /v1/models/<id>`（以及 `/models/<id>`）—— 该形状的单个条目，否则 404 `code:"model_not_found"`。这是 OpenAI 的 retrieve-model 调用；agent 框架会用自己配置里的名字探测它一次，所以应答它可以避免一个 `/v1/chat/completions` 本来不会抛出的 "model not found"。id 会被百分号解码，因此带空格的 checkpoint 目录也能用。
 - `POST /v1/completions`（以及 `/completions`）—— 原始文本续写。
 - `POST /v1/chat/completions`（以及 `/chat/completions`）—— 对话，使用 CWICK chat 模板（`<|begin|><|system|>…<|end|><|user|>…<|end|><|assistant|>`）。
 - `POST /v1/responses`（以及 `/responses`）—— Responses 方言：输入 `input` items，输出 `response` 对象（或 `response.*` 事件）。prompt、队列、前缀缓存与 chat 完全同一套；见下面 **Responses API**。
 - `POST /v1/messages`（以及 `/messages`）—— Anthropic 方言：输入 `system` 与 content blocks，输出 `message` 对象（或 `message_start … message_stop` 事件）。同一个引擎、同一条适配器规则；见下面 **Messages API**。
-- `GET /v1/metrics`（以及 `/metrics`）—— Prometheus 文本，采用 vLLM 的命名。
+- `GET /v1/metrics`（以及 `/metrics`）—— Prometheus 文本，采用 vLLM 的命名。`cwick:model_loaded`（1/0）是实时的常驻状态位；`cwick:model_info` 保留上一次成功装载的 checkpoint 标签。
 - `POST /v1/auth/login`、`GET /v1/auth/status`、`POST /v1/auth/logout` —— 单用户登录 endpoint。登录接受 `{"password":"..."}`，设置 HttpOnly 的 `cwick_session` cookie 并返回一个 Bearer token。配置了密码之后，其他每一个 API/metrics/logs endpoint 在没有它时都返回 401；`/`、应用 HTML 和管理页面则重定向到 `/login`。
 - `GET /v1/config`（以及 `/config`）—— 本进程正在运行的选项。只读：其中的一切都是装载期的选择（见下文）。
-- `POST /v1/models/switch` —— 把常驻模型换成目录中的另一个条目，无需重启。启动之后才下载完的 checkpoint 会在这里按需发现，不需要额外的刷新调用。
+- `POST /v1/models/switch` —— 把常驻模型换成目录中的另一个条目，无需重启。启动之后才下载完的 checkpoint 会在这里按需发现，不需要额外的刷新调用。本构建没有对应内核的架构、或契约校验不通过的 config，会在**释放任何东西之前**以 400 拒绝（见下文 **切换常驻模型**）。
 - `GET /v1/hub/models`、`GET /v1/hub/downloads`、`GET /v1/hub/search?q=…`、
   `POST /v1/hub/download`、`POST /v1/hub/download/<id>/<pause|resume|retry|cancel>`
   —— 本地模型库与下载队列（见下文 **模型库**）。
@@ -334,6 +334,8 @@ curl -s -b cookies.txt -X DELETE 'localhost:8000/v1/auth/keys?id=mUDhRy6Ywlyu'
 
 `--models-dir DIR`（可重复，最多 8 个）让其他本地 checkpoint *可被列出*；在切换请求它之前什么都不会装载。一个目录合格的条件是它含有 `config.json` 以及 `resident/tensors`、`model.safetensors.index.json`、`model.safetensors` 之一；对外宣称的 id 是 `model_type`，其次 `architectures[0]`，再次目录名，重复的以 `@2`、`@3`、… 去重。常驻条目从不改名，所以 `data[0]` 保持稳定。
 
+**「下载好了」不等于「能装载」。** `/v1/models` 与 `/v1/hub/models` 的每个条目都带 `supported`，为 false 时还带 `unsupported_reason`。模型库会下载任意仓库，但只有本构建实现了内核的架构才能变成常驻模型。判定读的是 `config.json` 的 `model_type`（有 `text_config` 时取内层，与装载器读法一致），并且在目录被发现时就算好缓存下来 —— 所以被轮询的模型列表不会在持有生成锁的时候解析配置文件。Web 控制台会禁用不支持条目的切换按钮。本构建实现了 GLM-5.3、DeepSeek-V4.1、MiniMax-M3.1 三套内核，以及 `cwick setup` 生成的小 checkpoint；要支持更多架构，就是加内核并在类型表里加一行，这份清单并不表示永远只能有这些模型。
+
 发布版 checkpoint 还会额外宣称一个由目录 basename 导出的*服务名*，因为 `model_type` 是训练运行的产物，没有客户端会猜到（`glm5_next`、`deepseek_v41_text`）：`zai-org/GLM-5.3-Flash` 以 **`glm-5.3-flash`** 提供服务，`deepseek-ai/DeepSeek-V4.1-Flash-1017` 以 **`deepSeek-v4.1-flash-1017`** 提供服务。`/v1/models` 列出的就是这个名，completions 在 `model` 里回显的也是这个名，`/v1/models/switch` 接受的还是这个名 —— checkpoint 自己的 `model_type` 在各处也照旧可用，所以学过旧拼写的东西都不会坏掉。其他 checkpoint 不受影响，保留它们 config.json 里的名字。
 
 ```bash
@@ -346,10 +348,13 @@ curl -s localhost:8000/v1/models/switch \
 | 200 | `switched` | 新模型已常驻并在服务 |
 | 200 | `already_resident` | 空操作：那个 root 已装载 |
 | 404 | — | 没有该 id 的目录条目 |
+| 400 | `error` | 目标架构在本构建里没有内核，或它的 config 未通过模型契约校验；**常驻模型完全不动** |
 | 409 | `error` | 某个槽位忙、有请求在排队、tokenizer 被占用，或正在换模型 |
-| 500 | `error` | 替换的引擎或其 tokenizer 装载失败 |
+| 500 | `error` | 旧模型已释放之后，替换引擎或其 tokenizer 装载失败 |
 
-换模型进行中时，生成请求会被应答 503 `code:"model_switch"` 而不是排队：它们被校验时所依据的那个模型正在被拆掉。如果替换失败，服务端会带着「没有模型」继续运行，并应答 503 `code:"no_model"`，直到另一次切换成功 —— 它绝不会退回一个半初始化的引擎。
+**校验在拆解之前。** 切换会先重读目标的 `config.json` 并跑一遍完整的模型契约检查（dry-run），只有通过了才释放旧引擎、tokenizer、Metal arena 和前缀缓存。未知的 `model_type` 会被 400 点名拒绝，而不会再掉进默认几何解析器、最后报一个无关的字段缺失（嵌套 config 里 `text_config.pad_token_id` 为 null 时，明明外层有值却报「missing pad_token_id」就是这么来的）。这两种 400 都不释放任何东西：常驻模型继续服务，`cwick:model_loaded` 保持 1，日志里也不会出现 `switching to` / `released`。
+
+换模型进行中时，生成请求会被应答 503 `code:"model_switch"` 而不是排队：它们被校验时所依据的那个模型正在被拆掉。如果**拆解之后**替换才失败（权重损坏、缺张量、tokenizer 装载不了），服务端会带着「没有模型」继续运行，并应答 503 `code:"no_model"`，直到另一次切换成功 —— 它绝不会退回一个半初始化的引擎。此时 `cwick:model_loaded` 为 `0`。`cwick:model_info` 有意保留上一次的标签（指标名和标签在一个进程生命周期里必须稳定），所以监控面板要用这个 gauge 来区分「在服务」与「没有模型」。
 
 `GET /v1/config` 报告本进程正在以什么运行：
 
@@ -565,7 +570,8 @@ CORS 问题。
 | 方法 | 路径 | 应答 |
 |---|---|---|
 | GET | `/v1/hub/search?q=<text>&limit=<n>` | `{"models":[…],"count":N,"endpoint":…,"error":…}` —— 远端目录的精简投影：id、下载量、点赞、tags、pipeline tag、是否 gated/private。`limit` 为 1–50（默认 12）。 |
-| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` —— 库根下的每个模型目录，含字节数、文件数、未完成字节、`complete` 与 `resumable`。 |
+| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` —— 库根下的每个模型目录，含字节数、文件数、未完成字节、`complete`、`resumable`、`supported`，以及为 false 时的 `unsupported_reason`。 |
+| DELETE | `/v1/hub/models/<name>` | 删除已下载的 checkpoint。200 `{"deleted":true,"path":…,"bytes":N,"files":N}`；名字未知或不安全 404；常驻模型、或有下载线程正在写入该目录 409。 |
 | GET | `/v1/hub/downloads` | `{"jobs":[…]}` —— 实时任务表：状态、进度、字节、分片、当前文件、速率、ETA 与错误。 |
 | POST | `/v1/hub/download` | body `{"repo":"owner/name"}` → 一个任务对象。对已在下载的仓库是幂等的。 |
 | POST | `/v1/hub/download/<id>/<动作>` | `pause` / `resume` / `retry` / `cancel` → 更新后的任务对象。 |
@@ -579,6 +585,14 @@ CORS 问题。
 `POST /v1/models/switch` 按需发现。只有存在 `config.json` 且没有任何 `.incomplete` 残留时，
 一个目录才算「完整」。
 
+**删除。** `DELETE /v1/hub/models/<name>` 接受 `owner/name`、裸目录名，或扁平的
+`./models/<name>` 条目。名字会先做百分号解码；含 `..`、反斜杠、绝对路径、空分量或 `.`
+分量的名字直接拒绝；解析出的目录在 realpath 之后必须严格位于库根之内，库根本身永远不可删。
+删除是递归的，且不跟随符号链接。常驻模型返回 409（先切走）——删掉正在运行引擎已映射的权重会
+把它弄坏；仍有下载线程在写入的目录也返回 409（先取消任务），否则一次可续传的传输会变成损坏的
+一份。删除成功后，同一请求内会把 catalog 条目一并移除，所以 `/v1/models` 与磁盘保持一致；
+指向该目录的已结束任务会被标为 `canceled`，不再继续宣称 `done`。
+
 **断点续传。** 传输中的文件写入 `<目标>.incomplete`，大小与目录清单一致时才 rename。暂停、
 出错、进程被杀、重启，留下的是同一种状态；下一次发 `Range: bytes=<size>-` 接着追加。所有
 尺寸都是 64 位（`curl_off_t`），单个文件超过 100 GiB、整个仓库几百 GiB 都不会撞上 2 GiB /
@@ -590,4 +604,5 @@ CORS 问题。
 `model_library` 是库根、`model_catalog` 是目录服务地址。
 
 这些 endpoint 刻意**不做**的事：加载权重、更换常驻模型、剪枝或量化 checkpoint。允许下载一个
-引擎尚未实现其架构的仓库——它只会在切换时按引擎原有的契约错误失败。
+引擎尚未实现其架构的仓库——它会在清单里标为 `supported:false`，对它的切换请求会在**常驻
+checkpoint 被卸载之前**以 400 点名架构拒绝。
