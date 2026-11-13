@@ -504,6 +504,31 @@
   function toolCallsHtml(calls) {
     return calls && calls.length ? '<div class="tools">' + toolCallItems(calls) + '</div>' : '';
   }
+  /* Fold OpenAI streaming `tool_calls` chunks into a message. One chunk
+     opens a card (id/name/arguments:""), later chunks sharing its index
+     append to the arguments, and the closing chunk repeats the id without
+     discarding what was streamed. Pure so it can be checked without a DOM. */
+  function applyToolCallDeltas(msg, chunks) {
+    var list = msg.toolCalls || (msg.toolCalls = []);
+    chunks.forEach(function (tc, k) {
+      var fn = tc.function || {};
+      /* A streaming shard names its index; a whole array at the finish has
+         no index, so its position in that array is the call number. */
+      var idx = typeof tc.index === 'number' ? tc.index : k;
+      var prev = list[idx];
+      list[idx] = {
+        id: tc.id || (prev && prev.id) || '',
+        name: fn.name || (prev && prev.name) || '',
+        arguments: ((prev && prev.arguments) || '') + (fn.arguments || '')
+      };
+      if (!prev) {
+        msg.toolStream = '';
+        msg.toolStreamMuted = true;
+      }
+    });
+    return list;
+  }
+
   /* The block for a call still being written. */
   function toolStreamHtml() {
     return '<div class="toolstream"><div class="ts-head"><span class="ts-dot"></span>' +
@@ -757,11 +782,14 @@
         t === 'response.reasoning_text.delta') {
       return chatChunk({ reasoning_content: ev.delta || '' });
     }
-    /* The call's payload arrives as one `function_call_arguments.delta`
-       right before the item completes, so there is nothing to animate: show
-       the name while it lands, then the parsed card from the item. */
+    /* The item is announced when the model starts the call and its
+       arguments arrive as deltas while it is still writing; show the name
+       plus each shard, then the parsed card from the completed item. */
     if (t === 'response.output_item.added' && ev.item && ev.item.type === 'function_call') {
       return chatChunk({ cwick_tool: (ev.item.name || '') + '(' });
+    }
+    if (t === 'response.function_call_arguments.delta') {
+      return chatChunk({ cwick_tool: ev.delta || '' });
     }
     if (t === 'response.output_item.done' && ev.item && ev.item.type === 'function_call') {
       return chatChunk({ tool_calls: [respItemToCall(ev.item)] });
@@ -1277,16 +1305,15 @@
         schedule();
       }
       if (d.tool_calls && d.tool_calls.length) {
-        assistantMsg.toolCalls = (assistantMsg.toolCalls || []).concat(d.tool_calls.map(function (tc) {
-          return { id: tc.id, name: (tc.function || {}).name, arguments: (tc.function || {}).arguments };
-        }));
-        assistantMsg.toolStream = '';   /* the parsed call replaces the raw text */
+        /* A call now opens with id/name/arguments:"" and its arguments
+           arrive as further chunks sharing the same index. */
+        applyToolCallDeltas(assistantMsg, d.tool_calls);
         schedule();
       }
       /* Non-standard progress field (see server.c): the tool-call body as it is
-         being generated. Without it the bubble is silent for the whole call,
-         because the body cannot become `tool_calls` until it parses. */
-      if (d.cwick_tool) {
+         being generated. Once a standard call card is open, its argument
+         deltas are the better progress view, so stop appending the raw XML. */
+      if (d.cwick_tool && !assistantMsg.toolStreamMuted) {
         if (!tFirst) tFirst = nowMs();
         assistantMsg.toolStream = (assistantMsg.toolStream || '') + d.cwick_tool;
         tLast = nowMs();

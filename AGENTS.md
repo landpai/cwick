@@ -32,16 +32,65 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
 
 ## 2. Hard constraints (read before you touch anything — these are not suggestions)
 
-- **C only.** C11 plus one Objective-C file (`src/metal_objc.m`, the Metal bridge). It
-  links nothing but macOS system frameworks (Accelerate / Metal / CoreImage / ImageIO /
-  CoreGraphics) and the system `sqlite3` (`Makefile:15-16`). No third-party libraries, no
-  Python, no weight-conversion step. One-off verification tools are plain C too
+- **C only.** C11 plus two Objective-C files (`src/metal_objc.m`, the Metal bridge for the
+  expert/backbone GEMVs, and `src/q35_gpu.m`, the encode layer of the Qwen3.5 whole-step
+  forward). They link nothing but macOS system frameworks (Accelerate / Metal / CoreImage /
+  ImageIO / CoreGraphics) and the system `sqlite3` (`Makefile:15-16`). No third-party
+  libraries, no Python, no weight-conversion step. One-off verification tools are plain C too
   (`tools/*.c`); shell only drives the compiler and the runs.
-- **Three model paths, never a fourth**:
+- **Four model paths**: each owns its loader, forward pass and prompt template; they share
+  only the process, the sampler and the server. Adding a model is one more entry, not a
+  rewrite of the others.
   - GLM-5.3-flash: `spine.c` (resident weights, memory plan), `engine.c` (request →
     prefill/decode), `attention.c` (MLA/GQA/DeltaNet), `moe.c` (routing + expert GEMV/GEMM);
   - DeepSeek-V4.1: `ds_model.c` / `ds_engine.c` / `ds_ops.c` / `ds_quant.c` / `ds_prompt.c`;
-  - MiniMax-M3.1: `mm_model.c` / `mm_engine.c` / `mm_prompt.c` (+ `mm.h`).
+  - MiniMax-M3.1: `mm_model.c` / `mm_engine.c` / `mm_prompt.c` (+ `mm.h`);
+  - Qwen3.5: `q35_model.c` / `q35_engine.c` / `q35_prompt.c` (+ `q35.h`), and the GPU
+    decode step in `q35_gpu.c` / `q35_gpu.m` / `q35_shader.c`. Dense BF16 with a
+    Gated DeltaNet on 24 of its 32 layers, so it streams nothing and needs no expert cache.
+    It is the only checkpoint small enough to be held whole: `q35_model_open` faults all
+    17.98 GiB in and wires it (plus the KV/DeltaNet state) when the size policy allows, and
+    its prefill is parallel over value heads (delta rule) — 58% of prefill on one core
+    before it was split. Attention is **two GEMMs** (score and output) through Accelerate,
+    with the causal mask written into the rectangle as -1e30 so the softmax argument is
+    unchanged; hand-written tiles ran at 22 GMAC/s against cblas's 750 at the same shape
+    (`tools/attnbench`). Decode is a separate path (`dec_scores`/`dec_out`): one position,
+    sixteen heads, so the code walks K/V rows and lets each 4 KiB row serve sixteen dots —
+    a per-head matrix-vector call reads 1 KiB out of every 4 KiB and runs at 13 GB/s. The prefix
+    cache carries this backend's state as `kind = 3` (`q35_prefix_pack`/`_apply`), and a
+    capture is only useful if it stops where the *next* turn stops agreeing — the last
+    8 tokens are searched for a thinking marker for exactly that reason. `CWICK_Q35_PROF=1`
+    prints the per-block split. Two norm conventions live in that checkpoint: plain RMSNorm
+    uses `1 + w`, the gated one inside the DeltaNet uses `w`. RoPE is `rotate_half`, not
+    adjacent pairs, and `q_proj` interleaves `q | gate` per head. All three are documented
+    in DECISIONS §51 because all three are silent when wrong; residency and the parallel
+    phases are §52, the GEMM rewrite and the f32 cache §54. Decode takes the GPU as one
+    command buffer (§61). Speculative verify is `CWICK_Q35_VERIFY=k` (k consecutive
+    positions, one weight pass, no drafter — timings are real, text is not) and
+    `CWICK_Q35_SPEC=k` (k drafts then a k+1-row verify; k drafts, not k rows — `SPEC=1` is
+    one draft and a two-row pass). The drafter is the checkpoint's own MTP block when
+    `model-mtp.safetensors` is present, prompt lookup otherwise; `CWICK_Q35_MTP=0` forces
+    lookup. It loses in every shape measured — 20.21 tok/s against 20.66 — so it is off by
+    default and §64 has the numbers. Its knobs: `CWICK_Q35_MTP_FULL=1` projects a draft
+    through all 2.03 GiB of vocabulary instead of the candidate slice (acceptance 0.356
+    against 0.168 on prose, for 5.5 ms), `CWICK_Q35_CAND=n` sizes that slice (default
+    4096), `CWICK_Q35_MTP_WIN=n` sizes the block's own KV window (default 512 rows, 4 MiB),
+    `CWICK_Q35_MTP_POSTNORM=0` feeds the fusion the residual stream instead of the
+    final-normed hidden, `CWICK_Q35_MTP_SWAP=1` inverts the fusion order (which zeroes
+    acceptance, so leave it), and `CWICK_Q35_MTP_NOATTN=1` closes the block's attention
+    half for an ablation, `CWICK_Q35_CAND_T=f` / `CWICK_Q35_CAND_LCAP=n` set how
+    much of the shortlist comes from the previous step's logits (DECISIONS §65),
+    `CWICK_Q35_ROWFUSE=0` puts the k-row pass back to one dispatch per row for
+    the row-local kernels, and `CWICK_Q35_GEMVN_RW=n` sweeps the k-row GEMV's
+    simdgroups per threadgroup (measured flat, §65). `CWICK_Q35_GPU_CHECK=1` compares every row of a k-row pass against the
+    same GPU path run one row at a time and must print `0.00000`; `CWICK_Q35_GEMVN_RP=1|2`
+    forces the verify kernel's rows-per-simdgroup for a same-session A/B, since the baseline
+    drifts up to 20% between sessions. `CWICK_Q35_SPEC_POISON=i` deliberately corrupts draft
+    i to exercise the partial-accept path. The verify kernel reads activations straight from
+    device memory and runs 128-thread groups; it is ablative-measured by `tools/q35gemab`
+    (`ABL=0..3`, `MODE`, `PF`, `RPF`, `TH`, `NSGV`), which is how its marginal row was traced
+    to activation traffic rather than arithmetic. §62 is the verify and the drafter, §63 the
+    per-row cost of the kernel that does it.
   Supporting a new model means a new loader + new dequantisation + a new prompt template
   + new kernels. **It is not a config change.**
 - **Quality rules are non-negotiable**: top-k comes from the checkpoint's own
@@ -65,6 +114,12 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
 - OpenAI-compatible API: `/v1/models`, `/v1/models/<id>`, `/v1/completions`,
   `/v1/chat/completions` (SSE, `reasoning_content` separate from `content`, `tool_calls`
   generated in each checkpoint's own protocol and parsed back to the OpenAI shape).
+  Streaming tool calls open as soon as the function name is written and append
+  standard argument shards, including **inside** a long parameter value, so a
+  one-parameter call fills in instead of landing whole at the end (§59).
+  `delta.cwick_tool` remains for the bundled console. Two tool XML dialects are
+  accepted (flat `<arg_key>` and nested `<function=>`), both rewritten to one
+  parser (§58). The DeepSeek DSML dialect is **not** parsed yet (§59).
 - Responses API (`POST /v1/responses`): `input` items (message / function_call /
   function_call_output, flat `function` tools) are translated into the chat request the
   rest of the server already validates, then answered as a `response` object or as
@@ -97,7 +152,10 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   500K would be 64 GiB).
 - Thinking depth: 关/低/中/高/超高/极致 → 0/512/2048/8192/16384/32768, and **the engine
   enforces the ceiling itself** (it writes the closing marker into both the output and the
-  context when the budget is spent).
+  context when the budget is spent). **A request with no reasoning field defaults to 关**
+  (`server.c`: `CWICK_THINK_DEFAULT_LEVEL`), identically to an explicit `none`; the
+  level is passed to the renderers as a real level, not as an "unset" sentinel.
+  The bundled web console sends `reasoning_effort` explicitly and is unaffected.
 - Prefix cache (`pfx.c`): the inference state is snapshotted to `--prefix-cache-dir` at the
   end of each prompt and replayed when the next request starts with the same tokens. A
   403-token prompt: 169.4 s cold → 9.95 s warm.
@@ -113,7 +171,10 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   decision prompt is *one* block and a full block costs 140–200 s on the 60-layer
   checkpoint — per-layer is the only useful granularity, otherwise a single-block prompt
   prints nothing for minutes), decode reports `decode(thinking)` / `decode(content)` /
-  `decode(tools)` separately.
+  `decode(tools)` separately on every per-step and periodic line. The phase hint is
+  pushed to all four backends (`engine.c`: DS / MiniMax / Qwen3.5 / GLM), and the
+  transition line also carries the finished phase's rate. Qwen3.5's prompt ends with
+  `<think>\n`, so its open marker is found in a 4-token window (§56).
 - Decision prefill (`jev.c` + `engine.c`, `docs/DECISIONS.md` §44): the questions of one
   request are encoded up front, the longest common *token* prefix is prefilled once and
   each question resumes from it. MiniMax: 1145 input tokens → 449 prefilled,

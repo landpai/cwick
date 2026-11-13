@@ -2244,3 +2244,1062 @@ deleted」，UI 不会继续显示一个文件已经不在的「已完成」。
 `.`；成功删除并报告两个文件、目录不再存在；不存在的名字 404；穿越的名字 404。对着一台真服务：
 三种布局删除都 200 且字节数正确，`/v1/hub/models` 与 `/v1/models` 同步消失，常驻模型 409，
 `..` / 绝对路径 404。
+
+## 51. 那个走了五次弯路才答出「4」的 checkpoint
+
+goal 模型清单的第四项是 Qwen3.5-9B：32 层，其中 24 层根本没有 softmax 注意力。它们
+带的是 Gated DeltaNet——一种循环线性注意力，用每个 value head 一个 [128,128] 状态
+代替 KV cache；剩下 8 层是普通 GQA，但有三处不同：Q/K 上各有一个 per-head RMSNorm、
+只旋转每个 head 四分之一维度的 partial RoPE、以及把 `q_proj` 宽度翻倍的输出门。全部
+BF16、18 GiB、没有专家，所以既不需要流式读盘，也不需要专家缓存预算。
+
+**移植跑起来了，然后连着五轮吐垃圾。** 每一轮的数字看着都合理，文字全都无用：先是无尽
+的空格，然后是无尽的换行，再然后是标点。出路不是继续盯着代码，而是**用 numpy 再写一份
+实现**，读同一批 shard、打印同一批统计量，再和参考 C 逐层对比。
+
+正是这个对比让问题显形。第 0 层 post-mixer 的均值、绝对最大值、前四个值**逐位到打印精度**
+都相同（`mean=0.00455 absmax=13.636 x[0..3]=0.1058 0.2135 0.0251 -0.0635`），
+第 1-3 层和最终 logits 排名也一样（`220(11.874)` 对 `220(11.877)`）。两份独立实现吻合到
+这个程度，并不说明移植对了，而是说明移植**忠实地实现了同一个错误的想法**——要修的是那个
+想法，不是代码。于是路线改成逐行读发布的模型源码。
+
+**五个彼此独立的错误，全都是静默的：**
+
+1. *卷积读错了行。* `src` 是块内的绝对位置，代码却把它加到了逐位置的基址上，于是位置 t
+   读到的是块内位置 t+src。块长足够时看不出来，一旦块比窗口要求的短，前几次运行就越界读了
+   未初始化内存，从第八个 token 起 conv 输出变成 0。正是这一点把最初的判断从「模型坏了」
+   改成了「模型没坏，是卷积差了一个位置」。
+
+2. *同一个文件里有两种 norm。* 这个 checkpoint 的每个 RMSNorm 都把权重存成相对 1 的偏移
+   （`Qwen3NextRMSNorm`，初始化为 0，乘子是 `1 + w`）——第 0 层 input norm 的均值是
+   0.033 而不是 1。但 DeltaNet 内部那个门控 norm 存的是普通乘子（`RMSNormGated`，初始
+   化为 1）。两边都加 1 或者都不加，会以两种不同方式把模型弄坏；判断依据就是「一族权重贴着
+   0、另一族贴着 1」。
+
+3. *旋转的形状错了。* 这里的 RoPE 是 `rotate_half`：被旋转的那段前后两半互换，索引 i 与
+   i + rotary/2 配对。移植用的是相邻配对 (2i, 2i+1)，也就是 GPT-J 的排布。两者都是旋转，
+   数值范围都正常，但在每个位置上都不同。**这是最大的一处错误。**
+
+4. *递推衰减的时机错了。* 定义的动作是先 `S = decay*S`，再用**衰减后的状态**算
+   `delta = beta*(v - S^T k)`，最后 `S += k (x) delta`。先读后衰减，会让每个位置的修正
+   都乘上一个本不该乘的衰减。
+
+5. *`q_proj` 是按 head 交错的。* 输出是 `n_heads x (q | gate)`，因为参考实现把它 view 成
+   `(..., n_heads, 2*head_dim)` 再切最后一维。把整块的前一半当 q 读，会把某个 head 的
+   gate 混进下一个 head 的 query——而数值范围依然正常，所以没有任何东西报错。
+
+**每一处是怎么定的。**（2）来自权重统计：均值为 0.033 的 norm 不可能是乘子。（1）（3）（4）
+来自在 numpy 对拍证明「代码确实在做它被写成要做的事」之后去读发布实现。（5）同样来自那次
+阅读，也正是它让「2+2」的回答从一串「2」变成了 `4`。
+
+**最终结果。** 五处全修之后，checkpoint 中英文都能正确作答，用 `<|im_end|>` 干净收尾，
+流式正常：`What is 2+2?` 返回 `4` 并停止；`用一句中文介绍你自己` 返回一句通顺的中文；
+`17 times 23` 产出 7 步推理链、以 `391` 结束，正文也是 `391`。decode 实测 **4.85 tok/s**
+（124 token 样本）——每步读 18 GiB、本机实测带宽上限 123 GB/s 对应 6.8 tok/s，也就是说
+内核跑到了内存总线允许的约 71%。prefill 是 512 位置一块、按层推进，递推在块内逐位置走
+（扫描本身不能加宽），24 层的状态合计 50 MiB，而 KV cache 若按同样长度会无界增长。
+
+**没有实现的部分，以及原因。** 视觉塔（27 层 `model.visual.*`）和 MTP 草稿头（`mtp.*`）。
+两者都无法从纯文本 prompt 触发：图像需要 `image_token_id` 位置展开成 patch，MTP 只对
+本构建并未使用的投机解码有意义。字节留在磁盘上，从未被绑定。另外也没有实现 `mrope` 的
+多模态位置分配——对文本而言三路位置相同，它退化为普通 RoPE。
+
+**覆盖。** 该架构和其它三个一样由同一张类型表准入（`qwen3_5`、`qwen3_5_text`），所以
+catalog 会标 supported、切换 dry-run 会放行。回归套件里「未知架构按名字拒绝」的用例改用
+了一个不存在的名字（`mamba9`），不再用这一个。
+
+## 52. 18 GiB 装得下，那就放进核里——顺带照出了两个串行段
+
+Qwen3.5-9B 是这棵树里第一个**比机器小**的 checkpoint。它没有路由专家，所以什么都不流式、
+也没有缓存预算要算：18 GiB 的每一个字节，每个位置都要读一遍。于是「让权重常驻内存」不再
+是偏好，而是一个有答案的尺寸问题。
+
+**策略。** `q35_resident_wanted(weights, state, host, ceiling)` 在「权重 + 状态不超过内存
+一半」且「在配置上限之下还留 4 GiB」时回答 yes。是一半，不是全部：被 wire 的页收不回来，
+一个要吃满半台机器的 checkpoint，会让长上下文的 KV、让这台服务器还能切过去的别的
+checkpoint、以及让系统都没有地方待。内存总量未知一律回答 no——这个判断的意义就在于不做
+没有测量依据的决定。`CWICK_Q35_RESIDENT=0|1` 两个方向都能覆盖。
+
+**机制。** `cwick_safetensors_make_resident(saf, prefix, wire)` 先把某个名字前缀下所有张量
+的字节区间收集起来、排序、把首尾相接的段合并（一层的那几个矩阵在分片里是挨着的，于是几百
+次 `mlock` 收成几十次），然后逐段：`MADV_WILLNEED` 把预读排上，`mlock` 一次系统调用完成
+「缺页装入 + wire」，**只有 wire 被拒绝时**才退化成走线程池的并行触页；最后 `MADV_NORMAL`
+——因为 mmap 时装的 `MADV_SEQUENTIAL` 说的是「这份文件顺序读一遍就完了」，而这里要住下来，
+留着它等于允许内核在读指针后面把页丢掉。释放是对称的，发生在
+`cwick_safetensors_close` 里 `munmap` 之前（只 munmap 不 munlock，记账里会留下已经不存在的
+字节）。KV 和 DeltaNet 状态也一起 wire——那是匿名内存，VM 宁可压缩也不换出，而被压缩的 KV
+页会变成 attention 里面的一次停顿，而不是边角上的一次。
+
+**买到什么。** 17.98 GiB 在加载期用 **2.6 s**（7.5 GB/s）装完并 wire 上，只付一次。44 token
+的 prompt 上 prefill 从 **2370 → 1569 ms**（1.5×），因为第一块不用再在请求的关键路径上
+吃 120 万次次缺页；760 token 的 prompt 是 13415 → 12207 ms（1.1×），剩下的都是真活。
+decode 不动：每步 18 GiB 对实测 123 GB/s 上限就是 6.8 tok/s，而内核本来就在 7.0 tok/s
+上跑着 92% 的总线。单发一个短请求刚好把 2.6 s 还回去；常驻服务只付一次。
+
+**照出了什么。** 缺页风暴一停，prefill 才第一次能被诚实地分相（`CWICK_Q35_PROF=1`，每块
+一行）。176 位置的块：mixer GEMM **748 ms**、MLP **1787 ms**、delta 递推 **2142 ms**、
+attention **1415 ms**。也就是 58% 的 prefill 压在一个核上，而这两段本来是尴尬并行的，只是
+当初照着公式串行写下来了：
+
+- delta 递推在位置上不能并行（它是 scan），但在 value head 上可以：每个 head 独占自己的
+  `[128,128]` 状态，从不读别人的。每层一次派发，一个 head 一个工作项。
+- attention 只是看起来串行：这一块的 KV 存完之后，每个 (位置, head) 都是独立的。工作项是
+  `(head, 位置分组)`，位置在各组之间**交错**分配而不是切成连续段——位置 400 的 query 的
+  成本是位置 100 的四倍，切连续段等于把所有贵活塞给同一个 worker。每个 worker 自己申请
+  打分向量；`m->scores` 只够一个 query，是共享 scratch。
+
+同一块的结果：delta 2142 → **379 ms**，attention 1415 → **142 ms**，整块 6092 → **3009 ms**，
+decode 一步 147 → **129 ms**（每 token 的递推原本就占 12 ms）。端到端，760 token 的 prefill
+从 **45.1 s 降到 12.2 s**（17 → 62 tok/s），而输出与串行版**逐位相同**（`CWICK_THREADS=1`
+对拍无差异）——并行版没有重排任何别的线程会读的东西。
+
+**顺手发现的一个 bug。** `ssm_state` 是按**拼接后**的 `val_dim × key_dim` 分配的，是前向
+真正索引到的 16 倍。它照样能跑，因为代码走的是 head 步长——只是白白占了 800 MiB 从来没人
+碰的内存。改成按 head 分配（`heads × 128 × 128` = 每层 2 MiB）后，空闲 RSS 从 19.95 降到
+19.24 GiB，`q35_cache_bytes` 与实际分配也对上了。
+
+## 53. Qwen3.5 的前缀缓存一个字节都没写进去，而 attention 比它自己的 GEMM 慢 40 倍
+
+两个缺陷都是读一个在跑的服务的日志读出来的，不是读代码读出来的：每个请求都打
+`prefix capture failed: prefix: capture position 74 outside 0..0`；以及一条 31,690 token 的
+prompt，prefill 速率从 73 tok/s 一路掉到 14.8 tok/s，eta 却越涨越大。
+
+**缓存从来没存过一个字节。** `cwick_engine_pos()` 回答「这个引擎手里有多少个位置」，它只有
+DeepSeek 与 MiniMax 两个分支；Qwen3.5 的游标在 `eng->q35->pos`。于是每次捕获都因为越界被拒，
+`prefix_cache_hits_total` 永远涨不起来，`./pfxcache` 一直是 0 字节——功能是关着的，而且不说。
+补上那个分支并不等于修好：`cwick_engine_capture_prefix` 也没有 q35 分支，补完游标它会掉进
+mHC/KDA 那套布局去读 `eng->keys`，而这个后端从来不分配它。所以 Qwen3.5 需要的是另外两个后端
+早就有的那套不透明 blob 契约：`q35_prefix_pack` / `q35_prefix_apply`，`kind = 3`，捕获与恢复
+各一个分支。blob 先放固定部分（24 层的 conv + DeltaNet 状态，50 MiB），再放 8 个注意力层的
+KV 行，这样 `pos` 可以只从长度反推出来——截断后的快照仍然能应用，而这正是「整段命中」那条路
+需要的能力。
+
+**然后是扩展仍然不命中。** 捕获通了之后，同一个 prompt 原样重发会命中（587 token：9556 ms 的
+prefill 变成 **147 ms**），但同一段对话的下一轮不命中。实测：第 N 轮 232 token、第 N+1 轮
+265 token，两者前 228 个 token 一致。把两个 `.pfx` 里的 token 列表 dump 出来才看清原因：
+服务端会在 prompt 末尾补上思考块，而 `reasoning_effort: none` 时补的是**预先闭合**的那一个，
+共 4 个 token（`<think>`、`\n\n`、`</think>`、`\n\n`）。下一轮把 assistant 的回复渲染成
+「header + 正文」，从不重发这个块，于是两个 prompt 正好在这 4 个 token 的第一个上分开。
+原来那个「少一个 token 的孪生快照」覆盖的是思考开启的情况（那时块就是单个开启标记），在这里
+差 3 个 token。修法是：在最后 8 个 token 里找开启标记，把孪生快照建在那个位置；有了它，
+第 N+1 轮复用 228 个 token、只需要 prefill 37 个，而不是退回 4 KiB 的块检查点。
+
+**attention 跑在 8 GMAC/s。** 把数字摆在一起看毫无歧义：bf16 GEMM 路径约 550 GMAC/s，而
+attention 内层——每次迭代一个标量乘加、中间夹一次 bf16 转换，并且每来一个 query 就把所有
+K/V 行重读一遍——只有 8。两处改动，都不改变任何求和的顺序：
+
+- **一次处理 8 个 query。** 工作项仍然是 `(head, 交错位置分组)`，所以一个 tile 是每隔 G 个的
+  位置，里面 8 个 query 除了 `7*G` 个 key 之外全共享。每行 K、每行 V 现在每个 tile 只读一次，
+  而不是每个 query 读一次——这就是 0.5 MAC/字节 与 4 MAC/字节 的区别；标量内核原本不是被总线
+  卡着（实测 123 GB/s 里只用了 16），而是被指令数卡着，只做向量化会把瓶颈直接推到总线上。
+- **点积与 axpy 走 NEON。** bf16 就是 f32 的高 16 位，左移 16 位再重新解释是精确的：没有查表、
+  没有舍入，一条指令四个 lane。
+
+用与出问题那条请求同形状的 prompt 各起一个进程实测：
+
+| prompt | 改前 | 改后 | ~14K 处的单块 |
+|---|---:|---:|---:|
+| 760 token | 12.3 s（61.6 tok/s） | **10.0 s（76.2 tok/s）** | — |
+| 7,600 token | 314 s（24.2 tok/s） | **102 s（74.4 tok/s）** | — |
+| 14,060 token | 935 s（15.0 tok/s） | **214 s（65.8 tok/s）** | 63.3 s → **9.6 s** |
+
+「改前」一列是拿那次 31K 实跑的日志拟合出来的曲线（`t(n) = 0.0117n + 3.90e-6n²`，对它自己的
+进度预测误差 1%）；同一条曲线给出那条 31,690 token 的 agent prompt 是 4285 s，而新的分相
+（14K 处 GEMM 4.5 s、delta 递推 1.1 s、attention 3.7 s）推算它大约 13 分钟。attention 仍然是
+唯一随上下文平方增长的项（14K 时占一块的 38%），但它是 130 GMAC/s，不是 8。
+
+输出没有变：三个固定 prompt 走接口产出的文本与改动前逐字节相同；760 token 的 prompt 在
+`CWICK_THREADS=1` 与 12 线程池之间也逐字节相同——分块改变的是谁读什么，不是任何求和的顺序。
+
+**而且窗口离失败只差一轮。** `max_tokens 65536 clamped to 1078: prompt 31690`——在
+`--context 32768` 下，一条 30K token 的 agent prompt 只剩 1078 个输出 token，**下一轮根本放不
+下**。这个 checkpoint 允许 262144，KV 是每个位置 33.6 KiB，所以 `start.sh` 现在要 131072：
+在 17.98 GiB 已 wire 的权重之上再加 4.05 GiB 缓存，常驻策略依旧批准。
+
+## 54. attention 是这棵树里唯一一个不是 GEMM 的内核
+
+30K token 的 prefill 退化只来自一项，上一节已经点名了：attention。但 §53 留下来的是
+一个手写分块内核，跑在 130 GMAC/s，而这棵树的 GEMM 路径跑在 790——所以那一项不是
+「不可约的二次工作」，而是做坏了的二次工作。本节是把两者分开的那组测量，以及随后的重写。
+
+**问题的形状。** 每个 512 位置的块里，除 attention 外都是平的：GEMM 4.5 s、delta 递推
+1.1 s、激活 0.27 s。attention 随这个块能看到的 key 数增长——每个块线性，于是整条 prompt
+是二次的。一次实跑的记录（块序号 → ms）：
+
+    1: 75   2: 182   3: 271   5: 438   8: 872   10: 1081   15: 1558   22: 2867
+
+也就是每 1000 个 key、每块 0.26 ms。折算到 30K 位置，一个块要在 attention 上花 7.8 s，而
+32 层的全部投影只花 4.5 s。
+
+**改之前它花在哪。** 按阶段插桩（一块、11K 处的线程时间）：QK 43%、softmax 6%、AV 51%。
+不是单点瓶颈而是两个，而且都不是算力：QK 内层每 4 个 MAC 做一次 `vshll` + 一次 `fma`，并且
+**每个 key 都把 query 向量从内存重读一遍**；AV 内层**每个 key 都把 1 KiB 的输出累加器读出来
+再写回去**。1.45 GMAC/s 每线程——同一个线程在普通 f32 点积上能做到 16.8。
+
+**两段各自能到多少。** `tools/attnbench` 在真实形状（512 query、16 头、256 维）和相同 MAC
+数下单线程跑两段：
+
+| 阶段 | 现有实现 | 手写重排 | cblas_sgemm |
+|---|---:|---:|---:|
+| score（QK） | 22.2 GMAC/s | 31.0 GMAC/s（1.4×） | **750.6（33.8×）** |
+| output（AV） | 18.9 GMAC/s | 43.8 GMAC/s（2.3×） | **477.1（25.2×）** |
+
+在恢复后的代码上重跑 `make tools/attnbench && ./tools/attnbench`（11,000 个 key）：
+score 是 21.9 → 920.3 GMAC/s（42×），output 是 18.7 → 888.9（48×）。cblas 的绝对值会随
+形状和机器状态变，40 倍这个差距不会。
+
+「手写重排」是指每个 key 行服务四个 query、把展宽后的 key 留在寄存器里、16 个累加器全程存活。
+它是真的有效，但离 GEMM 路径差 20 倍。原因不复杂：这两段就是 `S = Q·K^T` 和 `O = S·V`，而这个
+模型里其他每一个投影早就走 Accelerate 了。结论是别再手写。
+
+**重写。** `mixer_attn` 现在按（query 头, 128 query 的 tile）计算：
+
+    S[nq x keys] = Q[nq x 256] · K[keys x 256]^T     （cblas，alpha = 1/sqrt(256)）
+    掩码：每行超出自己位置的列置 -1e30，然后 softmax
+    O[nq x 256]  = S[nq x keys] · V[keys x 256]      （cblas）
+
+因果掩码作用在一个矩形上而不是跳过三角形：被掩的位置指数后恰好是 0，所以和原代码算的是同一
+个和，而 GEMM 拿到了它喜欢的形状。同样的块上实测：QK **818 GMAC/s**、AV **537 GMAC/s**。
+
+**一个在发布前就抓到的坑。** 第一版保留 bf16 KV 缓存，每层把可见行展宽到一块 f32 scratch。
+这对 prefill 没问题（30K 时每层 4 ms），对 decode 是灾难：n = 1 时每个 token 会把**整个**缓存
+展宽一遍、八次，只为算一个 query。现在缓存本身就是 f32，展宽整个没了。盘上的快照仍然是 bf16
+（一半字节、同样预算下一倍快照数），pack 走 `q35_narrow_rows`、apply 走 `q35_widen_rows`；
+代价是每个位置 64 KiB 缓存而不是 32，即 128K 时 8.1 GiB，对着 18 GiB 权重。
+
+**decode 是另一种形状。** 一次只有一个位置，16 个头读的是同一行——一行 4 KiB 可以服务 16 个
+点积（4 个 kv 切片 × 每组 4 个 query 头）。第一版用「每头一次 sgemm」，M=1 让 Accelerate 走进
+一条坏路径：30K 上下文每步 149 ms，decode 掉到 3.4 tok/s。改成 gemv 仍然只有 13 GB/s——每次
+只读 4 KiB 里的 1 KiB，预取器没法工作。最终 `dec_scores` / `dec_out_slices` 是行走内核：一行读一次、
+用十六次。11K 处一步从 190 ms 降到 139 ms（7.2 tok/s），31K 处从 294 ms 降到 161 ms
+（6.2 tok/s）；其中 score 段 8 ms、output 段几 ms，剩下的 111 ms 是权重。
+
+**结果。** 同样的 prompt、各一个进程、`--context 131072`：
+
+| prompt | 改前 | 改后 |
+|---|---:|---:|
+| 760 token | 10.0 s（76.2 tok/s） | 10.0 s（76.2 tok/s） |
+| 14,060 token | 214 s（65.8 tok/s） | **184 s（76.2 tok/s）** |
+| 30,970 token | 约 700 s（§53 曲线外推，末段 37 tok/s） | **436 s（71.0 tok/s）** |
+
+11K 位置的一个块从 8.9 s 降到 6.8 s，其中 attention 从 2.87 s 降到 0.83 s。剩下那部分增长是
+诚实的：QK 与 AV 每个块按定义就是 `O(keys)`，而 `16 头 × 512 query` 个分数上的 softmax 现在
+占 attention 的 28%（11K 时每块 230 ms）。attention 仍然是唯一随上下文增长的项，但增长系数从
+每 1000 key 每块 0.26 ms 降到 0.075 ms，于是速率贴着平地那段的 76 tok/s，而不是往 37 掉。
+
+**精确性上付出了什么。** cblas 的累加顺序和原来四累加器的点积不同，所以 prefill 不再与上一版
+逐位相同。输入仍然是 bf16 的 key 精确展宽成 f32、算术仍然是 f32，差别只在加法如何分组。三个
+固定 prompt 走接口产出的文本与重写前相同，而贪心解码正是「如果不同就会暴露」的那个检验。原来
+那个性质——760 token 的 prompt 在 `CWICK_THREADS=1` 与线程池之间逐位相同——现在是 cblas 的
+性质，不是我们的。
+
+
+## 55. 请求不带思考字段时，默认直接回答
+
+**现象。** 指向 OpenAI 兼容端点的 agent 类客户端通常只发 `messages`、`tools`、
+`max_tokens`，完全不带思考字段。`validate_body` 过去把这个情况默认成「极致」
+（预算 32768、header `Max`），请求行打印 `thinking=极致 (effort=Max, default)`。
+一个 37,638 token 的请求实测：`decode phase: thinking` → 52 token 后转 `content`
+→ 再 21 token 转 `tools`，随后按 ~5 tok/s 流式吐出很长的工具参数、跑了几千步。
+客户端只渲染那句开场白，之后一直停在「生成回复中」——工具参数增量不作为答案文本
+渲染。单槽 + `CWICK_ABORT_ON_DISCONNECT=0` 意味着客户端停止也不会释放槽位；
+客户端自己的 `max_tokens`（65536）还覆盖了启动参数 `--max-tokens`。
+
+**根因的后半段。** 旧默认值不只是一个档位，它还是「缺失」。
+`run_generation` 给三个模板渲染器传的是
+`gr->effort_defaulted ? NULL : gr->effort_level`，这是有意为之：让每个 checkpoint
+用自己的默认（DeepSeek header 75、MiniMax / Qwen3.5 的 `thinking=true`）。
+所以只把默认档位改成「关」是不够的——prompt 仍会打开思考块，而引擎拿着 0 预算
+立刻把它关掉，同一轮里两半互相矛盾。
+
+**改动。** `CWICK_THINK_DEFAULT_LEVEL` / `_EFFORT` 定义为 `关` / `Low`，放在
+`THINK_LEVELS` 旁边；日志回退也用同一对宏。删掉三处
+`effort_defaulted ? NULL : ...`，让「字段缺失」以真实档位「关」走下去，与显式
+`reasoning_effort:"none"` 完全同一条路径。`cwick_thinking_default_level()`
+把该值暴露给测试套件，断言它等于 `resolve("none")`。四种显式拼写仍然优先，
+未知拼写仍然 400。
+
+**影响面。** chat / responses / messages 都要合成一个 chat body；不带思考字段时
+合成出来的 body 也不带，于是三个方言自动跟随新默认，不需要各自加开关。
+决策端点不变（它本来就拒绝任何非 `none` 的 effort）。内置 Web 控制台会显式发送
+`reasoning_effort`，保持它自己选的档位。CLI `run` 没有请求体，与此无关。
+
+**验证。** `make test` PASS，新增 1 条断言（合计 671）。在 18001 端口起了一个
+临时服务（Qwen3.5，`--context 8192`），发五个请求实测：
+
+| 请求 | 日志行 | 首个 decode 阶段 | think token |
+|---|---|---|---:|
+| chat，不带字段 | `thinking=关 (effort=Low, default)` | `content` | 0 |
+| responses，不带字段 | 同上 | `content` | 0 |
+| messages，不带字段 | 同上 | `content` | 0 |
+| chat，显式 `reasoning_effort:"high"` | `thinking=高 (effort=High)` | `thinking` | 1 |
+| chat，显式 `reasoning_effort:"none"` | `thinking=关 (effort=Low)` | `content` | 0 |
+
+不带字段的 chat 响应是 `content:"2"`、`reasoning_content:null`、
+`reasoning_tokens:0`，汇总行 `think=0 tools=0 content=1 think_cap=0`；
+三个不带字段的请求都没有进入 `decode phase: thinking`，显式档位仍然优先。
+要恢复旧行为：把两个宏改回 `极致` / `Max` 并恢复三处三元表达式——但那也会
+把 prompt / 引擎不一致一起恢复。
+
+**不在本次范围内。** `max_tokens` 仍由客户端控制、仍会覆盖 `--max-tokens`；
+服务端硬上限是另一个独立决策。
+
+
+## 56. 阶段标签一直存在，但没送到第四个引擎
+
+**按 goal 第 10 条验收。** 一份 Qwen3.5 的 573 行服务日志（`--verbose --trace`，
+15:03）里有 96 行 `decode forward ...` 和 2 行定期 `decode N/32768 tokens ...`，
+`decode(` 出现 **0 次**。只有两行阶段切换提到了阶段名
+（`decode phase: content at token 1`、`content -> tools after 27 tokens`）。
+prefill 是好的：`[prefill] ~91/364 tokens (25.0%), layer 8/32 — 68.3 tok/s,
+eta 4s`，且每行都带墙上时间和 `[req N]`。
+
+**根因一：阶段提示只送到三个后端。** `phase_trk_observe` 每个 token 都会调
+`cwick_engine_set_decode_phase`，而这个 setter 只把提示复制进 DeepSeek 与
+MiniMax 的上下文，**漏了 Qwen3.5** ⇒ `q35_ctx.decode_phase` 恒为 NULL，
+`q35_phase_label` 在每步行和定期进度行上都打印光秃秃的 `decode`。
+`set_stop` / `set_abort_poll` / `set_verbose` 有同样的三缺一；现在四个 setter
+都覆盖全部后端。这与 §19（每请求字段只被一个循环看到）是同一类问题，
+只是晚了一个后端。
+
+**根因二：thinking 阶段根本不会结束。** Qwen3.5 的生成 prompt 以
+`<think>\n` 结尾，即开标记后面还跟一个换行 token。`run_generation` 只测
+`ids[nids-1] == think_open_id`，于是判成「opened by the model」，以
+`open_at_start=false` 装上预算。而 `cwick_think_plan` 只有在 `think_open`
+为真时才注入闭合标记；模板已经写过开标记，模型不会重写，预算因此永不触发。
+`CWICK_THINK_BUDGET=8` 下一个 130 token 的 `high` 请求实测
+`think=130 content=0`。闭合标记的检测本来就对两个「尾部带空白」的模板用了
+4 token 回溯窗口；现在同一个辅助函数（改名 `prompt_token_near_end`）也用于
+Qwen3.5 的开标记，并用 `!pfx_closed_at_start` 保护，保证已由模板关闭块的
+情况仍报「already closed」。
+
+**改动。** `engine.c`：四个 setter 补 Qwen3.5 分支。`server.c`：共用窗口函数、
+Qwen3.5 开标记检测、阶段切换行补该段速率。没有改内核、精度或采样。
+
+**实测**（18001 临时服务，Qwen3.5，`--context 8192`、`--verbose`、
+`CWICK_PROGRESS_MIN_MS=1000`，预算检查用 `CWICK_THINK_BUDGET=8`）：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 每步行 | `decode forward 1/32767 161 ms` | `decode(tools) forward 1/69 140 ms` |
+| 定期进度行 | `decode 34/32768 tokens (0.2%)` | `decode(thinking) 8/26 tokens (30.8%)` |
+| 阶段标签 | 无 | thinking / content / tools，每行都有 |
+| 阶段切换 | `... after 27 tokens (3.9s)` | `... after 8 tokens (1.1s, 7.01 tok/s)` |
+| 预算 8 | `think=130 content=0`，从未触发 | `wrote </think>`、`think=10 content=20` |
+| 不带思考字段 | — | 不变：`reasoning_content:null`、content `2` |
+
+预算修复对「显式开思考」是真实的行为变化：长思考块现在会在上限处收尾并给出答案。
+默认不思考路径不变（`block already closed by the template`、
+`decode phase: content at token 1`）。`make test` 671 断言 PASS。开标记窗口
+只用于 Qwen3.5；MiniMax 仍用「最后一个 token」的精确判定，因为本次没有
+实测支持改它。
+
+**不在范围内。** 一个手写工具请求报 `model emitted undeclared tool
+<function=get_time>`，那是工具格式不匹配，与日志/阶段无关，未动。
+
+
+## 57. 为什么 tools 阶段前端没有流式展示
+
+**问题。** 开场白之后，外部前端在整段 `decode(tools)` 里一直停在「生成回复中」，
+而引擎明明还在跑：一个 38 工具的真实请求在
+`content -> tools after 27 tokens (4.1s, 6.53 tok/s)` 之后又打了 637 行
+`decode(tools)`，约 7 tok/s。
+
+**实测。** 18001 临时服务，Qwen3.5，`stream:true`，声明一个工具，`--verbose`。
+带到达时间戳的原始 SSE 帧：
+
+| 方言 | 5.6 s 内帧数 | 标准工具增量 | 私有进度 |
+|---|---:|---:|---:|
+| chat | 15 | 0 | 12 帧 `delta.cwick_tool`，间隔约 141 ms |
+| responses | 3（`created` / `in_progress` / `failed`） | 0 | 0 |
+| messages | 2（`message_start` / `error`） | 0 | 0 |
+
+chat 的第一帧是 `delta.content:""`，随后 12 帧把正在生成的工具块放进
+**非标准**字段 `delta.cwick_tool`（如 `"<"`、`"function"`、`"=get"`、
+`"_time"`、`"</tool_call>"`）。`delta.tool_calls[].function.arguments`
+增量一次都没发。
+
+**根因一：进度是私有字段，不是标准协议。** `stream_tool_progress()` 把
+正在生成的块通过 `stream_delta_n(..., "cwick_tool", ...)` 发出，注释自己
+写明这个字段「会被不认识它的客户端忽略」。唯一标准的 `tool_calls` chunk
+在 `stream_finish()` 里由**完整解析结果**一次性构造，也就是这一轮结束时
+才发（`server.c` ~3508）。`resp_stream_text()` 的注释更直接：「工具调用
+进度在这里没有对应物：参数在轮末的 function_call item 里完整到达」。
+
+**根因二：另外两个方言连私有字段都丢了。** `stream_delta_n()` 把
+`cwick_tool` 交给 `resp_stream_text()` / `msg_stream_text()`，这两个只处理
+content / reasoning / text，未知字段直接丢弃 ⇒ responses 与 messages
+在整个阶段发 **0 个** delta。内置 Web 控制台是唯一消费者：
+`web/app.js` 把 `d.cwick_tool` 累积进 `assistantMsg.toolStream`，
+所以「渲染流式 toolCalls」这条要求只在自家 UI 成立。
+
+**根因三（本次请求）：工具方言不匹配。** 模型输出
+`<function=get_time>\n</function>`，而 `cwick_tools_extract()` 期望
+`<tool_call>NAME<arg_key>...`。解析失败 ⇒ 服务端发
+`{"error": ... "model emitted undeclared tool"}` 和 `[DONE]`，
+**连轮末那次完整 `tool_calls` 都没发**。这正是 §56 标为「未做」的那个
+不匹配。
+
+**前端为什么卡住。** content 阶段的增量是标准 `delta.content`，开场白能渲染；
+第一个 `<tool_call>` 之后 splitter 停止分类，线上只剩未知字段或什么都没有。
+严格按协议解析的客户端会保留上一帧并显示「生成回复中」直到请求结束；
+如果工具调用最终解析成功，它会在末尾一次性看到一个 `tool_calls` chunk。
+
+**本轮未改协议。** 修复方向是三个方言各自补标准增量（chat：先发带
+id/type/function.name 的 `tool_calls[i]` 起始 chunk，再逐片发
+`function.arguments`；responses：`response.output_item.added` +
+`response.function_call_arguments.delta`；messages：
+`content_block_start(tool_use)` + `content_block_delta(input_json_delta)`），
+同时保留 `cwick_tool` 给内置控制台。在途文本是清洗后的 XML 而非 JSON
+arguments，所以还需要一个流式 XML→JSON 映射。根因三更小、更独立，
+应当先修：否则客户端只是「看着一个最终仍会失败的工具调用」。
+
+
+## 58. 按 §57 诊断的顺序修复 tools 阶段静默
+
+§57 记录了三层原因并刻意没有改协议（那里「本轮未改协议」是历史叙述）。本节按当时给出的顺序落实：先修工具方言不匹配，再补标准流式增量。
+
+### 一、工具方言不匹配（根因三）
+
+嵌套模板的回答是
+
+```
+<tool_call>
+<function=save_note>
+<parameter=title>
+Memo
+</parameter>
+</function>
+</tool_call>
+```
+
+而 `extract_impl` 只认 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`。于是整轮以 `model emitted undeclared tool` 失败，**连轮末那次全量 `tool_calls` 都没有**。`tools.c:translate_function()` 在唯一那个解析器看到文本之前，把嵌套形式改写成扁平形式——与 `translate_invoke()` 对另一个 checkpoint 的做法一致。值前后的换行/空格作为框架裁掉、内部换行保留，`</tool_call>` wrapper 视为框架丢弃，块外散文保留。已经用 `<arg_key>` 的文本不动；`<function=` 缺 `</function>` 时也不改写，让解析器照旧拒绝（fail-closed）。新增 7 条单测覆盖零参数、多参数、内部换行、数字与 JSON 值、散文、一个 wrapper 内多个 function、以及未闭合块。
+
+真实 checkpoint 实测：原来以 `error` 收尾的手写工具请求，现在返回 `tool_calls:[{name:"get_time",arguments:"{}"}]`、`finish_reason:"tool_calls"`，访问日志 `finish=tool_calls calls=get_time`。
+
+### 二、三个方言的标准增量（根因一、二）
+
+`stream_tool_progress()` 仍把私有 `delta.cwick_tool` 发给内置控制台。与此同时 `tool_std_scan()` 观察在途块：模型一写出 `<function=NAME>`，`tool_std_open_frame()` 就用该方言自己的协议、以空的 `arguments` 开启调用；此后每完成一个参数追加一片增量。
+
+| 方言 | 起始帧 | 参数增量 |
+|---|---|---|
+| chat | 带 `id` / `type` / `function.name` 的 `delta.tool_calls[0]` | `delta.tool_calls[0].function.arguments` |
+| responses | `response.output_item.added`（`function_call`） | `response.function_call_arguments.delta` |
+| messages | `content_block_start`（`tool_use`） | `content_block_delta`（`input_json_delta`） |
+
+轮末三个收尾函数跳过第一个调用重复的 `added` / `delta` / `block_start`，但仍发 `done`、`output_item.done`、`content_block_stop`，所以只读终止事件的客户端看到的还是同一个对象。`tool_calls_json()` 增加 `empty_first` 模式，保证按增量拼接的 chat 客户端不会把已发的字节再算一遍。
+
+**为什么线上字节与 payload 不会互相矛盾。** 分片不是靠第二套 XML 文法生成的：`tool_std_scan()` 取在途文本到最后一个 `</parameter>`，人工补齐闭合标签，然后调用非流式路径使用的**同一个** `cwick_tools_extract()`；把结果对象末尾的 `}` 去掉，剩下的就是一个只会增长的前缀。轮末 `tool_std_settle()` 拿它与解析出的 `arguments_json` 比较并补发后缀；若不一致，就让**已经发出去的字节成为 payload**——拼接增量的客户端与读取最终对象的客户端仍然一致。call id 在起始帧一次性分配并写回解析结果，Responses 的终止文档随后重建，信封、item 与增量指向同一个调用。
+
+### 实测
+
+18001 临时服务，Qwen3.5，`--context 8192`，`CWICK_SEED=42`，每个方言一个请求，抓带到达时间戳的原始 SSE。
+
+| | §57 改前 | 改后 |
+|---|---|---|
+| chat | 15 帧，**标准工具增量 0**、私有帧 12 | 43 帧：1 个起始帧 + 3 片参数增量 + 37 私有帧 |
+| responses | 3 帧（`created` / `in_progress` / `failed`），0 增量 | 9 帧，含 3 片参数增量 |
+| messages | 2 帧（`message_start` / `error`），0 增量 | 8 帧，含 3 个 `input_json_delta` |
+| 首个标准帧 | 无（只有轮末） | 5.0 s，即写完函数名那一刻 |
+| 解析结果 | 拒绝（`undeclared tool`） | `save_note`，参数完整 |
+
+一轮 9.6 s 的请求，chat 标准帧分别落在 5.0 / 6.5 / 8.3 / 9.3 s，进度确实在途。三个方言拼接结果都是
+`{"title":"Memo","body":"hello world"}`，与非流式 payload、以及 Responses 的
+`function_call_arguments.done` 逐字节相同；零参数调用三个方言都是 `{}`。
+`make test` **678 断言 PASS**（新增 7 条），端到端 9 项检查 PASS，不带工具的普通问答 0 个工具帧。
+
+### 内置 Web 控制台
+
+`web/app.js` 过去把每个 `tool_calls` 帧都当成一个新调用，分片会产生空的重复卡片并反复清空原始进度视图。现在 `applyToolCallDeltas()` 按 `index` 归并：保留首个 id/name、追加 arguments、标准卡片开启后静音 `cwick_tool`。`respEventToChat()` 也把 `response.function_call_arguments.delta` 映射成进度（Messages 适配器本来就会消费 `input_json_delta`）。Node 里 9 项纯函数检查 PASS，覆盖旧式整帧、多调用数组、以及「首个调用流式 + 轮末多调用」。`src/webui_embed.c` 已重编。
+
+### 明确留下的边界
+
+- 分片粒度是**已完成的单个参数**。一个很长的参数值（最初报告里整份 HTML）仍在该 `</parameter>` 闭合时整体到达。要在值内部逐片流式，需要一个能同时保证 JSON 类型判定、不完整 UTF-8 与尾部空白裁剪三者单调的状态机，属于独立决策而不是调参。
+- 只有第一个调用走流式，其余调用轮末整体给出。
+- 其它方言的块（扁平 `<arg_key>`、`<invoke>` 形式）没有 `<function=` 开标记，因此不会提前开启，原有轮末全量行为原样保留。
+
+## 59. 「在流式」和「看起来在流式」不是一回事
+
+§58 让调用在书写过程中就开启，并按**已完成的参数**推分片。拿真实 agent 形态的
+调用去量，这个阶段依然是静默的：agent 的工具调用几乎总是**一个很长的参数**
+（一段 shell 脚本、一个文件正文），而「一个参数一片」意味着整个值在最后一次性
+到达。
+
+在真实 checkpoint 上、用 agent 实际会发的那种 prompt 复现：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 标准 `tool_calls` 帧 | 3 | 20 |
+| 到达形态 | 5.1 s 开帧，然后**静默 4.1 s**，然后整个值 | 5.2 s 到 10.2 s 之间每 ~0.15 s 一帧 |
+| 最大帧间隔 | 4.1 s | 1.1 s |
+
+3 帧在算术上算「流式」，观感上是卡死。只认「第一个参数字节」才渲染的客户端，
+整个阶段什么都不会显示——这正是反馈里说的「decode(tools) 阶段前端没有流式」。
+
+### 改了什么
+
+`tool_std_value_scan()` 现在切的是**正在写、还没闭合的那个参数**的值，而不是
+只切 `</parameter>` 已经到达的参数。值交给与闭合路径**同一个**
+`cwick_tools_extract()`：把块在安全字节处截断、人工补上闭合标签，因此转义、
+空白裁剪和键顺序都不可能和最终 payload 分叉。
+
+三件事让「值中间的切片」可以安全上线：
+
+1. **类型单调性。** 只有当前缀绝不可能不再是 JSON 字符串时才发：值不能以
+   `{ [ " -` 或数字开头；`t`/`f`/`n` 在仍是 `true`/`false`/`null` 前缀期间一律
+   扣住。脚本、路径、句子放行；`137` 和 `{"a":1}` 不放行，仍走闭合路径。这个
+   判定是单调的——一旦为真就不会再变——所以已发出的字节永远不需要撤回。
+2. **尾部空白扣留。** 提取器会裁掉值首尾空白。若把稍后会被裁掉的尾随空格发出去，
+   流式前缀就与 payload 不一致，因此尾部一直扣到非空白字节到达为止。
+3. **`</parameter>` 扣留。** 闭合标签是逐片到达的；一个还可能长成
+   `</parameter>` 的尾部属于框架而非值。没有这一条时，第一版把 `</parameter`
+   发进了 JSON 字符串里，拼接结果非法——这个问题是被端到端检查抓住的，不是单测，
+   所以下面那条检查才必须存在。
+
+流式前缀会去掉末尾那个引号（提取器把它作为 `"value"` 的一部分加上），因此最后
+一个值字节之后的那一字节，正好把前缀变成一个完整字符串。尾部不完整 UTF-8 与
+正文路径同样扣留。
+
+### 粒度
+
+每次扫描都要重新解析整个块，所以对大值不是逐 token 跑：一个值的第一个字节立即
+发出，之后每 12 字节一帧。6–7 tok/s 下，ASCII 约每 0.15 s 一帧、CJK 约 0.4 s，
+解析开销有界。实测 decode 速率无变化（6.82–7.43 tok/s，基线 6.4–6.87），说明
+扫描没有和 forward 抢资源。
+
+### 验证
+
+真实 checkpoint 上 11 项端到端检查全 PASS：chat 拼接与非流式 payload 逐字节
+相同；有且仅有 1 个带 id 的起始帧；私有 `cwick_tool` 进度仍在发；零参数调用
+三方言都是 `{}`。数字、布尔、对象参数保持 JSON 类型（`count:137`、
+`meta:{"a":1}`），因为它们从不进入在途路径。三方言拼接字节完全一致且都能解析。
+`make test` **683 断言 PASS**（新增 5 条：值中间的 prefix 必须是最终 JSON 的
+字节前缀，且必须严格更短）。内置控制台用 7 项纯函数检查复核，含长分片序列和
+收尾帧。
+
+被 `max_tokens` 在调用中途截断的轮次，仍以既有的 `unterminated <tool_call>`
+错误帧收尾——行为未变，且是对的：调用从未完成，没有合法结果可交回。
+
+### 另外发现，未修
+
+DeepSeek 的 prompt 模板教的是它自己的方言
+（`<｜DSML｜ calls>` / `<｜DSML｜ invoke name="…">` / `<｜DSML｜ parameter …>`），
+但 `cwick_tools_extract()` 只认 `<tool_call>`、`<function=`、`<invoke name="`
+和 MiniMax 的命名空间 token —— DSML 一个都不命中。`cwick_stream_segment()`
+同样只在字面量 `<tool_call>` 上进入工具模式。因此在一个严格遵循自身模板的
+checkpoint 上，工具阶段既不会产生阶段标签，也不会有任何增量。这与本节修掉的是
+**不同缺陷**（是方言缺失，不是粒度不足），需要先对一轮真实的 DS 请求做测量再改；
+记录在此，以免后来者把本节当成工具阶段的完整修复。
+
+## 60. Anthropic 客户端自己的 URL 形状就是一个 404
+
+**症状。** 一个 agent harness 指向本服务，每一轮都收到
+`404 {"error":{"message":"unknown endpoint","type":"invalid_request_error"}}`。
+serve 日志里一行就说清了全部：
+
+```
+[req 1] POST /v1/v1/messages?beta=true (46045 bytes body)
+[req 1] POST /v1/v1/messages?beta=true -> 404 in 1.1ms auth=key:cwick_N5TmAqb
+```
+
+这一条路径里躺着两个互不相干的缺陷，任一个单独存在都足以产生 404。
+
+**原因 1 —— 生成路由比较的是原始路径。** 这个 handler 里其他所有路由都拿
+`ponly` 比，那是函数开头 `path_only()` 写出的、剥掉查询串的形式；四个生成路由
+是仅剩的仍在比 `req.path` 的地方。Anthropic 客户端给每个 `/v1/messages` 调用都
+带上 `?beta=true`，于是 `strcmp(path, "/v1/messages")` 永远不成立 —— 这个端点
+对它唯一存在的那类客户端不可达；`/v1/chat/completions?x=1` 同理不可达。
+
+**原因 2 —— base URL 已经以 `/v1` 结尾。** Anthropic SDK 会在给定的 base URL
+后面拼 `/v1/messages`。把它配成 `http://host:8001/v1`，请求就以
+`/v1/v1/messages` 到达，路由表里没有任何一条认得它。拒绝它在技术上正确、在实用
+上无用：要改的是客户端并不拥有的那个配置字段，而 404 的文本也没说这件事。
+
+**改动。** `server.c`：在 `path_only()` 之后就地折叠重复的 `/v1/v1/` 前缀
+（循环 + `memmove`），所有路由一起受益；四个生成路由改为比 `ponly`。原始路径不动，
+访问日志和 `--trace` 行仍然打印收到的东西。不涉及内核、精度、采样或 prompt。
+
+**实测**（同一服务、同一鉴权，POST 空 `{}`，让已路由的请求倒在 body 校验而不是
+路由上）：
+
+| 请求 | 改前 | 改后 |
+| --- | --- | --- |
+| `POST /v1/v1/messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/messages` | 400（本就路由成功） | 400（不变） |
+| `POST /messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/chat/completions?x=1` | 404 unknown endpoint | 400 `messages must be a non-empty JSON array` |
+| `POST /v1/responses?beta=true` | 404 unknown endpoint | 400 `missing input` |
+| `GET /v1/v1/models` | 404 | 200，5 个已知模型 |
+
+随后在**原来 404 的那个 URL** 上跑真实流式调用：`POST /v1/v1/messages?beta=true`、
+`max_tokens 24`、一轮 user → `message_start … content_block_stop … message_delta …
+message_stop`，`200 in 1341.9ms prompt=15 completion=1 finish=stop`。
+`POST /v1/v1/models` 仍然 404 —— 归一化只关于路径，不关于方法。
+
+**本节未修。** 路由通了之后，同一个 harness 会被告知
+`model \`qwen3.5-9b\` is not served by this endpoint (the resident model is
+\`qwen3_5_text\`)`：这个 checkpoint 的目录不在 `cwick_model_served_alias()` 里，
+所以它用自己 `model_type` 的名字应答。这是 `/v1/models` 写明的契约，不是路由
+缺陷 —— 按目录公布的那个 id 发请求即可。
+
+## 61. Qwen3.5 decode：整步装进一个 command buffer（7.0 → 20.0 tok/s）
+
+**这一节立足的那次测量。** 一个 decode 步搬约 16 GB，每字节几乎不做算术，所以它是带宽问题。
+这台机器有两条通往内存的通路，宽度不同：CPU 集群从四个线程起就饱和在 **123.8 GB/s**，而 GPU 读到
+**284.6 GB/s**（真实的链接式步进形状下是 368 GB/s）。第二个数字从 CPU 上一点都拿不到。旧结论
+"decode 已经跑到总线的 93%，别再找了"——那个 93% 是拿 CPU 的通路算的。
+
+**GPU 不会白送的东西。** 一次提交一条投影是亏的。用 `tools/q35step` 实测：一步里的 128 个 GEMV
+（一层需要四个同步点 × 32 层）作为 128 次提交要 **118.8 ms**，因为每次 commit+wait 约 928 µs，
+而其中只有约 58 ms 是内核。同样这 128 个 GEMV 编进 **一个** command buffer（`tools/q35one`）只要
+**37.6 ms**——368 GB/s，而且工作集放大 4 倍结果不变，所以那是这个访问模式的 DRAM 速率，不是缓存假象。
+墙是调度项，不是带宽。
+
+**于是：每步一个 command buffer，递推也必须在 GPU 上。** 把一条投影的输出行拆给 CPU 池和 GPU
+并行——DeepSeek 后端正是这么做的——在这里是净亏：`tools/dualbw` 实测 12 个 CPU 线程与一次 GPU
+dispatch 同时跑合计 **213.7 GB/s**，而 GPU 单独是 328.9。两条引擎共用一根管子，CPU 分到的是更慢的
+那份。剩下的唯一可行形状是：一步的全部算子都在 GPU 上，32 层放进一个**串行** compute encoder，
+一次 commit、一次 wait、一次回传——logits。
+
+**实现。** 三个新单元，分开写是为了让只有最后一个需要 ObjC：
+
+| 单元 | 职责 |
+|---|---|
+| `q35_shader.c` | 16 个 Metal 内核，每一个都是 `q35_model.c` 里某个函数的孪生：BF16 GEMV、带 `1+w` 开关的 RMSNorm、embedding 取行、depthwise 卷积 + SiLU + 窗口滚动、逐头 L2 归一、DeltaNet 的门控与递推、逐头 Q/K 归一加部分旋转、KV 追加、打分、softmax、加权求和、输出门、SwiGLU、残差加 |
+| `q35_gpu.c` | 纯 C。调度本身：哪条投影喂什么、norm 在哪、这一位置的旋转表、缓冲绑定。完全不认识 Metal |
+| `q35_gpu.m` | Metal 隔离层：device、library、pipeline state、零拷贝缓冲绑定、encode 调用 |
+
+权重用 `newBufferWithBytesNoCopy` 直接套在 mmap 的 safetensors 上——4K 上下文时 13.19 GiB，
+128K 时 20.94 GiB，**零拷贝、零额外常驻内存**。KV 缓存、卷积窗口、DeltaNet 状态同样从
+`q35_model_open` 已经拥有的缓冲上套过来，所以 CPU prefill 和 GPU decode 写的是同一批字节，
+两者之间没有任何需要同步的东西。prefill 留在 CPU（它本来就有 71-80 tok/s）；只有单位置步进走新路。
+
+**正确性。** `CWICK_Q35_GPU_CHECK=1` 会在同一位置上再跑一遍 CPU 步进并比较。它必须先恢复递推状态
+（`q35_prefix_pack` / `apply`——DeltaNet 状态不像 KV 缓存那样能截断），否则第二次跑的就是另一步。
+实测三个位置：
+
+| 位置 | 最大绝对差 | 平均绝对差 | argmax |
+|---|---|---|---|
+| 43 | 0.00804 | 0.001855 | 一致 |
+| 44 | 0.00332 | 0.000564 | 一致 |
+| 45 | 0.00235 | 0.000277 | 一致 |
+
+这是 bf16 权重下的 f32 重排噪声，而且随位置**衰减**而不是累积——两条路径算的是同一件事。端到端，
+同一 prompt 下 90 个贪心 token **逐字节相同**。
+
+这个对照抓到一个肉眼看不出来的真 bug：DeltaNet 的输出门读的是 `z[j]`，而门控投影是按 value head
+索引的（`z[vh*hv + j]`），于是 32 个头全读了 0 号头的门。那时平均 logit 误差 1.77、argmax 不同；
+修好后是 0.0002。
+
+**结果**（`cwick run`，44 token prompt，63 个 decode 步，上下文 128K）：
+
+| decode 路径 | ms/步 | tok/s |
+|---|---|---|
+| CPU 池 | 143 | **7.00** |
+| GPU 整步 | 49.8 | **20.10** |
+| GPU 整步，`--context 131072` + 前缀缓存，走 HTTP | 48.9 | **20.45** |
+
+2.9×。47.4 ms 的墙里有 46.5 ms 是内核时间，即 341 GB/s，对上隔离测量里这条 GEMV 链的 368 GB/s——
+已经到了这个形状配比允许的 93%，没有可回收的调度开销了。`CWICK_METAL_TIME=1` 每步打印
+`commit=6us wait=47ms gpu=46.5ms`。
+
+**本节没做。** prefill 仍在 CPU 上，而 31K 的 agent prompt 是 390 s 的 TTFT 对上 1.5 s 的 decode——
+下一个值得搬的东西，而且是另一个问题（GEMM，不是 GEMV）。40 tok/s 则需要在这一步之上叠 MTP 草稿头。
+
+## 62. 校验 k 个 token 比跑 k 步便宜，但草稿比省下来的还贵
+
+**做成的那一半。** 一个 decode 步要读 16.4 GB 权重才产 1 个 token，所以超过 20 tok/s 的唯一
+出路是「一次读权重产不止一个 token」：先草稿 k 个，再用一趟读同样 16.4 GB 的 pass 把它们
+全部校验掉。校验这一半已经做完了，而且是精确的。
+
+障碍在 DeltaNet 层：它带的是矩阵递推状态，不是 KV 缓存——只能重算、不能截断。要保留 k 个
+已校验行里的前 j 行，就需要「第 j 行跑完时」的状态，而这要么每行单独再跑一趟（k 趟，白干），
+要么每步拷 50 MiB。实际做法是：**状态开 k+1 个槽并滚动**。第 r 行读槽 r、写槽 r+1，因此任何
+槽都不会被紧随其后的那一行覆盖，槽 0 永远是 live，保留 j 行就是把槽 j+1 `memmove` 到槽 0——
+pass 期间零额外流量，结尾一次拷贝而不是 k 次。卷积内核原本是原地窗口（`st` 既是输入又是
+输出），滚动槽会打破它；现在它多带一个源指针，两个指针指同一个槽时与原版逐位相同。
+
+`CWICK_Q35_GPU_CHECK=1` 拿 k 行 pass 的**每一行**去对「同一条 GPU 路径逐行跑」的结果。
+k = 2、3、4、8 在全部 32 层上都是 **max 0.00000、N 个里 0 个不同**——logits、KV、卷积窗口、
+递推状态全对。本节余下的结论都立在这上面：k 行 pass 不是 k 步的近似，是同一种算术。
+
+**一行的真实价格**（真实 decode 步，`CWICK_Q35_VERIFY=k`，19 趟，同一个 prompt，同一次会话）：
+
+| k | ms/趟 | 边际 ms/行 |
+|---|---|---|
+| 1 | 55.5 | — |
+| 2 | 63.6 | 8.1 |
+| 4 | 73.4 | 4.9 |
+| 6 | 85.6 | 6.1 |
+| 8 | 98.4 | 6.4 |
+
+边际成本随 k **上升**，这否掉了两种舒服的解释。不是带宽：无论 k 是多少，一趟都是读 16.4 GB，
+真是带宽限制，边际就该是 0。也不是每次派发的固定开销：那会把 k = 1 那一行抬高、让边际变平。
+它是多出来的那几行的算术，而且速率随寄存器占用变差——隔离基准（`tools/q35gemsw`，用这个
+checkpoint 自己的 13.82 GB 形状配比、32 层）在 k = 8 是 4.5 ms/行，真实步里是 6.4。
+
+也正是那个基准找到了本节唯一采纳的旋钮。内核是个 threadgroup 分块：k 条激活行只在块内暂存
+一次，整组共享，每个 simdgroup 负责一个权重行。让一个 simdgroup 负责 RP 个权重行，同一份
+暂存切片就复用 RP 次，激活侧流量降为 1/RP，代价是 RP*N 个活累加器：
+
+| 行数 n | RP1 ms | RP2 ms | RP4 ms |
+|---|---|---|---|
+| 4 | 45.3 | 45.8 | 47.1 |
+| 5 | 49.9 | 49.0 | 66.6 |
+| 6 | 54.4 | 52.5 | 72.5 |
+| 8 | 70.1 | 63.3 | — |
+
+RP4 从 n = 5 起就溢出；RP2 从 n = 5 起赢、以下略输，这就是策略。RP 是这个内核里唯一能拧、
+又不改变任何一次 FMA 在累加中位置的旋钮，也正是它让上面那条逐位校验还成立；把读宽放到
+8 个 bf16 在 n = 2..4 又快 3 ms，正因如此没有采纳。落到真实步里，k = 8 是
+**102.2 → 98.4 ms**（同场三次交错取最好）——比基准的 6.8 ms 小，因为真实 pass 里有一部分
+不随 RP 缩放。
+
+**草稿的价格。** 校验这一半接上之后，40 tok/s 就变成一句关于草稿的话：k+1 行的一趟必须产出
+`A` 个被接受的 token，且 `A / T(k) >= 40`；而 `A` 是草稿的事，不是校验的事。
+
+零成本草稿是 prompt 查表——拿末尾 2–6 个 token 去上下文里找上一次出现并顺着抄。它不读任何
+权重，也不可能把结果搞坏，因为接受判定用的是全量模型自己的贪心 argmax，关掉它输出逐字节
+相同。它也确实没用。两个 prompt、各 40 个 token：**每趟 1.08 到 1.24 个 token**（散文上
+52% 草稿被接受，代码上 23%），端到端 **2022 ms 对基线 2011 ms**——更宽的那一趟比多出来的
+token 更贵。免费不等于有用。
+
+盘上那个学出来的草稿头是 MTP，它的文件把价格定死了：**486.6 MB**，十五个张量——
+`mtp.fc[4096,8192]`、一整层 attention（GQA，`q_proj[8192,4096]` 带交错 gate，
+`k_proj`/`v_proj` 是 `[1024,4096]`，`o_proj[4096,4096]`，SwiGLU 12288）加三个 norm——
+而且**没有自己的输出投影**。所以每个草稿 token 要读 486.6 MB **再加上共享的 2.03 GB 词表
+投影**：2.52 GB，按实测速率是 7.0 ms。
+
+| k | T(k) = 一趟 + k × 7.0 ms | p = 0.8 时的 A | tok/s |
+|---|---|---|---|
+| 2 | 82 | 1.80 | 21.9 |
+| 4 | 109 | 2.95 | 27.1 |
+| 8 | 162 | 4.16 | 25.7 |
+
+**这张表就是答案，而它不是 40。** 词表投影占一个草稿 token 的 81%，所以草稿 8 个要 56 ms，
+而多出的 7 行只让校验贵了 43 ms——省下的正好又交回去了。接受率更高也救不了：p = 0.9 时
+8 个草稿在 162 ms 的一趟上拿回 5.70 个 token，即 35 tok/s，要 40 得 **p ≥ 0.94**。
+
+能改变答案的有两件事，按收益排。**让一个草稿 token 只花 ~1.4 ms：只投影词表里的候选切片**
+——草稿是允许错的，判定在校验那边，所以这是个带宽问题、不是精度问题；前 4096 行是 33.5 MB
+而不是 2.03 GB，这样 k = 8 是 118 ms、接受 4.16 个，即 **35 tok/s**，而 40 的门槛降到
+p ≥ 0.87。以及**砍掉那 6.4 ms
+的边际行**，它现在卡的是吞吐而不是带宽，也是唯一能同时改善所有 k 的杠杆。两件事都要先把
+MTP 接上，而且都不是调参。
+
+**顺带发现一个与上面全部无关的 bug。** 单行 decode 路径调用 forward 时，`ids` 里还是
+prompt，刚采到的 token 从来没有写进 `ids[0]`，于是每一次生成的每一步都是在拿 `prompt[0]`
+当条件，而不是拿它自己刚产出的那个 token。这会在十几个 token 内退化成重复
+（`TheTheThe…`、`MASKMASK[g[g[g…`），也让本文档此前所有关于输出文本的判断失效。k 行路径
+没有这个错误，这也正是它暴露出来的方式：同一个 prompt 走 `CWICK_Q35_VERIFY` 是通顺的、
+走普通路径不是。修法一行。
+
+## 63. 边际行的成本是激活流量，而它本来不必走 threadgroup 内存
+
+§62 留了一个没解释的数：k 行校验一趟本该只花一次权重读，但真实步里边际行是 6.4 ms
+（k = 1 时 55.5 ms，k = 8 时 98.4）。算术不是原因，而靠猜已经被证伪过两次，所以改成
+把内核逐项摘掉来量（`tools/q35gemab`，用这个 checkpoint 自己的 13.82 GB 形状配比，
+k = 8）：
+
+| 内核保留什么 | ms | 它去掉了什么 |
+|---|---|---|
+| 全部 | 65.8 | — |
+| 不读权重 | 36.4 | 那趟 13.82 GB 的 DRAM 扫读 |
+| 不读激活 | 45.2 | k 行的 threadgroup 读 |
+| 每个权重元素只做一次加法 | 64.0 | 全部 N 路乘法 |
+
+三个结论。乘法加在一起只值 **1.8 ms**，所以边际行从来不是算术。权重读 **29 ms**、激活读
+**21 ms**——而 36.4 + 29.4 正好是实测的 65.8，说明两条内存流**完全没有重叠**。第二点值得说白：
+这从来不是带宽天花板，而是一个把两条本可交错的流串起来的写法。
+
+激活读之所以存在，是因为这些行被暂存：每个 threadgroup 把 k 行拷一份进 threadgroup 内存，
+组内所有 simdgroup 共享，每块前后各一个 barrier。那个设计是 §62 拿来用 threadgroup 带宽换
+权重带宽的，而消融说明这笔换亏了。整个 pass 的 x 只有 N × k × 4 字节——k = 8 时 128 KB——
+因此它在整趟里都驻留 L2，每个 threadgroup 扫同一批缓存行的代价远不是一次 DRAM 读。
+直接从 device 内存读，就去掉了暂存循环、去掉了两个 barrier，k 循环也变平了。
+
+| | k=1 | k=2 | k=4 | k=6 | k=8 | 边际行 |
+|---|---|---|---|---|---|---|
+| 暂存版，256 线程 | 37.7 | 41.0 | 49.3 | 62.4 | 65.8 | 4.0 |
+| device 直读，128 线程 | 39.4 | 41.9 | 42.2 | 46.5 | 52.6 | 1.9 |
+
+把线程组缩到 4 个 simdgroup 是同一个改动的一部分：暂存没了之后组内没有共享状态，更窄的组
+只是意味着更多组能同时驻留。128 线程在每个 k 上都赢过 256（k = 8 是 53.1 对 57.7，两者都把
+激活读向量化了）；512 线程比两者都差。
+
+另外两个设置量过但没采纳。预取权重（PF = 2 或 4，先发若干 load 再消费）没有任何变化，这与
+「开销来自暂存结构而不是内存级并行」的判断一致。每 lane 读更宽的向量在便宜的 pass 上更快、
+在贵的 pass 上溢出，而且它会把求和重新结合，代价是逐位校验——与 §62 拒绝它的理由相同。
+
+激活按四个标量读而不是 `float4`。投影读的那个 scratch 缓冲是按分配宽度而不是输出宽度排的，
+所以行首不保证 16 字节对齐，而 Metal 里未对齐的向量读是**读错字节**、不是走慢路径。
+标量形式只贵 0.5 ms（52.6 对 52.1），换来不必去证明对齐。
+
+在真实 decode 步里（99 趟，三次交错取最好），同一个改动是 **k = 1 从 55.5 → 47.4 ms**、
+**k = 8 从 98.4 → 81.8 ms**，边际行 **6.4 → 4.9 ms**。剩下的 2.1 ms/行不在这个内核里：24 个
+线性层把卷积和递推**按行**跑一遍，每行六次 dispatch 加一个 barrier，所以每个边际行里都有一份
+是派发开销而不是字节。这是下一件要处理的事，而且是另一个改动。
+
+端到端走 API（200 token，`max_tokens` 生效，chat completions）是 **21.3 tok/s**，此前 18.3。
+逐位不变量完好：`CWICK_Q35_GPU_CHECK=1` 仍在 32 层的 8 行上全部报 `0.00000`，因为这个改动
+只删掉一次拷贝，没有移动任何一次 FMA 在累加中的位置。
+
+**这对 §62 的草稿算术意味着什么。** 校验这一半变便宜了，草稿要跨过的门槛也跟着移动。
+k 行的一趟产出 k 个 token，其中只有 k−1 个需要草稿，所以接受率 p 下期望接受数是
+A = Σ_{i<k} p^i——p = 0.8 时 k = 2 / 4 / 8 分别是 1.80 / 2.95 / 3.95。按 MTP 头
+7.0 ms/草稿 token 算，最好的是 k = 4：62 ms 的一趟加三个草稿是 83 ms 换 2.95 个 token，
+**35.5 tok/s**。仍然不到 40，因为这时头已经占了成本的大半。改成让草稿只对一个候选词表
+切片做投影（33.5 MB，约 1.45 ms；合法，因为判定在校验侧而不是草稿侧），k = 4 就是 67 ms、
+**44.4 tok/s**，k = 8 是 92 ms 换 3.95 个、**43.0 tok/s**。所以「40 tok/s 需要 p ≥ 0.94」
+不再成立：它需要的是一份只要 1.5 ms 的草稿，而那是带宽问题、不是精度问题。
+
+**已被 §64 取代。** 头真的绑上了、切片也做了，实测接受率是深度 1 的 0.36、切片下的
+0.17——不是 0.8。本节最后三段里的每个数字都由 §64 的表替换。
+
+## 64. MTP 头接上了、算对了，依然是净亏
+
+§62 预测 35.5 tok/s、§63 预测 44.4，两处都建立在「接受率 p = 0.8」这个**假设**上。
+这一节把头真正接上、把 p 量出来，结论是那两个预测错得比它们自己的误差棒还大：按实测
+接受率，任何投机形状都比「一步一行」更慢。
+
+**绑定。** `model-mtp.safetensors` 是独立文件，而且不在 `model.safetensors.index.json`
+里，所以文本分片的读取器够不到它；`mtp_open()` 直接映射（8 字节小端头长、JSON，然后
+按名逐个解析张量，dtype、shape、`data_offsets` 与文件长度都校验）。十五个张量、
+486.6 MB：`fc[4096,8192]`、一层 GQA（16 q 头 / 4 kv 头、head_dim 256、因为有交错的
+输出门所以 `q_proj[8192,4096]`、partial rope 0.25、每头 q/k norm）、12288 的 SwiGLU，
+**没有自己的输出投影**——词表头是共享的。它必须在 `q35_gpu_open` **之前**打开，因为
+GPU 会用 `newBufferWithBytesNoCopy` 直接套用它的两块缓存。
+
+现在 `mtp_one()` 只负责跑一个位置（融合、attention、SwiGLU，块输出留在 `g_m.res`），
+链式草稿和缓存回填两个调用方共用它。新增三个内核：`q35_gemv_rows` 就是 `q35_gemv`
+把行号改成从 device buffer 读；`q35_embed_id` 的 token 也从 device buffer 读，这样一个
+proposal 的 token 在下一个 proposal 读它之前不必回主机（一次往返 0.93 ms，而一个块
+1.6 ms）；`q35_argmax` 返回 index、平局取小，与它对照的 host 扫描一致。
+
+**文件没写、只能实测的两件事。** 一是融合里 `emb` 在前还是 `h` 在前：对调之后接受率
+归零（0/89），所以 `emb` 在前是对的。二是文本模型的隐藏态 `h` 取哪一份——残差流，还是
+词表头看到的那份最终 norm 之后的拷贝：后者在第一层深度上是 **39.0% 对 35.7%**，现在是
+默认（`CWICK_Q35_MTP_POSTNORM=0` 切回另一臂）。
+
+**块自己的缓存。** 草稿要靠 keys 做 attention，而新序列的第一个 proposal 时缓存里只有
+一个 key——它自己，这不是这一层训练时见过的形状。现在行按绝对位置索引、窗口 512 行
+（`CWICK_Q35_MTP_WIN`），`q35_mtp_sync()` 把文本模型已经决定过的那些位置的行写进去，
+数据直接取自校验趟留在 `g_s.x` 里的隐藏态：每个被接受的位置跑一次块，1.6 ms。窗口满了
+`mtp_compact` 把活着的行整体下移——旋转在写行时就烘进去了，所以这个平移是精确的、不是
+近似。prompt 的行仍然不回填（那需要 prefill 丢掉的隐藏态），窗口从最后一个 prompt 位置
+开始。
+
+回填买到的是 **35.6% 对 31.5%**（深度 1），代价 1.6 ms/步。它对深度 2、深度 3 没有用。
+
+**实测接受率**（200 token prompt、生成 161、贪心、各跑一次；按深度看——只有前面全部被
+接受才会走到深度 d）：
+
+| 形态 | 深度 1 | 深度 2 | 深度 3 |
+|---|---|---|---|
+| 全 2.03 GB 头 | 35.6% | 12.5% | 0.0% |
+| 4096 行候选切片 | 16.8% | 4.3% | 0.0% |
+
+接受率在第一条链之后就饱和了。恰恰是「链」这一步没法指望：proposal i+1 喂的是本块
+自己的残差，而不是文本模型的隐藏态，而检查点只按一个深度训练过。所以有用的形状是一个
+proposal，数字就是这么说的。
+
+**一行的成本**（同一 prompt，`CWICK_Q35_VERIFY`）：
+
+| 行数 | 1 | 2 | 3 | 4 | 5 | 9 |
+|---|---|---|---|---|---|---|
+| ms | 48.4 | 57.4 | 58.2 | 60.7 | 64.0 | 83.5 |
+
+离开一行要 **+9.0 ms**，之后每行只要 **+1.6 ms**。这一列才是真正的障碍，而且它不是
+带宽：四行和一行一样只读一份权重。第一个额外行就吃掉整趟的 19%。
+
+**端到端**（同一 prompt，各跑一次，与 20.66 对照）：
+
+| 形态 | token/趟 | ms/趟 | tok/s |
+|---|---|---|---|
+| 一行、不投机 | 1.00 | 48.4 | 20.66 |
+| SPEC=1，全头 | 1.35 | 66.9 | 20.21 |
+| SPEC=2，全头 | 1.39 | 74.7 | 18.59 |
+| SPEC=1，4096 行切片 | 1.17 | 60.8 | 19.03 |
+| SPEC=2，4096 行切片 | 1.18 | 63.4 | 18.54 |
+| SPEC=3，4096 行切片 | 1.18 | 67.8 | 17.33 |
+
+每一臂都是亏的，所以 `CWICK_Q35_SPEC` 默认保持关闭。
+
+**不是 40，也不是 35。** 约束是「一个 token 读一份权重」：40 tok/s 要求一趟产出 1.93 个
+token，而这个草稿侧的上限是 1.35。§62 说「需要 p ≥ 0.94」、§63 说「需要一份只要 1.5 ms
+的草稿」——代数都对，输入错了：切片下的草稿**确实**只要约 1.7 ms，但一趟仍然是 60.8 ms，
+因为第二个行要 9 ms；而 p 是 0.17，不是 0.8。这两节里的 35.5 / 44.4 / 43.0 用上面的表替换。
+
+**正确性。** 同一 seed 下 `CWICK_Q35_SPEC=0/1/2/3` 的输出文本逐字节相同：只有纯 argmax
+的采样器才允许接受草稿，所以带采样的请求根本不会投机，贪心请求的输出与单行路径完全一致。
+
+**还剩什么，按体量排序。** 第一，把两行的校验从 57.4 压到 50 ms——+9.0/+1.6 这个台阶是
+内核形状造成的异常（四行和一行一样只读一份权重），它一次性地对所有投机形状收税。第二，
+改善候选集：散文里最近 token 窗口只有约 60 个不同 id，切片为了省 5.5 ms 放弃了 19 个点
+的接受率；用上一步自己 logits 的 top-K 行（本来就在主机上）去扩充这个集合是最便宜的办法，
+能把单草稿一步拉到约 21.4 对 20.7。这两件都不会把 40 变成可能。
+
+## 65. 第二行是 8 ms 而不是 9，草稿侧依然付不起它
+
+§64 结尾留了两件事、按体量排序：把两行校验从 57.4 压到 50 ms，以及改善候选集、
+让切片不再丢 19 个点的接受率。两件都做了。第一件从 9 ms 里拿回 2 ms，第二件从
+19 个点里拿回 2 个，结论都没变。
+
+**第二行的成本到底在哪。** 第一个要排除的是 k 行 GEMV，因为它是整趟里唯一换了内核的
+部分：`CWICK_Q35_GPU_TILED1=1` 让单行走它，**49.5 对 48.0 ms**，3%。所以 9 ms 里有
+7 ms 在别处 —— 那些在 n ≥ 2 时按行各跑一遍的东西：每层两个 norm、两个残差加、SwiGLU
+乘，外加 DeltaNet 的门对。每层 9.5 个 dispatch，按 `CWICK_Q35_GPU_MAXL` 的斜率算是
+**0.21 ms/层**（8/16/32 层分别是 +2.66/+4.51/+7.71 ms，即 0.21 ms 每层 + 1.0 ms 固定）。
+
+**把它们批量化**只是改发射次数 —— 同样的算术、同样的求和、同样的顺序，所以一个 bit 都
+不会动。新增五个内核（`q35_rmsnorm_rows`、`q35_add_rows`、`q35_silu_mul_rows`、
+`q35_l2norm_rows`、`q35_gdn_gates_rows`），行号从 grid 拿、行 stride 作参数；
+`CWICK_Q35_ROWFUSE=0` 把逐行循环放回去，这样这个断言在一个二进制里就可测。结果，同一
+session 内 back-to-back、n = 2：**199 趟 56.61 → 55.81 ms**。所以一个 dispatch 值
+约 5 µs、不是 22 µs，那 9 ms 从来不是发射延迟。
+
+**n = 2 时的 RP。** `cwick_q35_gemv_n_rp` 一直是常量 2，因为那张表是在 n = 4..8 时测的
+（那里 RP4 会 spill）。n = 2 时只有八个活累加器，多出来的激活复用是白得的：RP4 是
+**54.61 对 55.67 ms**。n = 3 就已经退化（RP2 的 54.41 对 RP3 的 61.35），所以策略是
+`n <= 2 ? 4 : 2`。RP 不移动一个累加内的任何 FMA，所以 `CWICK_Q35_GPU_CHECK` 断言的
+逐位不变量不受影响 —— 两行校验仍然每个位置都是 `max|gpu-cpu| = 0.00000`。
+
+**剩下那部分不是激活重读。** 一个 threadgroup 覆盖 RW × RP = 8 行权重，所以激活切片被
+读 `cols/8` 次；把 group 加宽应该能砍掉一半。加了 `CWICK_Q35_GEMVN_RW` 去扫，结果是
+**RW 4 / 6 / 8 → 55.9 / 54.9 / 56.3 ms**，落在跑间噪声里；而 n = 1 时同一个内核反而从
+49.5 掉到 52.1。每多一行剩下的那 6 ms 没有解释清楚，也不值得再追 —— 其它都固定之后，
+两行一趟是 54.6 ms，而这个数只有在「草稿足够对、能把这个行填上」时才有意义。
+
+**候选集。** §64 提过用上一步自己的 logits 去喂短名单（校验趟已经把它拷到主机上了）。
+做了：`CWICK_Q35_CAND` 的一半是最近窗口，另一半是与最高 logit 相差
+`CWICK_Q35_CAND_T`（默认 2.5）以内的所有行，上限 `CWICK_Q35_CAND_LCAP`（默认 512）。
+深度 1 的接受率 **16.8% → 18.5%** —— 而一份草稿要为每个参评行付 8 KB 的词表头，所以
+2048 行要 4 ms、512 行要 1。宽的那版用 4 ms 买 2.6 个点，是亏的；窄的那版用 1 ms 买
+1.7 个点，是打平。用阈值不用 top-k，因为尖的分布只给出几行、平的分布能填满它那一半，
+两种都不需要排序。
+
+**端到端，同一 session，200 token prompt，生成 161-200，贪心：**
+
+| 形态 | token/趟 | ms/趟 | tok/s |
+|---|---|---|---|
+| 一行、不投机 | 1.00 | 48.1 | **20.74** |
+| VERIFY=2、不带草稿 | 1.00 | 56.2 | 17.79 |
+| SPEC=1，512 行切片 | 1.18 | 60.0 | 19.72 |
+| SPEC=1，2048 行切片 | 1.18 | 59.2 | 19.94 |
+| SPEC=1，全 2.03 GB 头 | 1.35 | 66.8 | 20.19 |
+
+每一臂仍然亏。草稿最好能给 0.35 token/趟（全头），而它填的那个行要 8 ms，所以交叉点在
+「0.35 > 8/48」，即切片接受率得超过 16.7% —— 它没有。
+
+**为什么 40 在这个检查点上不可达。** 在本机 341 GB/s 下一份权重读是 48 ms，所以 40 tok/s
+需要**每趟 2.08 个 token**，对应的接受率是 Σ p^i 且每个深度 p ≥ 0.52。全头给的是
+0.356 / 0.125 / 0.0，求和 1.40，而且这就是任何 k 的上限 —— 因为那个块只按一个深度训练过，
+再往后链自己的残差就出了分布。这个仓库里没有任何东西能提高一个属于权重的比率。能改变它
+的是：一个 MTP 头按多深度链训练过的检查点，或者一个能在 2 ms 内出草稿的小模型。两者都不在
+模型目录里。
+
+**正确性。** `make test` PASS（678 断言）。`CWICK_Q35_SPEC=0/1/2` 输出逐字节相同，两行
+校验的 `max|gpu-cpu| = 0.00000`。`CWICK_Q35_SPEC` 默认仍关闭。
+
+## 66. `serve` 每个会话的第一个请求就死：reset 里 256 倍越界
+
+日志停在 `[req 1] generation slot 0`，没有任何错误行，而进程已经不在了。同一个上午的两份崩溃
+报告栈完全相同：
+
+```
+__bzero + 12400
+q35_engine_reset
+cwick_engine_reset
+handle_client
+client_thread
+```
+
+`EXC_BAD_ACCESS / SIGBUS / KERN_PROTECTION_FAILURE`，写在**一个 ~11.86 GiB 区域的最开头**
+（`bytes after start: 0`）。`__bzero` 是大块 memset 的路径，而调用方在清草稿头的 KV 缓存。
+
+**根因。** MTP 缓存改成 512 行滑窗（§64）时，分配、`bind_tensor`、缓存计费、`mtp_compact`
+全都跟着改成了 `mtp_win`——但 `q35_engine_reset` 没改：
+
+```c
+/* 分配：mtp_win 行 */
+m->mtp_kcache = xcalloc((size_t)m->mtp_win, (size_t)kvw * sizeof(float));
+/* 清零：max_seq_len 行 */
+memset(qe->m.mtp_kcache, 0, (size_t)c->max_seq_len * ...);
+```
+
+每个 2 MiB 的分配被写了 512 MiB，两块，即 **256 倍**。越界一路冲出堆，撞进一段不可写的映射，
+内核在那一页上直接杀进程。什么都不打印，因为故障是即时的、没有 handler。
+
+**为什么 CLI 从来没露过。** `q35_engine_reset` 只经由 `cwick_engine_reset` 到达，而后者只有
+`handle_client` 调用——服务在请求之间重置状态。`cwick run` 建一个引擎、从不 reset，所以
+§62–§65 里所有 `run` 的测量都不受影响。这个回归是随滑窗引入的，也只可能在 `serve` 里出现。
+
+**修复。** 按 `mtp_win` 清，并加 `mtp_win > 0` 保护。在与崩溃那次相同的配置上验证（context
+131072、80 GiB 前缀缓存）：125 KB body / 25298 token 的请求返回 200，连续三轮请求不再
+reset 故障，`start.sh` 起回 8001 后正常服务。
+
+**顺手核查过、不是缺陷的几件事。**
+
+- *短 prompt 固定约 1.1 s 的 prefill*（6 token，CLI 与服务一致）。那是把 17.98 GiB 权重完整
+  读一遍——稠密 9B 模型产出任何一个 token 都必须碰每个矩阵，而 CPU prefill 路径只跑到约
+  16 GB/s（机器能到 120 GB/s）。长 prompt 上它被摊掉了：25298 token 实测 74.4 tok/s。
+- *某次测试里 `prefix_cache_queries_total` 为 0* 是我自己的配置——只有给了
+  `--prefix-cache-dir` 才开缓存。开了之后计数器是对的：queries 2、hits 1、复用 25297 token，
+  同一条 25298 token 的 prompt 第二次从 **340 s prefill 变成 0.206 s 的 TTFT**。
+- *79.65 / 80.00 GiB 的缓存占用*是缓存正常工作、不是泄漏：`evict_to_fit` 在 open 时和每次
+  store 之后都跑。但账值得记住——一个 25K token 请求会写三份快照（prompt 前缀、off-by-one
+  那份、prompt 加生成 token），这个检查点每份约 1.3 GB，所以 80 GiB 大约是 20 轮 agent
+  会话，之后最旧的开始被淘汰。
+- *日志里那行 `--trace` ON* 来自 `start.sh`，是它故意传的（goal.md 要求这个开关）；打印
+  prompt 与输出时是截断的。
+
+**教训是机械的。** 一块缓冲区有四处必须对尺寸达成一致：分配、重置、计费、以及任何把它序列化
+的地方。§64 动了其中三处。这四处之间没有 `_Static_assert` 可用，所以最便宜的一道防线是：
+**分配取的是运行时字段时，重置就不该取配置里的常量**——`mtp_win` 是字段、`max_seq_len` 是
+配置，上面两行不一致的正是这一点。
+
+## 67. serve 日志该按缓存命中率读，不该按延迟读
+
+`logs/cwick-serve.log`（10:07:25 至 10:25:25，三轮 42K token 的 agent 会话，全部 200，
+没有 warn/error/failure 行）只看状态码会显得一切正常。数字不是这样：每一轮都写着
+
+    prefix cache hit: 31785 of 42158 prompt tokens replayed, 10373 left to prefill
+    ...
+    prefix cached: 48087 tokens (251 ms, background)
+
+也就是每轮都存了一份完整的 42K/48K 快照，而**下一轮仍然只复用了那 31785 token 的静态
+system+tools 头**。三轮端到端分别 189.2 s、603.6 s、196.5 s；其中约 178 s 都在重新
+prefill 那约 10K 的尾部——本该由刚写下的快照覆盖。`logs/cwick-serve.log.crash-20261113`
+是另一次更早的故障，日志停在 `[req 1] generation slot 0` 且没有响应，即 §66 的 SIGBUS。
+
+**根因：被淘汰的正是刚写入的那一条。** 旧的代价函数用 `longest - pos` 排序，把最长的
+条目算成最该淘汰。而增长型会话里最新的快照按定义就是缓存中最长的，于是 `evict_to_fit`
+把刚写的文件选成自己的牺牲品，在报告成功后几微秒就 unlink 掉。缓存是 79.13 / 80.00 GiB、
+184 份快照，所以**每次** store 都会触发淘汰——这不是偶发，是每轮必现。
+
+现在淘汰分两级（`hits > 0` 的条目优先于从未被复用的，同级按最后使用时间），并有两条绝对
+保护：刚写入的条目，以及最短的前缀（所有更长 prompt 的公共基座；冷启动时第一份快照到达时
+它还没来得及攒到命中）。其余条目仍然可被淘汰——包括命中过的，按最后使用时间排序——
+所以缓存不会无限增长。当只剩这两条受保护条目时，允许超出一个文件的容量，而不是删掉其中
+任何一个。两条回归测试分别覆盖「24 份后续快照」与「单调增长的会话」；`make test`
+686/686 PASS。
+
+**核验时还发现一个构建级故障。** 管线枚举有 26 项而 `P_NAME[]` 只有 24 项，多出的两项
+属于两个既没有派发函数、也没有调用点的分组共享 attention 内核。正在跑的二进制是在这次枚举
+改动之前编译的，所以日志里每次启动都还是 `24 kernels`。一旦重新编译，`q35m_init` 会走到
+名字表末尾读 NULL，GPU 初始化失败——一条没有任何测试覆盖的静默回归。已删除死内核与枚举
+项；用独立 Metal 探针编译生产 shader 源码并建全部 24 条管线：`OK: 24 kernels, 0 bad`。
+该探针只是一次性验证，不是随项目交付的工具。
+
+**metrics 数据是健康的，但不完整。** `/v1/metrics` 暴露 44 组指标；在
+`uptime_seconds 12.5` 抓的快照里所有 counter 都是 0，只是因为当时还没有请求完成；
+`process_footprint_bytes` 28.50 GB 与 17.98 GiB 权重 + 8.44 GiB 状态 + 464 MiB MTP 头
+相符。真正的缺口是：goal.md 禁止 swap 与压缩，但唯一证据只有启动那一行
+（`host swap 0.86 of 2.00 GiB used, compressor ... since boot`）。现在新增五个主机级
+gauge 持续暴露：`cwick:host_swap_used_bytes`、`host_swap_total_bytes`、
+`host_wired_bytes`、`host_compressions_total`、`host_swapouts_total`。之所以是主机级，
+是因为 VM 接口没有进程视角：非零的绝对值本身不构成违规，要看一个采集窗口内的增量。独立
+渲染探针确认数值与启动行一致（928514048 / 2147483648 / 1225496103）。
+
+本轮未改动任何模型精度、权重、后端或上下文行为。

@@ -21,6 +21,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static cwick_safetensors *g_cmp_saf; /* qsort comparator context (startup only) */
 
@@ -438,8 +440,159 @@ void cwick_safetensors_split(const cwick_safetensors *saf,
     if (streamed_bytes) *streamed_bytes = streamed;
 }
 
+/* ------------------------------------------------------------------ */
+/* residency                                                           */
+/* ------------------------------------------------------------------ */
+
+uint64_t cwick_safetensors_bytes_under(const cwick_safetensors *saf,
+                                       const char *prefix) {
+    if (!saf) return 0;
+    size_t plen = prefix ? strlen(prefix) : 0;
+    uint64_t total = 0;
+    for (size_t i = 0; i < saf->tensor_count; i++) {
+        const cwick_st_tensor *t = &saf->tensors[i];
+        if (prefix && strncmp(t->name, prefix, plen) != 0) continue;
+        total += t->data_bytes;
+    }
+    return total;
+}
+
+/* One worker's slice of the fault-in pass. Reading one byte per page is
+ * enough: the kernel maps a whole page per fault, and doing more would only
+ * add bandwidth for data the caller is about to read anyway. */
+typedef struct {
+    const uint8_t *base;
+    size_t page;
+} touch_arg;
+
+static volatile uint64_t g_touch_sink;
+
+static void touch_range(void *argp, int64_t p0, int64_t p1) {
+    const touch_arg *a = (touch_arg *)argp;
+    uint64_t acc = 0;
+    for (int64_t i = p0; i < p1; i++) acc += a->base[i * (int64_t)a->page];
+    g_touch_sink += acc;
+}
+
+static int cmp_range(const void *a, const void *b) {
+    const cwick_st_range *ra = (const cwick_st_range *)a;
+    const cwick_st_range *rb = (const cwick_st_range *)b;
+    if (ra->p != rb->p) return ra->p < rb->p ? -1 : 1;
+    return ra->n < rb->n ? -1 : (ra->n > rb->n ? 1 : 0);
+}
+
+uint64_t cwick_safetensors_make_resident(cwick_safetensors *saf,
+                                         const char *prefix, int wire) {
+    if (!saf || !saf->map_count) return 0;
+    if (saf->pinned_count) return saf->pinned_bytes;   /* idempotent */
+
+    size_t plen = prefix ? strlen(prefix) : 0;
+    cwick_st_range *r = cwick_xmalloc((saf->tensor_count ? saf->tensor_count : 1) *
+                                      sizeof(*r));
+    size_t n = 0;
+    for (size_t i = 0; i < saf->tensor_count; i++) {
+        const cwick_st_tensor *t = &saf->tensors[i];
+        if (prefix && strncmp(t->name, prefix, plen) != 0) continue;
+        if (!t->data || t->data_bytes == 0) continue;
+        r[n].p = (void *)(uintptr_t)t->data;
+        r[n].n = t->data_bytes;
+        n++;
+    }
+    if (!n) {
+        free(r);
+        return 0;
+    }
+    qsort(r, n, sizeof(*r), cmp_range);
+
+    /* Merge touching or overlapping runs: mlock() is a syscall per call and a
+     * layer's weight matrices sit back to back inside a shard, so this turns a
+     * few hundred calls into a few dozen. */
+    size_t m = 0;
+    for (size_t i = 1; i < n; i++) {
+        uint8_t *end = (uint8_t *)r[m].p + r[m].n;
+        if ((uint8_t *)r[i].p <= end) {
+            uint8_t *e2 = (uint8_t *)r[i].p + r[i].n;
+            if (e2 > end) r[m].n = (size_t)(e2 - (uint8_t *)r[m].p);
+        } else {
+            r[++m] = r[i];
+        }
+    }
+    m++;
+
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 16384;
+    cwick_pool_init();
+
+    uint64_t bytes = 0;
+    int wired = 0;
+    for (size_t i = 0; i < m; i++) {
+        uint8_t *p = (uint8_t *)r[i].p;
+        size_t len = r[i].n;
+        /* Ask for the whole run first: the readahead this queues is what makes
+         * the per-page faults below cheap instead of one round trip each. */
+        madvise(p, len, MADV_WILLNEED);
+        int locked = 0;
+        if (wire) {
+            /* mlock() faults the range in and wires it in one syscall, which
+             * is both cheaper than a user-space pass over 1.2 M pages and the
+             * only version that cannot be undone by reclaim between the two
+             * steps. Page-align down/up: the first tensor of a shard starts at
+             * a file offset inside the mapping, not at its page boundary. */
+            uintptr_t lo = (uintptr_t)p & ~(uintptr_t)(page - 1);
+            uintptr_t hi = ((uintptr_t)p + len + page - 1) & ~(uintptr_t)(page - 1);
+            locked = cwick_mem_lock_range((const void *)lo, (size_t)(hi - lo),
+                                          "model weights");
+            if (locked) wired++;
+        }
+        if (!locked) {
+            touch_arg a;
+            a.base = p;
+            a.page = page;
+            int64_t pages = (int64_t)((len + page - 1) / page);
+            cwick_pool_for(pages, &a, touch_range);
+        }
+        bytes += len;
+    }
+    /* A sequential hint was installed at mmap time, when the only assumption
+     * was "this file is read once, front to back". That is false for a model
+     * that lives here: the kernel may drop pages behind the read pointer, and
+     * the next token would fault them back in. */
+    for (size_t i = 0; i < saf->map_count; i++)
+        if (saf->maps[i] && saf->map_lens[i])
+            madvise(saf->maps[i], saf->map_lens[i], MADV_NORMAL);
+
+    saf->pinned = r;
+    saf->pinned_count = m;
+    saf->pinned_bytes = bytes;
+    saf->pinned_wired = (wired == (int)m);
+    return bytes;
+}
+
+void cwick_safetensors_release_residency(cwick_safetensors *saf) {
+    if (!saf || !saf->pinned) return;
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 16384;
+    for (size_t i = 0; i < saf->pinned_count; i++) {
+        uint8_t *p = (uint8_t *)saf->pinned[i].p;
+        size_t len = saf->pinned[i].n;
+        uintptr_t lo = (uintptr_t)p & ~(uintptr_t)(page - 1);
+        uintptr_t hi = ((uintptr_t)p + len + page - 1) & ~(uintptr_t)(page - 1);
+        cwick_mem_unlock_range((const void *)lo, (size_t)(hi - lo));
+    }
+    free(saf->pinned);
+    saf->pinned = NULL;
+    saf->pinned_count = 0;
+    saf->pinned_bytes = 0;
+    saf->pinned_wired = 0;
+}
+
 void cwick_safetensors_close(cwick_safetensors *saf) {
     if (!saf) return;
+    /* Give back the wiring before the mapping goes away: an mlock()ed range
+     * that is only unmapped later leaves the accounting (and, on a host that
+     * counts wired pages against a limit, the budget) claiming bytes that no
+     * longer exist. */
+    cwick_safetensors_release_residency(saf);
     /* Drop the checkpoint's resident pages before letting go of the index.
      *
      * The maps themselves stay mapped, deliberately: the stream reads through

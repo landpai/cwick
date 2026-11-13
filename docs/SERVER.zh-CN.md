@@ -12,6 +12,7 @@
 - `POST /v1/chat/completions`（以及 `/chat/completions`）—— 对话，使用 CWICK chat 模板（`<|begin|><|system|>…<|end|><|user|>…<|end|><|assistant|>`）。
 - `POST /v1/responses`（以及 `/responses`）—— Responses 方言：输入 `input` items，输出 `response` 对象（或 `response.*` 事件）。prompt、队列、前缀缓存与 chat 完全同一套；见下面 **Responses API**。
 - `POST /v1/messages`（以及 `/messages`）—— Anthropic 方言：输入 `system` 与 content blocks，输出 `message` 对象（或 `message_start … message_stop` 事件）。同一个引擎、同一条适配器规则；见下面 **Messages API**。
+  路径是在剥掉查询串之后才比较的，所以 Anthropic 客户端给每个请求都加的 `?beta=true` 无害；重复的 `/v1/v1/` 前缀也会被折叠 —— base URL 本身已经以 `/v1` 结尾时照常服务，而不是回 `404 unknown endpoint`。访问日志和 `--trace` 行仍然原样打印收到的路径。
 - `GET /v1/metrics`（以及 `/metrics`）—— Prometheus 文本，采用 vLLM 的命名。`cwick:model_loaded`（1/0）是实时的常驻状态位；`cwick:model_info` 保留上一次成功装载的 checkpoint 标签。
 - `POST /v1/auth/login`、`GET /v1/auth/status`、`POST /v1/auth/logout` —— 单用户登录 endpoint。登录接受 `{"password":"..."}`，设置 HttpOnly 的 `cwick_session` cookie 并返回一个 Bearer token。配置了密码之后，其他每一个 API/metrics/logs endpoint 在没有它时都返回 401；`/`、应用 HTML 和管理页面则重定向到 `/login`。
 - `GET /v1/config`（以及 `/config`）—— 本进程正在运行的选项。只读：其中的一切都是装载期的选择（见下文）。
@@ -33,6 +34,10 @@
 
 - 每个请求一个生成的答案（`n` 和 `best_of` 若出现，必须为 `1`）。
 - `max_tokens` 或 `max_completion_tokens` 用于给答案设上限。
+- 请求不带 `reasoning_effort` / `thinking` / `reasoning` / `enable_thinking`
+  中任何一个字段时，默认档位是 **关**，与显式传 `reasoning_effort:"none"`
+  完全等价。过去「字段缺失」等于「极致」（32768 token 思考预算），见
+  DECISIONS §55。任何显式字段仍然优先。
 - 通过 server-sent events 流式返回，包括 `stream_options.include_usage`。
 - `model` —— 若出现，必须是本服务端对外宣称的模型（配置里的 `model_type`）。
 - `tools`（`{"type":"function","function":{name, description, parameters}}` 的数组，最多 64 个）和 `tool_choice`（`"auto"`、`"none"`，或 `{"type":"function","function":{"name":…}}` 指名一个已声明的函数）。
@@ -247,7 +252,19 @@ following XML format:
 <tool_call>{function-name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
 ```
 
-然后再由 `src/tools.c` 从原始 completion 里读回来。包含格式良好的 `<tool_call>` 块的答案会以 `message.tool_calls[]` 返回，并带 `finish_reason: "tool_calls"`（流式客户端拿到的是 `delta.tool_calls`）；第一个块之前的文字仍留在 `content` 里。
+另一套模板在同一个 wrapper 里嵌套 `<function=NAME>` / `<parameter=KEY>VALUE</parameter>`；`src/tools.c` 把它改写成上面的扁平文法，所以所有 checkpoint 共用一个解析器。包含格式良好的 `<tool_call>` 块的答案会以 `message.tool_calls[]` 返回，并带 `finish_reason: "tool_calls"`；第一个块之前的文字仍留在 `content` 里。
+
+**流式工具调用（DECISIONS §58）。** 流式请求在工具调用生成期间不再一片沉默。模型一写出函数名，三个方言就各自用一个空的 `arguments` 开启调用，随后每完成一个参数追加一片增量；把增量拼起来恰好是最终对象。
+
+| 方言 | 起始帧 | 参数增量 |
+|---|---|---|
+| chat | 带 `id` / `type` / `function.name` 的 `delta.tool_calls[0]` | `delta.tool_calls[0].function.arguments` |
+| responses | `response.output_item.added`（`function_call`） | `response.function_call_arguments.delta` |
+| messages | `content_block_start`（`tool_use`） | `content_block_delta`（`input_json_delta`） |
+
+私有字段 `delta.cwick_tool` 仍发给内置控制台。分片由「把在途块的闭合前缀交给同一个 `cwick_tools_extract()`」生成，因此线上字节与最终对象不会互相矛盾，轮末再做一次结算对齐。只有第一个调用走流式（其余调用轮末整体给出），其它方言的块原样回退到轮末全量。
+
+分片也会落在**参数值内部**（DECISIONS §59）：agent 的工具调用通常是一个很长的参数（一段 shell 脚本、一个文件正文），只在 `</parameter>` 处分片会让整个值堆在最后一帧到达。一旦确定这个值只可能是 JSON 字符串（不以 `{ [ " -` 或数字开头，且不再是 `true`/`false`/`null` 的前缀）就开始流式，每 12 字节一帧；尾部空白、未完成的 `</parameter>`、半个 UTF-8 字符一律扣留。数字、布尔与对象值因此仍整体到达，且每个中间前缀都是最终 `arguments` 的字节前缀，拼接的客户端与读最终对象的客户端不可能不一致。
 
 没有任何东西约束 decode，所以失败模式是被处理掉的，而不是靠祈祷它不出现：
 

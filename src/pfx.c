@@ -31,7 +31,8 @@ typedef struct {
     uint64_t h1, h2;
     int64_t pos;
     uint64_t bytes;
-    uint64_t seq;      /* creation order, for oldest-first eviction */
+    uint64_t seq;      /* creation order */
+    uint64_t last;     /* last use: creation, or a lookup that matched */
     uint64_t hits;     /* replays served from this entry */
     char *path;
 } pfx_entry;
@@ -72,9 +73,10 @@ typedef struct {
     uint64_t h1, h2;
     /* Backend kind, stored in the header word that used to be padding. Value 0
      * is the original layout, so snapshots written before this field existed
-     * still parse as kind 0 with no size change. Kind 1 (DeepSeek) appends one
-     * opaque blob, preceded by its u64 length, after the token list; the
-     * backend that wrote a blob owns its layout. */
+     * still parse as kind 0 with no size change. Kind 1 (DeepSeek), 2
+     * (MiniMax) and 3 (Qwen3.5) append one opaque blob, preceded by its u64
+     * length, after the token list; the backend that wrote a blob owns its
+     * layout. */
     uint32_t kind;
 } pfx_header;
 
@@ -101,7 +103,7 @@ static bool read_header(FILE *f, pfx_header *h) {
     uint32_t ver = 0, kind = 0;
     if (!r64(f, &magic) || magic != PFX_MAGIC) return false;
     if (!r32(f, &ver) || ver != PFX_VERSION) return false;
-    if (!r32(f, &kind) || kind > 2) return false;   /* unknown backend */
+    if (!r32(f, &kind) || kind > 3) return false;   /* unknown backend */
     h->kind = kind;
     int64_t *fld[] = { &h->pos, &h->nslots, &h->lat_stride, &h->v_stride,
                        &h->L, &h->lin_heads, &h->lin_dim, &h->kpool, &h->hd,
@@ -230,6 +232,7 @@ static bool index_add(cwick_pfx_cache *c, uint64_t h1, uint64_t h2, int64_t pos,
     memset(e, 0, sizeof(*e));
     e->h1 = h1; e->h2 = h2; e->pos = pos; e->bytes = bytes;
     e->seq = ++c->seq;
+    e->last = e->seq;
     e->path = cwick_strdup(path);
     c->total_bytes += bytes;
     return e->path != NULL;
@@ -252,40 +255,59 @@ static void index_drop(cwick_pfx_cache *c, int i) {
  * that every later turn still starts with, i.e. the single most valuable
  * thing in the cache. Losing it costs a full prefill on every turn after.
  *
- * So the victim is chosen by usefulness first: an entry that has actually
- * served replays is kept over one that has never been hit, and only among
- * equally-useful entries does age decide. */
-static uint64_t entry_cost(const pfx_entry *e, int64_t longest) {
-    /* Lower is more evictable. Three keys, in order of weight:
-     *
-     *   1. replays served -- an entry nobody has asked for again is worth
-     *      less than one that is demonstrably in use;
-     *   2. length -- a *short* prefix is the base that longer prompts extend,
-     *      so it can be replayed by every turn of a session, while a long
-     *      per-turn snapshot can only ever serve itself. This is the key that
-     *      saves the base prompt in the window before it has earned a hit;
-     *   3. age -- among equals, the older one goes first.
-     *
-     * Length has to outrank age: with plain LRU the base prompt is evicted
-     * the moment the next turn's snapshot arrives, because it is the oldest
-     * thing in the cache and has not yet served a replay. */
-    uint64_t h = e->hits;
-    if (h > 1023) h = 1023;
-    uint64_t len_rank = (uint64_t)(longest > e->pos ? longest - e->pos : 0);
-    if (len_rank > 4095) len_rank = 4095;
-    return (h << 52) | (len_rank << 40) | ((uint64_t)e->seq & 0xFFFFFFFFFull);
+ * So the victim is chosen in two tiers: an entry that has actually served a
+ * replay is kept over one that never has, and only inside a tier does age
+ * decide. Age is "last use" (last hit, or creation), not "creation", which is
+ * what keeps the base prompt alive: it is the oldest entry in the cache but
+ * every turn's lookup touches it, so it never looks stale. */
+static bool older_than(const pfx_entry *a, const pfx_entry *b) {
+    const bool ha = a->hits > 0, hb = b->hits > 0;
+    if (ha != hb) return !ha;              /* the never-replayed one goes */
+    if (a->last != b->last) return a->last < b->last;
+    /* Exact tie: the longer prefix covers the shorter one, so the shorter one
+     * is the redundant copy. */
+    if (a->pos != b->pos) return a->pos < b->pos;
+    return a->seq < b->seq;
 }
 
+/* Length used to be a ranking key here, and *descending* at that: the longest
+ * entry scored as the most evictable. A growing session's newest snapshot is
+ * by construction the longest the cache has ever seen, so every store ran
+ * evict_to_fit with itself as the victim and unlinked the file it had just
+ * written -- reported as `prefix cached: 41761 tokens (150 ms)` and gone from
+ * disk a microsecond later. Measured on a live 42K-token agent session: three
+ * turns in a row replayed exactly 31785 tokens (the static tools+system head)
+ * while all three 42K snapshots vanished, so each turn re-prefilled its
+ * remaining 10K tokens at 58 tok/s -- 178 s of TTFT per turn, for a cache
+ * that reported every store as a success.
+ *
+ * Two entries are therefore never candidates. The one just written carries
+ * the newest sequence number; without this guard the store deletes itself.
+ * The shortest prefix is the shared base of every longer prompt and the only
+ * entry able to serve all turns, yet on a cold start it has not earned a hit
+ * when the first snapshot arrives -- so age alone would drop it before its
+ * first lookup. Everything else stays eligible, including hit entries: among
+ * those, last-use order decides, so a long session cannot grow without bound.
+ *
+ * When those two protected entries are all that is left, allow one snapshot
+ * of overshoot on disk instead of deleting either. Losing the base costs a
+ * full prefill on every following turn; the overshoot is one file. */
 static void evict_to_fit(cwick_pfx_cache *c) {
     while (c->total_bytes > c->cap_bytes && c->n_ents > 1) {
-        int64_t longest = 0;
+        int base = -1;
+        int64_t shortest = -1;
         for (int i = 0; i < c->n_ents; i++)
-            if (c->ents[i].pos > longest) longest = c->ents[i].pos;
-        int victim = 0;
-        for (int i = 1; i < c->n_ents; i++)
-            if (entry_cost(&c->ents[i], longest) <
-                entry_cost(&c->ents[victim], longest))
+            if (shortest < 0 || c->ents[i].pos < shortest) {
+                shortest = c->ents[i].pos;
+                base = i;
+            }
+        int victim = -1;
+        for (int i = 0; i < c->n_ents; i++) {
+            if (i == base || c->ents[i].last == c->seq) continue;
+            if (victim < 0 || older_than(&c->ents[i], &c->ents[victim]))
                 victim = i;
+        }
+        if (victim < 0) return;
         index_drop(c, victim);
     }
 }
@@ -393,6 +415,7 @@ int64_t cwick_pfx_lookup(cwick_pfx_cache *c, const uint32_t *ids, int64_t n) {
                  * that picks the base prompt, which costs a single prefill
                  * while the longer snapshots are still there to serve. */
                 e->hits++;
+                e->last = ++c->seq;   /* keeps a live base prompt fresh */
                 break;
             }
         }

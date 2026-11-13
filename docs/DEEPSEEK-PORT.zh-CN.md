@@ -413,8 +413,10 @@ system / 会话中 system、user、assistant（reasoning + 内容 + DSML 工具�
 * 请求校验阶段用 `cwick_json_write()` 原样保留 OpenAI 的 `messages` / `tools` 数组，
   因为 DeepSeek 模板要读 `reasoning_content`、`task`、`wo_eos` 这些 `cwick_chat_msg`
   压缩结构里没有的字段；
-* 客户端没写 effort 时传「未设定」而不是 GLM 的“极致”——两个 checkpoint 的默认预算
-  不同（DeepSeek 是 75，GLM 是 Max）。实测渲染结果：
+* 客户端没写 effort 时曾传「未设定」，让各 checkpoint 用自己的默认预算
+  （DeepSeek 75、GLM Max）。§55 之后「字段缺失」就是真实档位「关」，与显式
+  `reasoning_effort:"none"` 走同一条路径。下面的渲染结果是改动前「未设定」的
+  历史产物，保留作逐字节模板参照：
 
 ```
 <｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)

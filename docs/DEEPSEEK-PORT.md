@@ -413,8 +413,9 @@ equivalent to "byte-identical to the reference format", not "looks about right".
 * the request validation stage uses `cwick_json_write()` to preserve OpenAI's `messages` / `tools` arrays verbatim,
   because the DeepSeek template needs to read `reasoning_content`, `task`, `wo_eos` — fields that the `cwick_chat_msg`
   compact structure does not have;
-* when the client does not write an effort, pass "unset" rather than GLM's "Max" — the two checkpoints have different
-  default budgets (DeepSeek is 75, GLM is Max). Measured rendering:
+* an absent effort used to be passed as "unset" so each checkpoint kept its own default budget (DeepSeek 75,
+  GLM Max). Since §55 the absent case is the real level 关 and takes the same path as `reasoning_effort:"none"`.
+  The rendering below is the historical "unset" output, kept as a byte-level rendering fixture:
 
 ```
 <｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)

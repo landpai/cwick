@@ -177,6 +177,18 @@ bool cwick_sampler_looped(const cwick_sampler *s, int *period, int64_t *run);
  * place — the caller recomputes it on every step anyway. */
 uint32_t cwick_sampler_pick(cwick_sampler *s, float *logits, int64_t n);
 
+/* True when `cwick_sampler_pick` on this state is a plain `argmax`: greedy,
+ * no penalties, and no loop-breaker ban armed at this step.
+ *
+ * That is the one condition under which a speculative step can verify a draft
+ * against the raw logits row and get the same answer the live pick would have
+ * given. Everything else in pick() either rewrites the logits (penalties, the
+ * ban) or draws from them (temperature), so a row compared against argmax
+ * would then be accepted where the real path would have said no -- a silent
+ * change in output, which is the one thing speculation is not allowed to do.
+ * When this returns false the caller simply verifies one row. */
+bool cwick_sampler_plain_argmax(const cwick_sampler *s);
+
 /* One-line description for request logs: "greedy", or
  * "t=1.00 top_p=0.95 top_k=20 pen=0.00/0.00". */
 void cwick_sampler_describe(const cwick_sampler_cfg *c, char *buf, size_t cap);

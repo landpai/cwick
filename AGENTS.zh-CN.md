@@ -25,15 +25,53 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
 
 ## 2. 硬约束（动手前先读，这些不是建议）
 
-- **只用 C**。C11 + 一个 Objective-C 文件（`src/metal_objc.m`，Metal 桥）。链接的
+- **只用 C**。C11 + 两个 Objective-C 文件（`src/metal_objc.m`，专家/主干 GEMV 的 Metal 桥；
+  `src/q35_gpu.m`，Qwen3.5 整步前向的 encode 层）。链接的
   只有 macOS 系统框架（Accelerate / Metal / CoreImage / ImageIO / CoreGraphics）
   与系统 `sqlite3`（`Makefile:15-16`）。不引入第三方库、不用 Python、没有权重转换步骤。
   一次性验证工具也写纯 C（`tools/*.c`），shell 只负责驱动编译与运行。
-- **只有三条模型路径，不要造第四条**：
+- **四条模型路径**：各自持有加载器、前向与 prompt 模板，只共享进程、采样器和服务器。
+  加一个模型是「再加一条」，不是重写其它三条。
   - GLM-5.3-flash：`spine.c`（常驻权重/内存计划）、`engine.c`（请求→prefill/decode）、
     `attention.c`（MLA/GQA/DeltaNet）、`moe.c`（路由 + 专家 GEMV/GEMM）；
   - DeepSeek-V4.1：`ds_model.c` / `ds_engine.c` / `ds_ops.c` / `ds_quant.c` / `ds_prompt.c`；
-  - MiniMax-M3.1：`mm_model.c` / `mm_engine.c` / `mm_prompt.c`（+ `mm.h`）。
+  - MiniMax-M3.1：`mm_model.c` / `mm_engine.c` / `mm_prompt.c`（+ `mm.h`）；
+  - Qwen3.5：`q35_model.c` / `q35_engine.c` / `q35_prompt.c`（+ `q35.h`），GPU decode 步在
+    `q35_gpu.c` / `q35_gpu.m` / `q35_shader.c`。32 层里 24 层是
+    Gated DeltaNet 的稠密 BF16，不流式读盘、不需要专家缓存。它是唯一小到能整份放进核里的
+    checkpoint：`q35_model_open` 在尺寸策略允许时把 17.98 GiB 全部装入并 wire（连 KV /
+    DeltaNet 状态一起），prefill 则按 value head（delta 递推）并行——这段原本占 prefill 的 58%
+    且只用一个核。attention 是**两次 GEMM**（score 与 output）走 Accelerate，因果掩码以
+    -1e30 写进矩形里、softmax 的参数不变；手写分块在同一形状上只有 22 GMAC/s，cblas 是 750
+    （`tools/attnbench`）。decode 是另一条路（`dec_scores`/`dec_out`）：只处理一个位置、十六个
+    头，于是行走 K/V 行、让每行 4 KiB 服务十六个点积——按头调矩阵向量乘只读 4 KiB 里的 1 KiB，
+    实测 13 GB/s。前缀缓存把它的状态当作 `kind = 3` 传输
+    （`q35_prefix_pack`/`_apply`），而一个快照只有停在「下一轮开始分歧」的位置才有用——最后
+    8 个 token 里搜思考标记就是为了这个。`CWICK_Q35_PROF=1` 打印每块的分相。
+    这个 checkpoint 里有**两种**
+    norm 约定：普通 RMSNorm 用 `1 + w`，DeltaNet 内部那个门控 norm 用 `w`；RoPE 是
+    `rotate_half` 而不是相邻配对；`q_proj` 是**按 head 交错的 `q | gate`**。三者错时都
+    不报错，所以都写进了 DECISIONS §51；驻留与并行分相在 §52，GEMM 重写与 f32 缓存是 §54。
+    decode 走 GPU、整步装进一个 command buffer（§61）。投机校验是 `CWICK_Q35_VERIFY=k`
+    （k 个连续位置、一趟权重 pass、不带草稿器——计时是真的、文本不是）和 `CWICK_Q35_SPEC=k`
+    （k 份草稿 + 一趟 k+1 行校验；注意 k 是**草稿数**不是行数，`SPEC=1` 就是一份草稿 + 两行）。
+    草稿器优先用检查点自带的 MTP 块（有 `model-mtp.safetensors` 时），否则回落到 prompt
+    查表；`CWICK_Q35_MTP=0` 强制用查表。它实测在每种形状下都是亏的——20.21 对 20.66 tok/s
+    ——所以默认关闭，数字在 §64。它的开关：`CWICK_Q35_MTP_FULL=1` 让草稿对全部 2.03 GiB
+    词表投影而不是候选切片（散文上接受率 0.356 对 0.168，代价 5.5 ms）、`CWICK_Q35_CAND=n`
+    定切片大小（默认 4096）、`CWICK_Q35_MTP_WIN=n` 定块自己 KV 窗口的行数（默认 512 行、
+    4 MiB）、`CWICK_Q35_MTP_POSTNORM=0` 让融合吃残差流而不是最终 norm 之后的那份、
+    `CWICK_Q35_MTP_SWAP=1` 反转融合顺序（会让接受率归零，别动）、`CWICK_Q35_MTP_NOATTN=1`
+    关掉块的 attention 半边做消融、`CWICK_Q35_CAND_T=f` / `CWICK_Q35_CAND_LCAP=n` 定
+    短名单里有多少来自上一步 logits（§65）、`CWICK_Q35_ROWFUSE=0` 把 k 行 pass 的逐行
+    内核放回一行一次发射、`CWICK_Q35_GEMVN_RW=n` 扫 k 行 GEMV 的每线程组 simdgroup 数
+    （实测是平的，§65）。`CWICK_Q35_GPU_CHECK=1`
+    拿 k 行 pass 的每一行去对「同一条 GPU 路径逐行跑」，必须打印 `0.00000`；
+    `CWICK_Q35_GEMVN_RP=1|2` 强制校验内核的「每个 simdgroup 负责几个权重行」以做同场 A/B，
+    因为基线在会话之间会漂到 20%。`CWICK_Q35_SPEC_POISON=i` 故意把第 i 个草稿改坏，用来
+    走部分接受那条路。校验内核的激活直接从 device 内存读、线程组是 128 线程；它由
+    `tools/q35gemab` 做消融测量（`ABL=0..3`、`MODE`、`PF`、`RPF`、`TH`、`NSGV`），边际行的成本
+    正是这样被追到激活流量而不是算术上的。§62 是校验与草稿，§63 是这个内核的每行成本。
   接一个新模型 = 新加载器 + 新反量化 + 新 prompt 模板 + 新内核，**不是改一个 config**。
 - **质量铁律**：top-k 取 checkpoint 自己的 `num_experts_per_token`，专家不剪、
   embedding 不共享、缺分片 fail closed（宁可起不来，也不悄悄跑小一号的模型）。
@@ -51,6 +89,11 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
 - OpenAI 兼容 API：`/v1/models`、`/v1/models/<id>`、`/v1/completions`、
   `/v1/chat/completions`（SSE、`reasoning_content` 与 `content` 分离、
   `tool_calls` 按 checkpoint 自己的协议生成再解析回 OpenAI 形状）。
+  流式工具调用在写出函数名时就开启，并逐片发送各方言的标准参数增量，
+  增量会一直落到**参数值内部**，所以「只有一个长参数」的调用是逐段填充而不是
+  最后整体出现（§59）。`delta.cwick_tool` 仍保留给内置控制台。两种工具 XML
+  文法（扁平 `<arg_key>` 与嵌套 `<function=>`）都收，统一改写后交给同一个
+  解析器（§58）。DeepSeek 的 DSML 方言**尚未解析**（§59）。
 - Responses API（`POST /v1/responses`）：`input` items（message / function_call /
   function_call_output、扁平的 `function` tools）先翻译成服务端早就在校验的 chat 请求，
   再按 `response` 对象或 `response.*` 事件回答。是一个适配器而不是第二个引擎——prompt、
@@ -85,6 +128,9 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   用 500000、MiniMax 用 32768（它的 KV 是 2.3 KiB/位置/层，500K 要 64 GiB）。
 - 思考强度：关/低/中/高/超高/极致 → 0/512/2048/8192/16384/32768，
   **上限由引擎自己执行**（到顶时把闭合标记写进输出和上下文）。
+  **请求不带思考字段时默认「关」**（`server.c` 的 `CWICK_THINK_DEFAULT_LEVEL`），
+  与显式 `none` 等价；该档位作为真实 level 传给渲染器，不再传「未设定」哨兵。
+  内置 Web 控制台会显式发送 `reasoning_effort`，不受影响。
 - 前缀缓存（`pfx.c`）：每个 prompt 结束把推理状态快照到 `--prefix-cache-dir`，
   下轮同前缀直接回放。403 token 的 prompt：冷 169.4 s → 热 9.95 s。
 - 内存计划（`spine.c` + `stream.c`）：上限默认 80% RAM，`--mem-fraction` /
@@ -94,8 +140,11 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   503 + `Retry-After`；排队中断连会被移出队列（不白烧一次 prefill）。
 - 日志：stdout 一事件一行，带墙上时间与请求号；prefill 按层报进度（块大小
   `MM_CHUNK` / `DS_CHUNK` = 1024，典型决策 prompt 就是**一块**，满块在 60 层上要
-  140–200 s，所以必须按层打，否则单块 prompt 几分钟 0 行），decode 分
-  `decode(thinking)` / `decode(content)` / `decode(tools)`。
+  140–200 s，所以必须按层打，否则单块 prompt 几分钟 0 行），decode 的每步行与
+  定期进度行都分 `decode(thinking)` / `decode(content)` / `decode(tools)`。
+  阶段提示会推给全部四个后端（`engine.c`：DS / MiniMax / Qwen3.5 / GLM），
+  切换行还带刚结束那一段的速率。Qwen3.5 的 prompt 以 `<think>\n` 结尾，
+  所以开标记要用 4 token 窗口找（§56）。
 - `/v1/metrics`：vLLM 命名，槽位忙时照样能读。
 - 控制台（`webui.c` + `src/webui_embed.c`）：对话 / 应用 / 模型 / 日志 / 设置五个 tab；
   对话页**三种方言都支持**（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，

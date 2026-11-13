@@ -633,7 +633,9 @@ char *cwick_metrics_render(size_t *out_len) {
     emit_gauge_i(&b, "cwick:expert_cache_cap_bytes",
                  "Expert-cache budget in bytes.", cap);
     emit_gauge_i(&b, "cwick:memory_ceiling_bytes",
-                 "Hard ceiling cwick steers its RSS toward (--mem-fraction of RAM).",
+                 "Hard ceiling cwick steers its RSS toward (--mem-fraction of "
+                 "RAM). 0 means nothing is steered: no expert cache exists to "
+                 "budget because the whole checkpoint is resident and wired.",
                  atomic_load_explicit(&g_ceiling, memory_order_relaxed));
     emit_gauge_i(&b, "cwick:context_window_tokens",
                  "Configured KV context window in tokens.",
@@ -656,6 +658,37 @@ char *cwick_metrics_render(size_t *out_len) {
         emit_gauge_i(&b, "cwick:process_footprint_bytes",
                      "Physical footprint of the cwick process (resident + "
                      "compressed).", fp);
+    }
+    /* The memory plan promises the checkpoint's pages stay uncompressed and
+     * unswapped. Startup logs that state once, but a scraper needs to keep
+     * checking it for the whole lifetime of the process: swap can appear an
+     * hour later, when another app on the same machine applies pressure.
+     *
+     * These are HOST-WIDE counters, not cwick's own -- vm.swapusage and
+     * host_statistics64 have no per-process view. A nonzero swap_used on a
+     * machine that already had swap before cwick started is not a violation;
+     * what matters is the delta over a scrape window. The compressions and
+     * swapouts counters are since boot, so read their slope, not their level. */
+    {
+        cwick_vm_state vm;
+        if (cwick_vm_state_sample(&vm)) {
+            emit_gauge_i(&b, "cwick:host_swap_used_bytes",
+                         "Host-wide swap space in use (not attributable to "
+                         "cwick alone). Watch the delta, not the level.",
+                         vm.swap_used);
+            emit_gauge_i(&b, "cwick:host_swap_total_bytes",
+                         "Host-wide swap space configured.", vm.swap_total);
+            emit_gauge_i(&b, "cwick:host_wired_bytes",
+                         "Host-wide memory currently wired (includes the "
+                         "checkpoint cwick pinned).", vm.wired);
+            emit_gauge_i(&b, "cwick:host_compressions_total",
+                         "Host-wide VM compressions since boot. A rising "
+                         "slope during a run means the memory plan is "
+                         "under pressure.", vm.compressions);
+            emit_gauge_i(&b, "cwick:host_swapouts_total",
+                         "Host-wide pages written to swap since boot.",
+                         vm.swapouts);
+        }
     }
     emit_gauge(&b, "cwick:uptime_seconds",
                "Seconds since cwick started.",

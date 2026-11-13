@@ -2820,3 +2820,1405 @@ delete that reports two files and leaves no directory; 404 for a missing name;
 404 for a traversing name. Against a live server: three layouts deleted with
 200 and the right byte count, `/v1/hub/models` and `/v1/models` both dropping
 them, the resident checkpoint refused with 409, and `..` / absolute paths 404.
+
+## 51. The checkpoint that answered "4" only after five wrong turns
+
+The fourth entry in the goal's model list is Qwen3.5-9B: 32 layers, of which 24
+have no softmax attention at all. They carry a Gated DeltaNet -- a recurrent
+linear attention that keeps a [128,128] state per value head instead of a KV
+cache -- and the remaining 8 are ordinary GQA with three twists: a per-head
+RMSNorm on Q and K, a partial rotation covering a quarter of each head, and an
+output gate that doubles the width of `q_proj`. All BF16, 18 GiB, no experts,
+so nothing streams and nothing needs a cache budget.
+
+**The port ran and produced garbage for five rounds.** Every round looked
+plausible in the numbers and useless in the text: endless spaces, then endless
+newlines, then punctuation. The way out was not more staring at the code. It
+was a second implementation in numpy that reads the same shards and prints the
+same statistics, and then comparing, layer by layer, against the reference C.
+
+That comparison is what made the problem visible. Layer 0's post-mixer mean,
+absolute maximum and first four values matched **to the last printed digit**
+(`mean=0.00455 absmax=13.636 x[0..3]=0.1058 0.2135 0.0251 -0.0635`), and so did
+layers 1-3 and the final logit ranking (`220(11.874)` against `220(11.877)`).
+Two independent implementations agreeing that closely does not mean the
+port is right. It means the port faithfully implements *the same wrong idea*,
+and that the idea -- not the code -- is what has to be fixed. From there the
+route was the published model source, read line by line.
+
+**Five separate mistakes, all silent:**
+
+1. *The convolution read the wrong row.* `src` is an absolute position inside
+the block, but the code added it to a per-position base, so position t read
+block position t+src. It looks right until the block is shorter than the
+window demands: the first runs read uninitialised memory past the end and
+conv output went to zero from the eighth token on. That is what turned the
+first diagnosis from "the model is broken" into "the model is fine, the
+convolution is off by a position".
+
+2. *Two different norms live in one file.* Every RMSNorm in this checkpoint
+stores its weight as an offset from one (`Qwen3NextRMSNorm`, initialised at 0,
+multiplier `1 + w`) -- layer 0's input norm averages 0.033, not 1. But the
+gated norm inside the DeltaNet stores a plain multiplier (`RMSNormGated`,
+initialised at 1). Applying `1 + w` to both, or to neither, breaks the model
+in two different ways; the tell is that one family of weights sits near zero
+and the other near one.
+
+3. *The rotation was the wrong shape.* RoPE here is `rotate_half`: the two
+halves of the rotated slice swap, and index i pairs with i + rotary/2. The
+port used adjacent pairs (2i, 2i+1), the GPT-J layout. Both are rotations, both
+produce numbers in a sane range, and they disagree on every position. This was
+the single largest error.
+
+4. *The recurrence decayed at the wrong moment.* The defined step is
+`S = decay*S` first, then `delta = beta*(v - S^T k)` **reading the decayed
+state**, then `S += k (x) delta`. Decaying after the read leaves every
+position's correction scaled by a decay it should not have.
+
+5. *`q_proj` is interleaved per head.* The output is `n_heads x (q | gate)`,
+because the reference views it as `(..., n_heads, 2*head_dim)` and splits that
+last axis. Reading the first half of the whole matrix as q mixes one head's
+gate into the next head's query -- and the numbers stay in range, so nothing
+complains.
+
+**What settled each one.** (2) came from the weight statistics: a norm
+averaging 0.033 cannot be a multiplier. (1), (3), (4) came from reading the
+published implementation after the numpy cross-check had proved the code was
+doing exactly what it was written to do. (5) came from the same reading, and
+is the reason the answer to "2+2" changed from a run of "2"s to `4`.
+
+**Where it ends up.** With all five fixed the checkpoint answers correctly in
+both languages, closes its turn on `<|im_end|>`, and streams: `What is 2+2?`
+returns `4` and stops; `用一句中文介绍你自己` returns a coherent Chinese
+sentence; `17 times 23` produces a 7-step reasoning block ending `391` and the
+answer `391`. Decode measured **4.85 tok/s** over 124 tokens -- 18 GiB of
+weights per step against a measured 123 GB/s ceiling is 6.8 tok/s, so the
+kernel is at ~71% of what the memory bus allows. Prefill is layer-major over
+512-position blocks, the recurrence walking positions inside a block because a
+scan cannot be widened, and its state is 50 MiB for all 24 layers against a KV
+cache that would grow without bound.
+
+**Not implemented, and why.** The vision tower (27 layers, `model.visual.*`)
+and the MTP draft head (`mtp.*`). Neither is reachable from a text prompt:
+images would need `image_token_id` positions expanded into patches, and MTP
+only pays off for a speculative decoder this build does not run. The bytes stay
+on disk and are never bound. Also absent: `mrope`'s multimodal position
+allocation, which for text collapses to ordinary RoPE because all three
+position streams are equal.
+
+**Coverage.** The architecture is admitted by the same type table as the other
+three (`qwen3_5`, `qwen3_5_text`), so the catalog marks it supported and the
+switch dry-run lets it through. The regression suite keeps its "unknown
+architecture is refused by name" cases by using a name that does not exist
+(`mamba9`) instead of this one.
+
+## 52. 18 GiB fits, so it lives in core — and that is what exposed two serial phases
+
+Qwen3.5-9B is the first checkpoint in this tree that is *smaller than the
+machine*. There are no routed experts, so nothing streams and there is no cache
+to budget: every one of the 18 GiB is read by every position. That turns "keep
+the weights in RAM" from a preference into a size question with an answer.
+
+**The policy.** `q35_resident_wanted(weights, state, host, ceiling)` says yes
+while weights + state fit in half of RAM and under the configured ceiling with
+4 GiB to spare. Half, not all: wired pages cannot be reclaimed, so a checkpoint
+that wants more than half the machine leaves nothing for a long context's KV,
+for the other checkpoints this server can switch to, or for the OS. An unknown
+host size is a no -- the point of the check is to avoid a decision made without
+the measurement. `CWICK_Q35_RESIDENT=0|1` overrides either way.
+
+**The mechanism.** `cwick_safetensors_make_resident(saf, prefix, wire)` collects
+the byte range of every tensor under a name prefix, sorts them, merges the
+touching runs (a layer's matrices sit back to back inside a shard, so a few
+hundred `mlock` calls collapse into a few dozen), then for each run:
+`MADV_WILLNEED` to queue the readahead, `mlock` to fault in and wire in one
+syscall, and — only when the wiring is refused — a parallel page-touch pass
+through the pool. Finally `MADV_NORMAL`, because the `MADV_SEQUENTIAL` installed
+at mmap time says "read this once, front to back", which is false for a mapping
+that lives here and would let the kernel drop pages behind the read pointer.
+Release is symmetric and happens in `cwick_safetensors_close` before `munmap`
+(a wired range that is only unmapped later leaves the accounting claiming bytes
+that no longer exist). The KV and DeltaNet state is wired too — that is
+anonymous memory, which the VM would rather compress than page, and a compressed
+KV page becomes a stall inside the attention call instead of at its edges.
+
+**What it buys.** 17.98 GiB faulted in and wired in **2.6 s** (7.5 GB/s) at load
+time, paid once. On a 44-token prompt prefill drops from **2370 to 1569 ms**
+(1.5x) because the first block no longer takes 1.2 M minor faults on the
+request's critical path; on a 760-token prompt it is 13415 to 12207 ms (1.1x),
+the rest being real work. Decode does not move: 18 GiB per step against a
+measured 123 GB/s ceiling is 6.8 tok/s, and the kernels were already at 92% of
+the bus at 7.0 tok/s. A single short request pays the 2.6 s back; a server
+pay it once.
+
+**What it exposed.** With the fault storm gone, prefill could finally be
+profiled honestly (`CWICK_Q35_PROF=1`, one line per block). For a 176-position
+block: mixer GEMM **748 ms**, MLP **1787 ms**, delta-rule **2142 ms**, attention
+**1415 ms**. That is 58% of prefill on a single core, in two loops that are
+embarrassingly parallel and had simply been written serially:
+
+- the delta rule cannot parallelise over positions (it is a scan) but it can
+  over value heads: each head owns its own `[128,128]` state and never reads
+  another's. One dispatch per layer, one head per work item.
+- attention only looks serial: after the KV for the block is stored, every
+  (position, head) pair is independent. Items are `(head, position group)` with
+  positions **interleaved** across groups rather than sliced in blocks — a query
+  at position 400 costs four times what one at 100 does, and contiguous slices
+  hand one worker all the expensive ones. Each worker allocates its own score
+  vector; `m->scores` is sized for one query and is shared scratch.
+
+Result, same block: delta-rule 2142 → **379 ms**, attention 1415 → **142 ms**,
+block total 6092 → **3009 ms**, and a decode step 147 → **129 ms** because the
+per-token recurrence was 12 ms of it. End to end on a 760-token prompt prefill
+went from **45.1 s to 12.2 s** (17 → 62 tok/s), and the output is bit-identical
+to the serial build (`CWICK_THREADS=1` diffs clean) — the parallel version
+reorders nothing that any other thread reads.
+
+**One bug found on the way.** `ssm_state` was allocated as
+`val_dim x key_dim` over the *concatenated* dimensions, 16x the size the forward
+pass indexes. It still worked, because the head stride is what the code walks —
+it just reserved 800 MiB that nothing ever touched. Per-head allocation
+(`heads x 128 x 128` = 2 MiB per layer) drops idle RSS from 19.95 to 19.24 GiB
+and makes `q35_cache_bytes` and the resized state agree.
+
+## 53. The prefix cache was writing nothing for Qwen3.5, and attention was 40x slower than its own GEMM
+
+Two defects, found by reading a live server's log rather than by reading code:
+`prefix capture failed: prefix: capture position 74 outside 0..0` on every
+request, and a 31,690-token prompt whose prefill rate fell from 73 tok/s to
+14.8 tok/s while the ETA grew.
+
+**The cache never held a byte.** `cwick_engine_pos()` answers "how many positions
+does this engine hold" and had branches for DeepSeek and MiniMax only; Qwen3.5
+keeps its cursor in `eng->q35->pos`. So every capture was rejected as
+out-of-range, `prefix_cache_hits_total` could never rise, and `./pfxcache` stayed
+at 0 bytes -- the feature was off without saying so. Adding the branch is not the
+fix: `cwick_engine_capture_prefix` has no q35 branch either, so it would fall
+through to the mHC/KDA layout and read `eng->keys`, which this backend never
+allocates. Qwen3.5 therefore needed the same opaque-blob contract the other two
+backends have: `q35_prefix_pack` / `q35_prefix_apply` with `kind = 3`, and a
+branch in both capture and apply. The blob is the fixed part first (24 layers of
+conv + DeltaNet state, 50 MiB) and then the KV rows of the 8 attention layers,
+which makes `pos` recoverable from the length alone -- so a truncated snapshot
+still applies, which is what the whole-prompt path needs.
+
+**Then the extension case still missed.** With capture working, an exact repeat
+of a prompt hit (587 tokens: 9556 ms of prefill became **147 ms**), but the next
+turn of the same conversation did not. Measured on a live session: turn N was 232
+tokens, turn N+1 was 265, and they agreed on the first 228. Dumping both token
+lists out of the `.pfx` files showed why: the server ends a prompt with the
+thinking block, and with `reasoning_effort: none` that block is the *pre-closed*
+one, four tokens (`<think>`, `\n\n`, `</think>`, `\n\n`). The next turn renders
+the assistant's reply as header plus content and never resends it, so the two
+prompts diverge at the first of those four. The existing "one token shorter" twin
+covered the thinking-on case (where the block is the single open marker) and was
+three tokens too long here. The fix searches the last eight tokens for the open
+marker and keys the twin there; with it, turn N+1 replays 228 and prefills 37
+instead of falling back to the 4 KiB block checkpoint.
+
+**Attention ran at 8 GMAC/s.** The profile is unambiguous once the numbers are
+read together: the bf16 GEMM path runs at ~550 GMAC/s, and the attention inner
+loop -- one scalar multiply-add per iteration with a bf16 conversion in between,
+and every K/V row re-read for every query -- ran at 8. Two changes, neither of
+which reorders a sum:
+
+- **Eight queries per pass.** Work items stay `(head, interleaved position
+  group)`, so the tile is every G-th position and the eight queries in it share
+  all but `7*G` keys. Each K row and each V row is now read once per tile instead
+  of once per query, which is the difference between 0.5 MAC/byte and 4; the
+  scalar kernel was not bus-limited (16 GB/s of a measured 123) but
+  instruction-limited, and vectorising alone would have moved the bottleneck
+  straight onto the bus.
+- **NEON dots and axpy.** bf16 is the top half of an f32, so widening by 16 bits
+  and reinterpreting is exact: no table, no rounding, four lanes per instruction.
+
+Measured on prompts of the same shape as the failing request, one process each:
+
+| prompt | before | after | block at ~14K |
+|---|---:|---:|---:|
+| 760 tokens | 12.3 s (61.6 tok/s) | **10.0 s (76.2 tok/s)** | — |
+| 7,600 tokens | 314 s (24.2 tok/s) | **102 s (74.4 tok/s)** | — |
+| 14,060 tokens | 935 s (15.0 tok/s) | **214 s (65.8 tok/s)** | 63.3 s → **9.6 s** |
+
+The "before" column is the curve fitted to the logged 31K run
+(`t(n) = 0.0117n + 3.90e-6n²`, which predicted that run's progress to within
+1%); the same fit puts the 31,690-token agent prompt at 4285 s, and the new
+profile -- 4.5 s of GEMM, 1.1 s of delta rule, 3.7 s of attention at 14K --
+projects it at roughly 13 minutes. Attention is still the only term that grows
+with the square of the context (38% of a 14K block), but at 130 GMAC/s instead
+of 8.
+
+Output is unchanged: three fixed prompts through the API produce byte-identical
+text to the build before this change, and a 760-token prompt is byte-identical
+between `CWICK_THREADS=1` and the 12-thread pool -- the tile changes who reads
+what, not the order anything is summed in.
+
+**And the window was one turn from failing.** `max_tokens 65536 clamped to
+1078: prompt 31690` -- at `--context 32768` a 30K-token agent prompt leaves 1078
+output tokens and the *next* turn does not fit at all. The checkpoint allows
+262144 and its KV is 33.6 KiB/position, so `start.sh` now asks for 131072: 4.05
+GiB of cache on top of 17.98 GiB of wired weights, which the residency policy
+still approves.
+
+## 54. Attention was the one kernel in this engine that was not a GEMM
+
+The 30K-token prefill degraded because of one term, and the previous section
+already named it: attention. What §53 left behind was a hand-written tile kernel
+running at 130 GMAC/s inside an engine whose GEMM path runs at 790 — so the term
+was not "irreducible quadratic work", it was quadratic work done badly. This
+section is the measurement that separated the two, and the rewrite that followed.
+
+**The shape of the problem.** Per 512-position block, everything except
+attention is flat: GEMM 4.5 s, Delta-rule 1.1 s, activation 0.27 s. Attention
+grows with the number of keys the block can see -- linearly per block, which
+makes the whole prompt quadratic. Measured on one run (block index -> ms):
+
+    1: 75   2: 182   3: 271   5: 438   8: 872   10: 1081   15: 1558   22: 2867
+
+That is 0.26 ms per 1000 keys per block, so at 30K positions a block spent 7.8 s
+in attention against 4.5 s in all 32 layers' projections.
+
+**Where it went, before.** Instrumenting the pass by phase (thread-time, one
+block at 11K): QK 43%, softmax 6%, AV 51%. Not one bottleneck but two, and
+neither was arithmetic: the QK loop did one `vshll` + one `fma` per 4 MAC and
+reloaded the query vector from memory for every key, while the AV loop loaded
+and stored the 1 KiB output accumulator once per key. At 1.45 GMAC/s per thread
+the kernel was 11x below what the same thread does on a plain f32 dot.
+
+**What each loop could be.** `tools/attnbench` runs both passes at the real shape
+(512 queries, 16 heads, 256 dims) and the same MAC count, one thread:
+
+| pass | as shipped | hand-reordered | cblas_sgemm |
+|---|---:|---:|---:|
+| scores (QK) | 22.2 GMAC/s | 31.0 GMAC/s (1.4x) | **750.6 (33.8x)** |
+| output (AV) | 18.9 GMAC/s | 43.8 GMAC/s (2.3x) | **477.1 (25.2x)** |
+
+A re-run of `make tools/attnbench && ./tools/attnbench` on the restored tree
+(11,000 keys) reads 21.9 -> 920.3 GMAC/s (42x) for scores and 18.7 -> 888.9
+(48x) for output: the absolute cblas number moves with shape and thermals, the
+40x gap does not.
+
+Hand-reordering means four queries per key row with the widened key held in
+registers and sixteen accumulators live. It is real, and it is 20x short. The
+reason is not subtle: these two are `S = Q·K^T` and `O = S·V`, and every other
+projection in this model already goes through Accelerate. The answer was to stop
+hand-writing them.
+
+**The rewrite.** `mixer_attn` now computes, per (query head, query tile of 128):
+
+    S[nq x keys] = Q[nq x 256] · K[keys x 256]^T     (cblas, alpha = 1/sqrt(256))
+    mask: columns past each row's own position set to -1e30, then softmax
+    O[nq x 256]  = S[nq x keys] · V[keys x 256]      (cblas)
+
+The causal mask is applied to a rectangle instead of skipping a triangle: the
+masked entries exponentiate to exactly zero, so the sum is the same one the old
+code computed, and the GEMM gets a shape it likes. Measured on the same blocks:
+QK **818 GMAC/s**, AV **537 GMAC/s**.
+
+**One trap, found before it shipped.** The first version kept the bf16 KV cache
+and widened the visible rows once per layer into an f32 scratch. That is fine for
+prefill -- 4 ms per layer at 30K -- and catastrophic for decode: with n = 1, each
+token would widen the *entire* cache, eight times, to compute one query. The
+cache itself is f32 now and the widening is gone. The snapshot on disk stays
+bf16 (half the bytes, twice as many snapshots under the same budget) with
+`q35_narrow_rows` on pack and `q35_widen_rows` on apply; the cost is 64 KiB of
+cache per position instead of 32, i.e. 8.1 GiB at 128K against 18 GiB of weights.
+
+**Result.** Same prompts, one process each, `--context 131072`:
+
+| prompt | before | after |
+|---|---:|---:|
+| 760 tokens | 10.0 s (76.2 tok/s) | 10.0 s (76.2 tok/s) |
+| 14,060 tokens | 214 s (65.8 tok/s) | **184 s (76.2 tok/s)** |
+| 30,970 tokens | ~700 s (extrapolated from §53's curve; 37 tok/s at the tail) | **436 s (71.0 tok/s)** |
+A block at 11K positions went from 8.9 s to 6.8 s, and its attention term from
+2.87 s to 0.83 s. What is left of the growth is the honest part: QK and AV are
+`O(keys)` per block by definition, and softmax over `16 heads x 512 queries`
+scores is now 28% of the attention term (230 ms per block at 11K). Attention is
+still the only term that grows with context, but it grows at 0.075 ms per 1000
+keys per block instead of 0.26, so the rate stays close to the flat part's 76
+tok/s instead of collapsing toward 37.
+
+**Decode is a different shape.** One position, and its sixteen heads read the
+same cache row -- 4 KiB that can serve sixteen dot products (four kv slices x
+four query heads per group). The first version called sgemm per head, and with
+M=1 Accelerate takes a path that cost 149 ms per step at 30K (3.4 tok/s). gemv
+was better but still ran at 13 GB/s: 1 KiB read out of every 4 KiB defeats the
+prefetcher. `dec_scores` / `dec_out_slices` walk rows instead, one read serving sixteen
+uses. At 11K a step went from 190 ms to 139 ms (7.2 tok/s) and at 31K from
+294 ms to 161 ms (6.2 tok/s); attention is 8 ms of the score pass and a few ms
+of the output pass, and the remaining 111 ms is the weights.
+
+**What this costs in exactness.** cblas accumulates in a different order than the
+four-accumulator dot did, so prefill is no longer bit-identical to the previous
+build. The inputs are still bf16 keys widened exactly to f32, and the arithmetic
+is still f32; the difference is where the additions group. Three fixed prompts
+through the API produce the same text as before the rewrite, and greedy decoding
+is what would expose it if that were not true. The old kernel's property -- a
+760-token prompt identical between `CWICK_THREADS=1` and the pool -- is now
+cblas's property, not ours.
+
+
+## 55. A request with no reasoning field now answers without thinking
+
+**Observation.** Agent-style clients pointed at an OpenAI-compatible endpoint
+usually send `messages`, `tools` and `max_tokens`, but no reasoning field at
+all. `validate_body` defaulted that case to `极致` (budget 32768, header
+`Max`), and the request line read `thinking=极致 (effort=Max, default)`. On a
+37,638-token request the run went `decode phase: thinking` -> `content` after
+52 tokens -> `tools` after 21 more, then streamed a long tool argument for
+thousands of steps at ~5 tok/s. The client renders the opening sentence and
+then shows "generating" with nothing new: tool-argument deltas are not
+rendered as answer text. With one generation slot and
+`CWICK_ABORT_ON_DISCONNECT=0`, stopping the client does not free the slot;
+the client's own `max_tokens` (65536) also overrode the startup
+`--max-tokens`.
+
+**The second half of the root cause.** The old default was not only a level,
+it was *absent*. `run_generation` passed
+`gr->effort_defaulted ? NULL : gr->effort_level` to all three template
+renderers, deliberately, so each checkpoint could apply its own default
+(DeepSeek's header 75, `thinking=true` for MiniMax and Qwen3.5). Changing
+only the default level would therefore have left the prompt opening a
+reasoning block while the engine, now armed with a zero budget, closed it
+immediately -- two halves disagreeing about the same turn.
+
+**Change.** `CWICK_THINK_DEFAULT_LEVEL` / `_EFFORT` are `关` / `Low`, defined
+next to `THINK_LEVELS`; the log fallback uses the same pair. The three
+`effort_defaulted ? NULL : ...` ternaries are gone, so an absent field
+travels as the real level `关` and takes exactly the path an explicit
+`reasoning_effort:"none"` takes. `cwick_thinking_default_level()` exposes the
+value to the test suite, which asserts it equals `resolve("none")`. All four
+explicit spellings still override it and an unknown spelling is still a 400.
+
+**Reach.** chat, responses and messages all synthesise a chat body; with no
+reasoning field the synthesised body has none either, so all three follow
+the new default without a per-dialect switch. The decision endpoint is
+unchanged (it already refuses any effort other than `none`). The bundled web
+console sends `reasoning_effort` explicitly and keeps its own selected level.
+CLI `run` has no request body and is unrelated.
+
+**Verification.** `make test` passes with one new assertion (671 total). A
+temporary server on port 18001 (Qwen3.5, `--context 8192`) answered five
+bodies:
+
+| request | log line | first decode phase | think tokens |
+|---|---|---|---:|
+| chat, no field | `thinking=关 (effort=Low, default)` | `content` | 0 |
+| responses, no field | same | `content` | 0 |
+| messages, no field | same | `content` | 0 |
+| chat, `reasoning_effort:"high"` | `thinking=高 (effort=High)` | `thinking` | 1 |
+| chat, `reasoning_effort:"none"` | `thinking=关 (effort=Low)` | `content` | 0 |
+
+The no-field chat response was `content:"2"`, `reasoning_content:null`,
+`reasoning_tokens:0` and the summary line `think=0 tools=0 content=1
+think_cap=0`. No no-field request entered `decode phase: thinking`, and an
+explicit level still wins. To restore the old behaviour, put the two macros
+back to `极致` / `Max` and restore the three ternaries -- but that also
+restores the prompt/engine disagreement.
+
+**Not part of this change.** `max_tokens` remains client-controlled and still
+overrides `--max-tokens`; a server-side cap is a separate decision.
+
+
+## 56. The phase label existed but never reached the fourth engine
+
+**Acceptance check against goal #10.** A 573-line serve log from the Qwen3.5
+build (`--verbose --trace`, 15:03) has 96 `decode forward ...` lines and two
+periodic `decode N/32768 tokens ...` lines. It contains **zero** occurrences
+of `decode(`. Only the two transition lines named a phase
+(`decode phase: content at token 1`, `content -> tools after 27 tokens`).
+Prefill was fine: `[prefill] ~91/364 tokens (25.0%), layer 8/32 — 68.3 tok/s,
+eta 4s`, and every line carried a wall-clock time and `[req N]`.
+
+**Cause 1 — the phase hint stopped at three backends.** `phase_trk_observe`
+calls `cwick_engine_set_decode_phase` on every token. That setter copied the
+hint into the DeepSeek and MiniMax contexts but not the Qwen3.5 one, so
+`q35_ctx.decode_phase` stayed NULL and `q35_phase_label` printed plain
+`decode` on both the per-step and the periodic lines. The same copy-and-miss
+was present in `set_stop`, `set_abort_poll` and `set_verbose`; all four
+setters now reach every backend. This is the same class of bug as §19 (a
+per-request field that only one loop saw), one backend later.
+
+**Cause 2 — the thinking phase never ended.** Qwen3.5's generation prompt
+ends with `<think>\n`, i.e. the opening marker followed by a newline token.
+`run_generation` tested only `ids[nids-1] == think_open_id`, concluded
+"opened by the model", and armed the budget with `open_at_start=false`.
+`cwick_think_plan` injects the closing marker only when `think_open` is true;
+the model has no reason to write an opening marker the template already
+wrote, so the budget never fired. With `CWICK_THINK_BUDGET=8` a 130-token
+`high` request produced `think=130 content=0`. The close-marker check already
+used a 4-token backwards window for the two templates that trail whitespace;
+the same helper (renamed `prompt_token_near_end`) is now used for the opening
+marker on Qwen3.5, guarded by `!pfx_closed_at_start` so a template that
+already closed the block still reports "already closed".
+
+**Change.** `engine.c`: Qwen3.5 branches in four setters. `server.c`: shared
+window helper, Qwen3.5 open-marker detection, and a per-phase rate on the
+transition line. No kernel, precision or sampling change.
+
+**Measured** (temporary server, port 18001, Qwen3.5, `--context 8192`,
+`--verbose`, `CWICK_PROGRESS_MIN_MS=1000`, `CWICK_THINK_BUDGET=8` for the
+budget check):
+
+| | before | after |
+|---|---|---|
+| per-step line | `decode forward 1/32767 161 ms` | `decode(tools) forward 1/69 140 ms` |
+| periodic line | `decode 34/32768 tokens (0.2%)` | `decode(thinking) 8/26 tokens (30.8%)` |
+| phase labels | none | thinking / content / tools, on every line |
+| transition | `... after 27 tokens (3.9s)` | `... after 8 tokens (1.1s, 7.01 tok/s)` |
+| budget 8 | `think=130 content=0`, never fired | `wrote </think>`, `think=10 content=20` |
+| no reasoning field | — | unchanged: `reasoning_content:null`, content `2` |
+
+The budget fix is a real behaviour change for explicitly enabled thinking:
+a long think block now ends at its ceiling and the turn answers. The
+default-no-thinking path is unchanged (`block already closed by the
+template`, `decode phase: content at token 1`). `make test` 671 assertions
+PASS. The open-marker window is limited to Qwen3.5; the MiniMax template
+still uses the exact-last-token test for the opening marker, because no
+measurement here justifies changing it.
+
+**Out of scope.** One hand-written tool request produced `model emitted
+undeclared tool <function=get_time>` — a tool-format mismatch, not a logging
+or phase problem. Left alone.
+
+
+## 57. Why a streaming client goes silent during the tools phase
+
+**Question.** After the opening sentence the front end shows "generating" and
+nothing else for the whole `decode(tools)` phase, while the engine is
+demonstrably still working: a real 38-tool request logged 637
+`decode(tools)` steps at ~7 tok/s after `content -> tools after 27 tokens
+(4.1s, 6.53 tok/s)`.
+
+**Measured.** Temporary server, port 18001, Qwen3.5, `stream:true`, one
+declared tool, `--verbose`. Raw SSE frames with arrival timestamps:
+
+| dialect | frames in 5.6 s | standard tool delta | private progress |
+|---|---:|---:|---:|
+| chat | 15 | 0 | 12 x `delta.cwick_tool`, ~141 ms apart |
+| responses | 3 (`created`, `in_progress`, `failed`) | 0 | 0 |
+| messages | 2 (`message_start`, `error`) | 0 | 0 |
+
+The chat frames carry `delta.content:""` once, then twelve chunks of the
+in-flight tool block in a **non-standard** field `delta.cwick_tool` (e.g.
+`"<"`, `"function"`, `"=get"`, `"_time"`, `"</tool_call>"`). No
+`delta.tool_calls[].function.arguments` delta is ever emitted.
+
+**Cause 1 — progress is private, not standard.** `stream_tool_progress()`
+sends the in-flight block through `stream_delta_n(..., "cwick_tool", ...)`;
+its own comment says the field is "ignored by clients that do not know it".
+The only standard `tool_calls` chunk is built in `stream_finish()` from the
+fully parsed array, once, at the end of the turn (`server.c` ~3508).
+`resp_stream_text()` states the same policy outright: "Tool-call progress
+has no equivalent here: the arguments arrive complete in the function_call
+item at the end of the turn".
+
+**Cause 2 — two dialects drop even the private field.** `stream_delta_n()`
+routes `cwick_tool` into `resp_stream_text()` / `msg_stream_text()`, which
+handle only content / reasoning / text and discard unknown fields. Hence
+responses and messages emit *zero* deltas for the entire phase. The built-in
+web console is the only consumer: `web/app.js` accumulates `d.cwick_tool`
+into `assistantMsg.toolStream`, which is why the requirement to render
+streaming toolCalls holds for cwick's own UI and nowhere else.
+
+**Cause 3 (this request) — the tool dialect did not match.** The model
+emitted `<function=get_time>\n</function>` while `cwick_tools_extract()`
+expects `<tool_call>NAME<arg_key>...`. Parsing failed, the server sent
+`{"error": ... "model emitted undeclared tool"}` and `[DONE]`, so even the
+final all-at-once `tool_calls` chunk never arrived. This is the mismatch
+recorded as out-of-scope in §56.
+
+**Why the front end freezes.** Content-phase deltas are standard
+`delta.content`, so the opening sentence renders. At the first `<tool_call>`
+the splitter stops classifying and the only bytes left on the wire are
+unknown fields or nothing. A strict client keeps its last rendered frame and
+shows its "generating" indicator until the request ends; if the call parses
+successfully it sees one single `tool_calls` chunk at the very end.
+
+**Not changed in this round.** No protocol code was touched. Fixing this
+means emitting standard tool deltas per dialect (chat: a `tool_calls[i]`
+opening chunk with id/type/function.name followed by
+`function.arguments` shards; responses: `response.output_item.added` +
+`response.function_call_arguments.delta`; messages:
+`content_block_start(tool_use)` + `content_block_delta(input_json_delta)`),
+while retaining `cwick_tool` for the built-in console. The in-flight text is
+cleaned XML, not JSON arguments, so a streaming XML-to-JSON mapper is part
+of that work. Cause 3 is smaller, independent, and should land first:
+otherwise a client can watch a tool call that still fails at the end.
+
+
+## 58. Fixing the silent tools phase, in the order diagnosed in §57
+
+§57 recorded three causes and deliberately changed no protocol ("not changed
+in this round" there is a historical note). This section implements its
+proposed fixes in that order: the dialect mismatch first, then the standard
+streaming deltas.
+
+### 1. The tool dialect mismatch (cause 3)
+
+The nested template answers with
+
+```
+<tool_call>
+<function=save_note>
+<parameter=title>
+Memo
+</parameter>
+</function>
+</tool_call>
+```
+
+while `extract_impl` only reads `<tool_call>NAME<arg_key>k</arg_key>
+<arg_value>v</arg_value></tool_call>`. The turn therefore failed with
+`model emitted undeclared tool` and no `tool_calls` at all, not even the
+end-of-turn one. `tools.c:translate_function()` rewrites the nested form into
+the flat one before the single existing parser sees it, exactly as
+`translate_invoke()` already does for another checkpoint. Whitespace framing
+around a value is trimmed, inner newlines are kept, `</tool_call>` wrappers
+are discarded as framing, and prose outside the block is preserved. A text
+that already uses `<arg_key>` is left alone; a `<function=` without its
+`</function>` is left unchanged so the extractor still refuses the turn
+(fail-closed). Seven new unit assertions cover zero-argument calls, multiple
+parameters, inner newlines, numeric and JSON values, prose, multiple
+functions in one wrapper and the unterminated case.
+
+Measured on the real checkpoint: the same hand-written tool request that used
+to end in `error` now returns `tool_calls:[{name:"get_time",arguments:"{}"}]`,
+`finish_reason:"tool_calls"`, access log `finish=tool_calls calls=get_time`.
+
+### 2. Standard deltas in all three dialects (causes 1 and 2)
+
+`stream_tool_progress()` still emits the private `delta.cwick_tool` for the
+bundled console. In parallel, `tool_std_scan()` watches the in-flight block:
+once the model has written `<function=NAME>`, `tool_std_open_frame()` opens
+the call with an empty `arguments` in the dialect's own protocol, and each
+completed parameter appends a shard.
+
+| dialect | opening frame | argument shards |
+|---|---|---|
+| chat | `delta.tool_calls[0]` with `id` / `type` / `function.name` | `delta.tool_calls[0].function.arguments` |
+| responses | `response.output_item.added` (`function_call`) | `response.function_call_arguments.delta` |
+| messages | `content_block_start` (`tool_use`) | `content_block_delta` (`input_json_delta`) |
+
+At the finish the three closing functions skip the first call's `added` /
+`delta` / `block_start` events but still send `done`, `output_item.done` and
+`content_block_stop`, so a client that reads only the terminal events sees the
+same object. `tool_calls_json()` gained an `empty_first` mode so a
+concatenating chat client never sees the streamed bytes twice.
+
+**Why the wire bytes and the payload cannot disagree.** The shards are not
+produced by a second XML grammar. `tool_std_scan()` takes the in-flight text
+up to the last `</parameter>`, closes the block synthetically, and calls the
+same `cwick_tools_extract()` the buffered path uses; dropping the object's
+final brace leaves a prefix that can only grow. At the finish
+`tool_std_settle()` compares it with the parsed `arguments_json` and sends the
+remaining suffix. If they disagree, the bytes already on the wire become the
+payload — a client concatenating deltas and one reading the final object
+still agree. The call id is allocated once on the opening frame and written
+back to the parsed call, and the Responses terminal document is rebuilt
+afterwards, so envelope, item and deltas all name the same call.
+
+### Measured
+
+Temporary server on port 18001, Qwen3.5, `--context 8192`, `CWICK_SEED=42`,
+one request per dialect, raw SSE with arrival timestamps.
+
+| | §57 before | after |
+|---|---|---|
+| chat | 15 frames, **0** standard tool deltas, 12 private frames | 43 frames, 1 opening + 3 argument shards, 37 private frames |
+| responses | 3 frames (`created` / `in_progress` / `failed`), 0 deltas | 9 frames, 3 argument deltas |
+| messages | 2 frames (`message_start` / `error`), 0 deltas | 8 frames, 3 `input_json_delta` events |
+| first standard frame | none (only the end of the turn) | 5.0 s, i.e. as soon as the name was written |
+| parsed call | refused (`undeclared tool`) | `save_note`, arguments complete |
+
+Chat standard frames landed at 5.0 / 6.5 / 8.3 / 9.3 s of a 9.6 s turn, so
+progress is genuinely in flight. All three dialects concatenated to exactly
+`{"title":"Memo","body":"hello world"}`, identical to the non-streaming
+payload and to Responses' `function_call_arguments.done`. Zero-argument calls
+produced `{}` on all three. `make test` 678 assertions PASS (7 new), nine
+end-to-end checks PASS, and a plain answer with no tools emitted no tool
+frames at all.
+
+### Bundled web console
+
+`web/app.js` used to treat every `tool_calls` frame as a new call, so the
+shards would have created empty duplicate cards and repeatedly cleared the
+raw progress view. `applyToolCallDeltas()` now folds chunks by `index`, keeps
+the first id/name, appends arguments, and mutes `cwick_tool` once a standard
+card is open. `respEventToChat()` also maps
+`response.function_call_arguments.delta` to progress (the Messages adapter
+already consumed `input_json_delta`). Nine pure-function checks in Node PASS,
+including legacy whole-frame calls, multi-call arrays and a streamed first
+call followed by a multi-call finish. `src/webui_embed.c` was regenerated.
+
+### Boundaries, deliberately left as a follow-up
+
+- Shards are emitted **per completed parameter**. A single very long value
+  (the whole HTML file from the original report) still arrives when its
+  `</parameter>` closes. Streaming *inside* a value needs a state machine
+  that keeps JSON type detection, incomplete UTF-8 and trailing-whitespace
+  trimming monotone; that is a separate decision, not a tuning tweak.
+- Only the first call is streamed; further calls arrive whole at the finish.
+- A block in another dialect (flat `<arg_key>`, or the `<invoke>` form) has no
+  `<function=` opener, so nothing is opened early and the original
+  end-of-turn behaviour is preserved unchanged.
+
+## 59. Saying it is streaming is not the same as looking like it
+
+§58 opened the call while it was being written and pushed each *completed
+parameter* as a shard. Measured against a real agent-shaped call, that was
+still a silent phase: an agent's tool call is almost always **one long
+parameter** (a shell script, a file body), and a shard per parameter means the
+whole value lands in a single frame at the very end.
+
+Reproduced on the real checkpoint with the same prompt an agent sends:
+
+| | before | after |
+|---|---|---|
+| standard `tool_calls` frames | 3 | 20 |
+| arrival | opening 5.1 s, then **4.1 s of nothing**, then the whole value | every ~0.15 s from 5.2 s to 10.2 s |
+| largest gap between frames | 4.1 s | 1.1 s |
+
+Three frames is arithmetically "streaming" and reads as a hang. A client that
+only paints after the first argument byte shows nothing for the entire phase,
+which is exactly the report: the frontend shows no streaming during
+`decode(tools)`.
+
+### What changed
+
+`tool_std_value_scan()` now slices the value of the **parameter still being
+written**, not just the parameters whose `</parameter>` has arrived. The value
+is handed to the same `cwick_tools_extract()` as the closed path — the block is
+truncated at the safe byte and closed synthetically — so escaping, whitespace
+trimming and key order cannot drift from the final payload.
+
+Three things make a mid-value slice safe to put on the wire:
+
+1. **Type monotonicity.** A prefix is only emitted when it can never stop
+   being a JSON string: the value must not start with `{ [ " -` or a digit,
+   and `t`/`f`/`n` are held while they are still a prefix of
+   `true`/`false`/`null`. A shell script, a path, a sentence passes; `137`
+   and `{"a":1}` do not, and keep the closed-parameter path. The test is
+   monotone — once true it stays true — so committed bytes can never need
+   retracting.
+2. **Trailing-whitespace hold.** The extractor trims leading/trailing
+   whitespace from a value. Emitting a trailing space that is later trimmed
+   would make the streamed prefix disagree with the payload, so the tail is
+   held until a non-space byte lands.
+3. **`</parameter>` hold.** A closing tag arrives one piece at a time; a tail
+   that could still grow into `</parameter>` is framing, not value. Without
+   this the first version emitted `</parameter` inside the JSON string and the
+   concatenated result was invalid — caught by the end-to-end check, not by
+   the unit test, which is why the check below exists.
+
+The closing quote is stripped from the in-flight prefix (the extractor adds it
+as part of `"value"`), so the byte after the last value byte is the one that
+turns a prefix into a complete string. Incomplete UTF-8 at the tail is held
+back for the same reason as in the content path.
+
+### Granularity
+
+Each scan re-parses the whole block, so it does not run per token for a large
+value: after the first byte of a value, a frame goes out every 12 bytes. At
+6-7 tok/s that is a frame every ~0.15 s for ASCII and ~0.4 s for CJK, while
+the parse cost stays bounded. Measured decode rate is unchanged (6.82-7.43
+tok/s against a 6.4-6.87 baseline), so the scan does not compete with the
+forward pass.
+
+### Verified
+
+Eleven end-to-end checks PASS on the real checkpoint: chat concatenation
+equals the non-streaming payload byte for byte, exactly one opening frame
+carries the id, the private `cwick_tool` progress is still emitted, and zero-
+argument calls yield `{}` in all three dialects. Numeric, boolean and object
+parameters keep their JSON types (`count:137`, `meta:{"a":1}`) because they
+never enter the in-flight path. All three dialects concatenate to the same
+bytes and every result parses. `make test` 683 assertions PASS (5 new: a
+mid-value prefix must be a byte-prefix of the final JSON, and must be strictly
+shorter). The bundled console was re-checked with seven pure-function cases,
+including a long shard sequence and the closing frame.
+
+A turn truncated by `max_tokens` mid-call still ends with the existing
+`unterminated <tool_call>` error frame — unchanged, and correct: the call was
+never finished, so there is nothing valid to hand back.
+
+### Separately found, not fixed
+
+The DeepSeek prompt template teaches its own dialect
+(`<｜DSML｜ calls>` / `<｜DSML｜ invoke name="…">` / `<｜DSML｜ parameter …>`),
+but `cwick_tools_extract()` only knows `<tool_call>`, `<function=`,
+`<invoke name="` and the MiniMax namespace token — DSML matches none of them.
+`cwick_stream_segment()` likewise only enters tool mode on a literal
+`<tool_call>`. So on a checkpoint that follows its own template exactly, the
+tools phase produces neither a phase label nor any delta of any kind. That is a
+different defect from the one fixed here (it is a missing dialect, not missing
+granularity) and it needs its own measurement against a DS turn before being
+changed; it is recorded here so the next reader does not mistake this section
+for a complete fix of the tools phase.
+
+## 60. The Anthropic client's own URL shape was a 404
+
+**Symptom.** An agent harness pointed at this server gets
+`404 {"error":{"message":"unknown endpoint","type":"invalid_request_error"}}`
+on every turn. One serve log line carries the whole story:
+
+```
+[req 1] POST /v1/v1/messages?beta=true (46045 bytes body)
+[req 1] POST /v1/v1/messages?beta=true -> 404 in 1.1ms auth=key:cwick_N5TmAqb
+```
+
+Two independent defects sit in that one path, and either of them alone is
+enough to produce the 404.
+
+**Cause 1 — the generation routes compared the raw path.** Every other route
+in the handler matches `ponly`, the query-stripped form that `path_only()`
+writes at the top of the function; the four generation routes were the only
+ones still comparing `req.path`. The Anthropic client puts `?beta=true` on
+every `/v1/messages` call, so `strcmp(path, "/v1/messages")` never matched —
+the endpoint was unreachable for the one client it exists for, and
+`/v1/chat/completions?x=1` was unreachable the same way.
+
+**Cause 2 — a base URL that already ends in `/v1`.** The Anthropic SDK appends
+`/v1/messages` to whatever base URL it is given. Configure it as
+`http://host:8001/v1` and the request arrives as `/v1/v1/messages`, which no
+route in the table knows. Rejecting it is technically correct and practically
+useless: the fix is on the client's side of a config field the client does not
+own, and the 404 text does not say so.
+
+**Change.** `server.c`: after `path_only()`, collapse a repeated `/v1/v1/`
+prefix in place (loop + `memmove`) so every route benefits, and match the four
+generation routes against `ponly`. The raw path is untouched, so the access
+log and the `--trace` line still print what arrived. No kernel, precision,
+sampling or prompt change.
+
+**Measured** (same server, same auth, POST with `{}` so a routed request
+fails body validation instead of routing):
+
+| request | before | after |
+| --- | --- | --- |
+| `POST /v1/v1/messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/messages` | 400 (already routed) | 400 (unchanged) |
+| `POST /messages?beta=true` | 404 unknown endpoint | 400 `max_tokens is required` |
+| `POST /v1/chat/completions?x=1` | 404 unknown endpoint | 400 `messages must be a non-empty JSON array` |
+| `POST /v1/responses?beta=true` | 404 unknown endpoint | 400 `missing input` |
+| `GET /v1/v1/models` | 404 | 200, 5 known models |
+
+A real streaming call then completes on the exact URL that used to 404:
+`POST /v1/v1/messages?beta=true`, `max_tokens 24`, one user turn →
+`message_start … content_block_stop … message_delta … message_stop`,
+`200 in 1341.9ms prompt=15 completion=1 finish=stop`. `POST /v1/v1/models`
+still answers 404 — normalisation is about the path, not the method.
+
+**Not fixed here.** After routing, the same harness will be told
+`model \`qwen3.5-9b\` is not served by this endpoint (the resident model is
+\`qwen3_5_text\`)`: this checkpoint's directory is not in
+`cwick_model_served_alias()`, so it answers to its own `model_type`. That is
+the documented contract (see /v1/models), not a routing bug — send the id the
+catalog advertises.
+
+## 61. Qwen3.5 decode: the whole step in one command buffer (7.0 -> 20.0 tok/s)
+
+**The measurement this rests on.** A decode step moves ~16 GB and does almost
+no arithmetic per byte, so it is a bandwidth question. This machine has two
+paths to memory, and they are not the same width: the CPU cluster saturates at
+**123.8 GB/s** from four threads up, while the GPU reads at **284.6 GB/s**
+(and 368 GB/s in the chained shape a real step uses). Nothing about the second
+number is reachable from the CPU. The old ruling — "decode already runs at 93%
+of the bus, stop looking" — measured that 93% against the CPU's path.
+
+**What the GPU does not give you for free.** Submitting a projection at a time
+is a loss. Measured with `tools/q35step`: 128 GEMVs of one step (the four sync
+points a layer needs, 32 layers) cost **118.8 ms** as 128 submissions, because
+each commit+wait is ~928 us and only ~58 ms of that is the kernels. The same
+128 GEMVs encoded into **one** command buffer (`tools/q35one`) cost **37.6 ms**
+— 368 GB/s, and identical with a 4x larger working set, so it is the DRAM rate
+and not a cache artifact. The dispatch term, not the bandwidth, was the wall.
+
+**So: one command buffer per step, and the recurrence on the GPU too.** Splitting
+a projection's output rows between the CPU pool and the GPU — what the
+DeepSeek backend does — is a net loss here: measured with `tools/dualbw`,
+12 CPU threads and one GPU dispatch running at once reach **213.7 GB/s**
+together against 328.9 for the GPU alone. The two engines share one pipe and
+the CPU's share of it is the slower one. That leaves exactly one shape that
+works: every operator of the step on the GPU, 32 layers inside a single serial
+compute encoder, one commit, one wait, and one host readback — the logits.
+
+**Implementation.** Three new units, split so that only the last one is ObjC:
+
+| unit | role |
+|---|---|
+| `q35_shader.c` | 16 Metal kernels, each the twin of a function in `q35_model.c`: BF16 GEMV, RMSNorm with the `1+w` flag, embedding gather, depthwise conv + SiLU + window rotate, per-head L2 norm, the DeltaNet gates and recurrence, per-head Q/K norm with partial rotation, KV append, score pass, softmax, weighted sum, output gate, SwiGLU, residual add |
+| `q35_gpu.c` | plain C. The schedule: which projection feeds what, where the norms sit, the position's rotation table, the buffer bindings. Knows nothing about Metal |
+| `q35_gpu.m` | the Metal quarantine: device, library, pipeline states, no-copy buffer adoption, the encode calls |
+
+The weights are adopted with `newBufferWithBytesNoCopy` over the mmap'd
+safetensors — 13.19 GiB at a 4K context, 20.94 GiB at 128K, **zero copies and
+zero extra resident memory**. The KV cache, the convolution window and the
+DeltaNet state are adopted the same way out of the buffers `q35_model_open`
+already owns, which is what makes the CPU prefill and the GPU decode write the
+same bytes with no synchronisation between them. Prefill stays on the CPU,
+where it already runs at 71-80 tok/s; only one-position steps take the new path.
+
+**Correctness.** `CWICK_Q35_GPU_CHECK=1` runs the CPU step on the same position
+and compares. It has to restore the recurrence state first (`q35_prefix_pack` /
+`apply` — a DeltaNet state cannot be truncated like a KV cache), otherwise the
+second run is simply a different step. Measured, three positions:
+
+| position | max abs diff | mean abs diff | argmax |
+|---|---|---|---|
+| 43 | 0.00804 | 0.001855 | agree |
+| 44 | 0.00332 | 0.000564 | agree |
+| 45 | 0.00235 | 0.000277 | agree |
+
+That is f32 reordering noise against bf16 weights, and it *decays* with
+position instead of accumulating — the two paths are computing the same thing.
+End to end, 90 greedy tokens from the same prompt come out **byte-identical**
+to the CPU path.
+
+One real bug was found by that check and not by inspection: the DeltaNet
+output gate read `z[j]` where the gate projection is indexed by value head
+(`z[vh*hv + j]`), so all 32 heads read head 0's gate. Mean logit error was
+1.77 with a different argmax; after the fix it is 0.0002.
+
+**Result** (`cwick run`, 44-token prompt, 63 decode steps, context 128K):
+
+| decode path | ms/step | tok/s |
+|---|---|---|
+| CPU pool | 143 | **7.00** |
+| GPU, whole step | 49.8 | **20.10** |
+| GPU, whole step, `--context 131072` + prefix cache, over HTTP | 48.9 | **20.45** |
+
+2.9x. The GPU time attributable to kernels is 46.5 ms of the 47.4 ms wall, i.e.
+341 GB/s against the 368 GB/s the isolated GEMV-chain measured — 93% of the
+number the shape mix allows, so there is no dispatch overhead left to reclaim.
+`CWICK_METAL_TIME=1` prints `commit=6us wait=47ms gpu=46.5ms` per step.
+
+**Not done here.** Prefill is still the CPU's, and at a 31K agent prompt it is
+390 s of TTFT against 1.5 s of decode — the next thing worth moving, and a
+different problem (GEMM, not GEMV). And 40 tok/s needs the MTP draft head on
+top of this step, which is what the next section is about.
+
+## 62. Checking k tokens costs less than k steps, but a draft costs more than the check saves
+
+**The half that worked.** A decode step reads 16.4 GB of weights to produce one
+token, so the way past 20 tok/s is to produce more than one token per read:
+draft k tokens, then check all k in a single pass whose weight read is the same
+16.4 GB. The checking half is done, and it is exact.
+
+The obstacle is that the DeltaNet layers carry a matrix recurrence rather than a
+KV cache — state that cannot be truncated, only recomputed. Keeping the first j
+of k checked rows therefore needs the state as it stood after row j, which is
+either a separate pass per row (k passes, no saving) or a 50 MiB copy per step.
+What it is instead: **the state is allotted k+1 slots and rolls**. Row r reads
+slot r and writes slot r+1, so no slot is overwritten by the row that follows
+it, slot 0 is always live, and keeping j rows is one `memmove` from slot j+1 to
+slot 0 — no extra traffic during the pass, and one copy at the end instead of k.
+The convolution kernel wrote its window in place (`st` was both its input and
+its output), which a rolling slot breaks; it now takes a separate source
+pointer, and with both pointers on the same slot it is bit-for-bit the in-place
+version.
+
+`CWICK_Q35_GPU_CHECK=1` compares *every* row of a k-row pass against the same
+GPU path run one row at a time. At k = 2, 3, 4 and 8 the answer is **0.00000
+max, 0 of N differ** across all 32 layers — logits, KV, convolution window and
+recurrence state. That is what the rest of this section stands on: a k-row pass
+is not an approximation of k steps, it is the same arithmetic.
+
+**What a row costs, measured as a real decode step** (`CWICK_Q35_VERIFY=k`, 19
+passes, one prompt, one session):
+
+| k | ms/pass | marginal ms/row |
+|---|---|---|
+| 1 | 55.5 | — |
+| 2 | 63.6 | 8.1 |
+| 4 | 73.4 | 4.9 |
+| 6 | 85.6 | 6.1 |
+| 8 | 98.4 | 6.4 |
+
+The marginal cost *rises* with k, which rules out both comfortable explanations.
+Not bandwidth: a pass reads 16.4 GB whatever k is, so a bandwidth limit would
+make the marginal zero. Not a per-dispatch overhead either: that would inflate
+the k = 1 row and leave the marginal flat. It is the arithmetic of the extra
+rows, at a rate that degrades as the register footprint grows — the isolating
+benchmark (`tools/q35gemsw`, the checkpoint's own 13.82 GB of shapes, 32 layers)
+gets 4.5 ms/row at k = 8 where the step gets 6.4.
+
+That benchmark is also what found the one knob taken here. The kernel is a
+threadgroup tile: the k activation rows are staged once and shared by the whole
+group, one simdgroup per weight row. Letting a simdgroup own RP weight rows
+reuses the same staged slice RP times and cuts the activation side of the pass
+by RP, at the cost of RP*N live accumulators:
+
+| rows n | RP1 ms | RP2 ms | RP4 ms |
+|---|---|---|---|
+| 4 | 45.3 | 45.8 | 47.1 |
+| 5 | 49.9 | 49.0 | 66.6 |
+| 6 | 54.4 | 52.5 | 72.5 |
+| 8 | 70.1 | 63.3 | — |
+
+RP4 spills from n = 5 up; RP2 wins from n = 5 up and loses slightly below it,
+which is the policy. RP is the only knob in that kernel that can be turned
+without moving an FMA within an accumulation, and that is what keeps the bitwise
+check above true; widening the load to 8 bf16 was 3 ms faster at n = 2..4 and
+was not taken for the same reason. In a real step it is worth **102.2 -> 98.4 ms**
+at k = 8 (same session, three interleaved reps, best of each) — less than the
+benchmark's 6.8 ms, because part of a real pass does not scale with RP.
+
+**The drafter, priced.** With the check half attached, 40 tok/s becomes a
+statement about drafts: a pass of k+1 rows has to yield `A` accepted tokens with
+`A / T(k) >= 40`, and `A` is the draft's business, not the verify's.
+
+The zero-cost draft is a prompt lookup — match the last 2-6 tokens against an
+earlier occurrence in the context and continue from there. It reads no weights,
+and it cannot corrupt anything, because the accept test is the full model's own
+greedy argmax; with it off the output is byte-identical. It also does not work.
+Two prompts, 40 tokens each: **1.08 to 1.24 tokens per pass** (52% of drafts
+accepted on prose, 23% on code), and end to end **2022 ms against 2011 ms** of
+baseline — the wider pass costs more than the extra tokens are worth. Free is
+not the same as useful.
+
+The learned draft on disk is the MTP head, and its file settles the price:
+**486.6 MB**, fifteen tensors — `mtp.fc[4096,8192]`, one full attention layer
+(GQA, `q_proj[8192,4096]` with the interleaved gate, `k_proj`/`v_proj` at
+`[1024,4096]`, `o_proj[4096,4096]`, SwiGLU at 12288) and three norms — and **no
+output projection of its own**. So a draft token reads 486.6 MB *plus the shared
+2.03 GB vocabulary head*: 2.52 GB, 7.0 ms at the measured rate.
+
+| k | T(k) = pass + k x 7.0 ms | A at p = 0.8 | tok/s |
+|---|---|---|---|
+| 2 | 82 | 1.80 | 21.9 |
+| 4 | 109 | 2.95 | 27.1 |
+| 8 | 162 | 4.16 | 25.7 |
+
+**That table is the answer, and it is not 40.** The head is 81% of a draft token,
+so drafting eight tokens costs 56 ms against the 43 ms the seven extra rows cost
+the verify pass — the gain is handed straight back. Accepting more does not
+rescue it either: at p = 0.9, eight drafts return 5.70 tokens on a 162 ms pass,
+which is 35 tok/s, and 40 would need **p >= 0.94**.
+
+Two things would change the answer, in order of size. **Make a draft token cost
+~1.4 ms by projecting only a candidate slice of the vocabulary** — a draft is
+allowed to be wrong, the verify decides, so this is a bandwidth question and not
+an accuracy one; the top 4096 rows are 33.5 MB instead of 2.03 GB, which puts
+k = 8 at 118 ms and 4.16 accepted tokens at **35 tok/s**, with the bar for 40
+falling to p >= 0.87. And **cut the 6.4 ms
+marginal row**, which is now throughput-bound rather than bandwidth-bound and is
+the only lever that helps every k at once. Both need the MTP bound first, and
+neither is a tuning change.
+
+**One bug found on the way, unrelated to any of the above.** The single-row
+decode path called the forward with `ids` still holding the prompt and never
+wrote the token it had just sampled into `ids[0]`, so every step of every
+generation was conditioned on `prompt[0]` instead of on the token it had
+produced. That degenerates into a repetition within a dozen tokens
+(`TheTheThe...`, `MASKMASK[g[g[g...`) and it invalidated every earlier reading
+of output text in this document. The k-row path does not share the mistake,
+which is how it surfaced: the same prompt produced fluent text through
+`CWICK_Q35_VERIFY` and did not through the ordinary path. The fix is one line.
+
+## 63. The marginal row was activation traffic, and it did not have to go through threadgroup memory
+
+§62 left one number unexplained: a k-row verify pass should cost one weight read,
+but the marginal row measured 6.4 ms in a real step (55.5 ms at k = 1, 98.4 at
+k = 8). Arithmetic is not the reason, and guessing at the reason had already
+produced two wrong answers, so the kernel was ablated instead
+(`tools/q35gemab`, 13.82 GB per pass over this checkpoint's own shape mix, one
+term removed at a time, k = 8):
+
+| what the kernel keeps | ms | what it removes |
+|---|---|---|
+| everything | 65.8 | — |
+| no weight read | 36.4 | the 13.82 GB DRAM sweep |
+| no activation read | 45.2 | the threadgroup read of the k rows |
+| one add per weight element | 64.0 | every N-way multiply |
+
+Three things fall out. The multiply-adds are worth **1.8 ms** in total, so a
+marginal row never costs arithmetic. The weight read is **29 ms** and the
+activation read **21 ms** — and 36.4 + 29.4 is 65.8, the measured total, which
+means the two memory streams were not overlapping *at all*. That second point is
+the one worth stating plainly: this was never a bandwidth ceiling, it was a
+kernel that serialised two streams it could have interleaved.
+
+The activation read existed because the rows were staged: one copy of the k rows
+into threadgroup memory per threadgroup, shared by every simdgroup in the group,
+two barriers around each staged tile. That design was chosen in §62 to trade
+threadgroup bandwidth for weight bandwidth, and the ablation shows the trade was
+a loss. x is N x k x 4 bytes for the whole pass — 128 KB at k = 8 — so it stays
+resident in L2 for the duration, and every threadgroup sweeping those same lines
+costs nothing like a DRAM read. Reading it straight from device memory removes
+the staging loop, removes both barriers, and makes the k loop flat.
+
+| | k=1 | k=2 | k=4 | k=6 | k=8 | marginal row |
+|---|---|---|---|---|---|---|
+| staged, 256 threads | 37.7 | 41.0 | 49.3 | 62.4 | 65.8 | 4.0 |
+| device, 128 threads | 39.4 | 41.9 | 42.2 | 46.5 | 52.6 | 1.9 |
+
+Narrowing the threadgroup to 4 simdgroups is part of the same change: with the
+staging gone a group holds no shared state, so a narrower group just means more
+of them resident. 128 threads beat 256 at every k (53.1 against 57.7 at k = 8,
+both with the activation read vectorised); a 512-thread group was worse than
+both.
+
+Two other settings were measured and not taken. Prefetching the weight loads
+(PF = 2 or 4, issuing several loads before consuming any) changed nothing, which
+is consistent with the overhead being the staging structure rather than memory
+level parallelism. Reading a wider vector per lane is faster on the cheap passes
+and spills on the expensive ones, and it would re-associate the sum, which costs
+the bitwise check — the same reason §62 declined it.
+
+The activation is read as four scalars rather than a `float4`. The scratch buffer
+a projection reads from is sized by allocation width, not output width, so a row
+start is not guaranteed 16-byte aligned, and a misaligned vector load in Metal
+returns the wrong bytes instead of taking a slow path. The scalar form costs
+0.5 ms of the pass (52.6 against 52.1) and removes the obligation to prove the
+alignment.
+
+In a real decode step (99 passes, best of three interleaved reps) the same change
+is **55.5 -> 47.4 ms at k = 1** and **98.4 -> 81.8 ms at k = 8**, marginal row
+**6.4 -> 4.9 ms**. The residual 2.1 ms per row is not in this kernel: the 24
+linear layers run their convolution and recurrence once *per row*, six dispatches
+and a barrier each, so a share of every marginal row is dispatch overhead rather
+than bytes. That is the next thing to attack, and it is a different change.
+
+End to end through the API (200 tokens, `max_tokens` honoured, chat completions)
+the step is **21.3 tok/s** against 18.3 before. The bitwise invariant is intact:
+`CWICK_Q35_GPU_CHECK=1` still reports `0.00000` on all 8 rows across 32 layers,
+because the change removes a copy and does not move a single FMA within an
+accumulation.
+
+**What this does to the draft arithmetic of §62.** The verify half got cheaper,
+so the price a draft has to beat moved with it. A pass of k rows yields k tokens
+and only k-1 of them need a draft, so at accept rate p the expected accepted
+count is A = sum of p^i for i < k — 1.80 / 2.95 / 3.95 at p = 0.8 for k = 2 / 4 /
+8. With the MTP head at 7.0 ms per draft token the best case is k = 4: a 62 ms
+pass plus three drafts is 83 ms for 2.95 tokens, **35.5 tok/s**. Still not 40,
+because the head is now the larger half of the cost. Project a draft against a
+candidate slice of the vocabulary instead (33.5 MB, ~1.45 ms; legitimate because
+the verify decides, not the draft) and k = 4 becomes 67 ms, **44.4 tok/s**, and
+k = 8 becomes 92 ms for 3.95 tokens, **43.0 tok/s**. So "40 tok/s needs
+p >= 0.94" no longer holds: it needs a draft that costs 1.5 ms, which is a
+bandwidth change rather than an accuracy one.
+
+**Superseded by §64.** The head *was* bound, the slice *was* built, and the
+measured accept rate is 0.36 at depth 1 and 0.17 against the slice — not 0.8.
+Every number in this section's last three paragraphs is replaced by §64's table.
+
+## 64. The MTP head is bound, correct, and still a loss
+
+§62 projected 35.5 tok/s and §63 projected 44.4 from an MTP drafter whose accept
+rate was *assumed* at p = 0.8. This section binds the head, measures p, and
+reports that the projections were wrong by more than their own error bars: at the
+measured rate every speculative shape is slower than one row per step.
+
+**Binding.** `model-mtp.safetensors` is its own file and is not named in
+`model.safetensors.index.json`, so the text shards' reader cannot reach it;
+`mtp_open()` maps it directly (8-byte little-endian header length, JSON, then
+each tensor by name with dtype, shape and `data_offsets` checked against the file
+length). Fifteen tensors, 486.6 MB: `fc[4096,8192]`, one GQA layer (16 q heads /
+4 kv heads, head_dim 256, `q_proj[8192,4096]` because of the interleaved output
+gate, partial rope 0.25, per-head q/k norm), SwiGLU at 12288, and no output
+projection of its own — the vocabulary head is shared. It has to open **before**
+`q35_gpu_open`, because the GPU adopts its two cache buffers by
+`newBufferWithBytesNoCopy`.
+
+One `mtp_one()` now runs a single position (fuse, attend, SwiGLU, block output
+left in `g_m.res`) and both callers use it: the chain and the cache fill. Three
+kernels were added. `q35_gemv_rows` is `q35_gemv` with the row ids read from a
+device buffer. `q35_embed_id` reads the token from a device buffer, so a
+proposal's token never goes back to the host before the next proposal reads it —
+a round trip is 0.93 ms against a 1.6 ms block. `q35_argmax` returns an index and
+breaks ties towards the smaller id, like the host scan it is compared against.
+
+**Two things the file does not state, both measured.** Whether the fusion puts
+`emb` first or `h` first: inverting it takes acceptance to zero (0 of 89), so
+`emb` first is right. And which copy of the text model's hidden state `h` is —
+the residual stream, or the final-normed copy the vocabulary head consumes:
+**39.0% against 35.7%** at depth 1 for the normed copy, which is now the default
+(`CWICK_Q35_MTP_POSTNORM=0` selects the other arm).
+
+**The block's cache.** A draft attends over keys, and at the first proposal of a
+fresh sequence the cache held exactly one key — itself, which is not a shape the
+layer was trained on. Rows are now indexed by absolute position over a 512-row
+window (`CWICK_Q35_MTP_WIN`), and `q35_mtp_sync()` writes the rows for positions
+the text model has already decided on, straight from the hidden states the verify
+pass left in `g_s.x`: one block run per accepted position, 1.6 ms each. When the
+window fills, `mtp_compact` shifts the live rows down — the rotation was baked in
+when the row was written, so the shift is exact rather than approximate. The
+prompt's rows are still not back-filled (that needs the hidden states prefill
+discards), so the window starts at the last prompt position.
+
+The sync is worth **35.6% against 31.5%** at depth 1 for its 1.6 ms per step. It
+does nothing for depth 2 or 3.
+
+**Measured acceptance** (200-token prompt, 161 generated, greedy, one run each,
+by depth — depth d is only reached when every earlier proposal was accepted):
+
+| arm | depth 1 | depth 2 | depth 3 |
+|---|---|---|---|
+| full 2.03 GB head | 35.6% | 12.5% | 0.0% |
+| 4096-row candidate slice | 16.8% | 4.3% | 0.0% |
+
+Acceptance saturates after the first link. Chaining is exactly why one would
+expect otherwise: proposal i+1 is fed this block's own residual instead of the
+text model's hidden state, and the checkpoint was trained for one depth only. The
+useful shape is therefore one proposal, and that is what the numbers say.
+
+**Cost of a row** (same prompt, `CWICK_Q35_VERIFY`):
+
+| rows | 1 | 2 | 3 | 4 | 5 | 9 |
+|---|---|---|---|---|---|---|
+| ms | 48.4 | 57.4 | 58.2 | 60.7 | 64.0 | 83.5 |
+
+Leaving one row costs **+9.0 ms**; every row after that **+1.6 ms**. That column
+is the real obstacle, and it is not bandwidth: four rows read exactly one copy of
+the weights just as one row does. The first extra row is 19% of a whole pass.
+
+**End to end** (same prompt, one run each, `tok/s this arm` against `20.66`):
+
+| arm | tokens/pass | ms/pass | tok/s |
+|---|---|---|---|
+| one row, no drafter | 1.00 | 48.4 | 20.66 |
+| SPEC=1, full head | 1.35 | 66.9 | 20.21 |
+| SPEC=2, full head | 1.39 | 74.7 | 18.59 |
+| SPEC=1, 4096-row slice | 1.17 | 60.8 | 19.03 |
+| SPEC=2, 4096-row slice | 1.18 | 63.4 | 18.54 |
+| SPEC=3, 4096-row slice | 1.18 | 67.8 | 17.33 |
+
+Every arm loses, so `CWICK_Q35_SPEC` stays off by default.
+
+**Not 40, and not 35 either.** One weight read per token is the constraint; 40
+tok/s means 1.93 tokens per pass, and this drafter's ceiling is 1.35. §62's
+"p >= 0.94" and §63's "make a draft cost 1.5 ms" had the right algebra and the
+wrong input: a draft against the slice *does* cost ~1.7 ms, and the pass is still
+60.8 ms because the second row costs 9 ms — while p is 0.17, not 0.8. Both
+sections' 35.5 / 44.4 / 43.0 are replaced by the table above.
+
+**Correctness.** Output text is byte-identical across `CWICK_Q35_SPEC=0/1/2/3` on
+the same seed: only a plain argmax loop may accept drafts, so a sampled request
+never speculates at all, and a greedy one emits exactly what the single-row path
+emits.
+
+**What is left, in order of size.** First, make a two-row verify cost 50 ms
+instead of 57.4 — the +9.0/+1.6 step is a kernel-shape anomaly (four rows cost
+one weight read either way), and it taxes every speculative shape at once.
+Second, improve the candidate set: on prose the recent-token window holds about
+60 distinct ids, so the slice gives up 19 points of acceptance to save 5.5 ms;
+seeding the set with the top-K rows of the previous step's own logits, which are
+already on the host, is the cheap way to recover most of that and would put a
+one-draft step near 21.4 against 20.7. Neither one changes the answer to 40.
+
+## 65. The second row is 8 ms, not 9, and the drafter still does not pay for it
+
+§64 ended with two items in order of size: make a two-row verify cost 50 ms
+instead of 57.4, and improve the candidate set so the slice stops giving up 19
+points of acceptance. Both were done. The first recovered 2 ms of the 9, the
+second recovered 2 points of the 19, and neither changes the conclusion.
+
+**Where the second row's cost actually is.** The first thing to rule out was the
+k-row GEMV, since that is the only part of the pass that changes kernel:
+`CWICK_Q35_GPU_TILED1=1` runs one row through it and costs **49.5 ms against
+48.0** — 3%. So 7 of the 9 ms were in everything else, which at n ≥ 2 ran once
+per row: two norms, two residual adds and the SwiGLU multiply per layer, plus
+the DeltaNet gate pair. Nine and a half dispatches per layer, 0.21 ms per layer
+by the `CWICK_Q35_GPU_MAXL` slope (8/16/32 layers gave +2.66/+4.51/+7.71 ms, so
+0.21 ms per layer and 1.0 ms of fixed cost).
+
+**Batching them** is a pure change of launch count — same arithmetic, same sums,
+same order — so it cannot move a single bit. Five kernels were added
+(`q35_rmsnorm_rows`, `q35_add_rows`, `q35_silu_mul_rows`, `q35_l2norm_rows`,
+`q35_gdn_gates_rows`), each taking the row from the grid and the row stride as an
+argument, and `CWICK_Q35_ROWFUSE=0` puts the per-row loop back so the claim stays
+testable in one binary. Result, back to back in one session at n = 2: **56.61 →
+55.81 ms over 199 passes**. So a dispatch is worth about 5 µs, not 22, and the
+9 ms was never launch latency.
+
+**RP for n = 2.** `cwick_q35_gemv_n_rp` was a constant 2 because the table it
+came from was taken at n = 4..8, where RP4 spills. At n = 2 there are eight live
+accumulators, and the extra activation reuse is free: **54.61 against 55.67 ms**
+at RP4. n = 3 already regresses (54.41 at RP2 against 61.35 at RP3), so the
+policy is `n <= 2 ? 4 : 2`. RP moves no FMA within an accumulation, so the
+bitwise invariant `CWICK_Q35_GPU_CHECK` asserts is untouched — the two-row check
+still reports `max|gpu-cpu| = 0.00000` on every position.
+
+**What is left is not activation re-reading.** A threadgroup covers RW x RP = 8
+weight rows, so the activation slice is read `cols/8` times; widening the group
+should cut that. `CWICK_Q35_GEMVN_RW` was added to sweep it and the sweep says
+no: **55.9 / 54.9 / 56.3 ms at RW 4 / 6 / 8**, inside the run-to-run spread, and
+at n = 1 the same kernel goes from 49.5 to 52.1 ms. The remaining 6 ms per extra
+row is not understood and is no longer worth chasing — with everything else
+fixed, a two-row pass is 54.6 ms, and that number only matters if a draft can be
+right often enough to fill the row.
+
+**The candidate set.** §64 proposed seeding the shortlist from the previous
+step's own logits, which the verify has already copied to the host. Done:
+half of `CWICK_Q35_CAND` is the recent window and the other half is every row
+within `CWICK_Q35_CAND_T` (default 2.5) of the top logit, capped at
+`CWICK_Q35_CAND_LCAP` (default 512). Acceptance at depth 1 goes **16.8% → 18.5%**
+— and a draft pays 8 KB of head per ranked row, so 2048 rows cost 4 ms and 512
+cost 1. The wide version bought 2.6 points for 4 ms, which is a loss; the narrow
+one buys 1.7 for 1 ms, which is a wash. Threshold rather than top-k because a
+sharp distribution contributes a handful of rows and a flat one fills its half,
+and neither case needs a sort.
+
+**End to end, one session, 200-token prompt, 161-200 generated, greedy:**
+
+| arm | tokens/pass | ms/pass | tok/s |
+|---|---|---|---|
+| one row, no drafter | 1.00 | 48.1 | **20.74** |
+| VERIFY=2, no drafter | 1.00 | 56.2 | 17.79 |
+| SPEC=1, 512-row slice | 1.18 | 60.0 | 19.72 |
+| SPEC=1, 2048-row slice | 1.18 | 59.2 | 19.94 |
+| SPEC=1, full 2.03 GB head | 1.35 | 66.8 | 20.19 |
+
+Every arm still loses. The drafter is now good for 0.35 tokens per pass at best
+(the full head), and the row it fills costs 8 ms, so the crossover sits at
+0.35 > 8/48, i.e. acceptance above 16.7% for the slice — which it does not have.
+
+**Why 40 is not reachable on this checkpoint.** One weight read is 48 ms at this
+machine's 341 GB/s, so 40 tok/s needs **2.08 tokens per pass**, and the
+acceptance that would produce it is the sum of p^i with p >= 0.52 at every depth.
+The full head delivers 0.356 / 0.125 / 0.0, which sums to 1.40 and is the ceiling
+for any k, because the block was trained for one depth and chaining its own
+residual is out of distribution. Nothing in this repository can raise a rate that
+is a property of the weights. What would: a checkpoint whose MTP head is trained
+on multi-depth chains, or a second model small enough to draft in 2 ms. Neither
+is in the model directory.
+
+**Correctness.** `make test` PASS (678 assertions). Output text is byte-identical
+across `CWICK_Q35_SPEC=0/1/2` and across the two-row check's `max|gpu-cpu| =
+0.00000`. `CWICK_Q35_SPEC` stays off by default.
+
+## 66. `serve` died on the first request of every session: a 256x overrun in reset
+
+The log stopped at `[req 1] generation slot 0` with no error, and the process was
+gone. Two crash reports from the same morning have the same stack:
+
+```
+__bzero + 12400
+q35_engine_reset
+cwick_engine_reset
+handle_client
+client_thread
+```
+
+`EXC_BAD_ACCESS / SIGBUS / KERN_PROTECTION_FAILURE`, writing at the *start* of a
+~11.86 GiB region (`bytes after start: 0`). `__bzero` is the large-block memset
+path, and the caller clears the draft head's KV caches.
+
+**Root cause.** When the MTP cache became a 512-row sliding window (§64),
+allocation, `bind_tensor`, the cache accounting and `mtp_compact` were all moved
+to `mtp_win` — but `q35_engine_reset` was not:
+
+```c
+/* allocated: mtp_win rows */
+m->mtp_kcache = xcalloc((size_t)m->mtp_win, (size_t)kvw * sizeof(float));
+/* cleared: max_seq_len rows */
+memset(qe->m.mtp_kcache, 0, (size_t)c->max_seq_len * ...);
+```
+
+512 MiB written into each 2 MiB allocation, twice, i.e. **256x**. The overflow
+ran out of the heap into a mapping that was not writable and the kernel killed
+the process on the first page of it. Nothing printed, because the fault is
+immediate and there is no handler.
+
+**Why the CLI never showed it.** `q35_engine_reset` is reached through
+`cwick_engine_reset`, which only `handle_client` calls — the server resets state
+between requests. `cwick run` builds one engine and never resets it, so every
+`run` measurement in §62–§65 was unaffected. The regression was introduced with
+the sliding window and could only ever appear in `serve`.
+
+**Fix.** Clear `mtp_win` rows, guarded on `mtp_win > 0`. Verified on the same
+configuration the crashed server ran (context 131072, 80 GiB prefix cache): a
+125 KB body / 25298-token request returns 200, three consecutive request cycles
+do not reset-fault, and 8001 serves again after `start.sh`.
+
+**Checked while there, and not defects.**
+
+- *A fixed ~1.1 s of prefill on a short prompt* (6 tokens, CLI and server
+  alike). That is one full read of 17.98 GiB of weights — a dense 9B model has to
+  touch every matrix to produce one token, and the CPU prefill path runs it at
+  ~16 GB/s against the 120 GB/s the machine can do. It disappears into the
+  average on long prompts: 25298 tokens measured 74.4 tok/s.
+- *`prefix_cache_queries_total` at 0 in one test* was my own configuration — the
+  cache only opens when `--prefix-cache-dir` is given. With it, the counters are
+  right: queries 2, hits 1, 25297 tokens reused, and the same 25298-token prompt
+  went from **340 s of prefill to a 0.206 s TTFT** on the second request.
+- *79.65 of 80.00 GiB prefix cache used* is the cache doing its job, not a leak:
+  `evict_to_fit` runs on open and after every store. It is worth knowing the
+  arithmetic though — one 25K-token request writes three snapshots (the prompt
+  prefix, the off-by-one copy, and the prompt plus the generated tokens), about
+  1.3 GB each for this checkpoint, so 80 GiB is roughly 20 turns of an agent
+  session before the oldest entries start going.
+- *The `--trace` line in the log* is `start.sh`, which passes it deliberately
+  (goal.md asks for the flag); prompts and outputs are truncated when printed.
+
+**The lesson is mechanical.** A buffer has four places that must agree on its
+size: the allocation, the reset, the accounting, and anything that serialises it.
+§64 moved three of them. A `_Static_assert`-style guard is not available across
+those sites, so the cheapest defence is that reset should never take a size from
+the config when the allocation took it from a runtime field — `mtp_win` is a
+field, `max_seq_len` is the config, and that mismatch is exactly what the two
+lines above disagree on.
+
+## 67. Reading the serve log as a cache-hit problem, not a latency problem
+
+`logs/cwick-serve.log` (10:07:25 to 10:25:25, three 42K-token agent turns, all
+200, no warn/error/failure lines) looks healthy if you read only the status
+codes. The numbers say otherwise: every turn logged
+
+    prefix cache hit: 31785 of 42158 prompt tokens replayed, 10373 left to prefill
+    ...
+    prefix cached: 48087 tokens (251 ms, background)
+
+i.e. each turn stored a full 42K/48K snapshot and the *next* turn still replayed
+only the same 31785-token static system+tools head. The three turns were
+189.2 s, 603.6 s and 196.5 s end to end; roughly 178 s of each was re-prefilling
+the ~10K-token tail that the snapshot it had just written should have covered.
+`logs/cwick-serve.log.crash-20261113` is a separate, earlier failure — the log
+stops at `[req 1] generation slot 0` with no response, which is the §66 SIGBUS.
+
+**Root cause: the victim was the entry the store had just written.** The old
+cost function ranked by `longest - pos`, making the longest entry the most
+evictable. A growing session's newest snapshot is by construction the longest
+thing in the cache, so `evict_to_fit` ran with the new file as its own victim and
+unlinked it microseconds after reporting success. The cache was 79.13 of 80.00
+GiB with 184 snapshots, so *every* store triggered an eviction — the bug was not
+intermittent, it was every turn.
+
+The victim is now chosen in two tiers (`hits > 0` entries are kept over ones
+never replayed, then last-use decides), with two absolute protections: the entry
+just written, and the shortest prefix (the shared base of all longer prompts,
+which on a cold start has not earned a hit when the first snapshot arrives).
+Everything else stays eligible — including hit entries, ordered by last use — so
+the cache cannot grow without bound. When only the two protected entries remain,
+one file of overshoot is allowed rather than deleting either. Two regression
+tests cover 24 later snapshots and a monotonically growing session; `make test`
+is 686/686 PASS.
+
+**A second, build-level fault was found while verifying.** The pipeline enum had
+26 entries but `P_NAME[]` had 24, and the two extra names belonged to
+group-shared attention kernels that had no dispatch function and no call site.
+The running binary was built before that enum change, which is why every start
+in the log still reports `24 kernels`. Rebuilding would have made `q35m_init`
+walk past the end of the name table into NULL and fail GPU setup — a silent
+regression that no test covers. The dead kernels and the enum entries were
+removed; a standalone Metal probe now compiles the exact production shader
+source and builds all 24 pipelines: `OK: 24 kernels, 0 bad`. That probe is a
+one-off verification, not a shipped tool.
+
+**The metrics scrape was healthy but incomplete.** `/v1/metrics` exposed 44
+families; the snapshot taken at `uptime_seconds 12.5` shows every counter at 0
+simply because no request had finished yet, and `process_footprint_bytes`
+28.50 GB matches 17.98 GiB of weights plus 8.44 GiB of state plus the 464 MiB
+MTP head. The real gap is that goal.md forbids swap and compression, yet the
+only evidence was one startup line (`host swap 0.86 of 2.00 GiB used,
+compressor ... since boot`). Five host-wide gauges now expose it continuously:
+`cwick:host_swap_used_bytes`, `host_swap_total_bytes`, `host_wired_bytes`,
+`host_compressions_total`, `host_swapouts_total`. They are host-wide because the
+VM APIs have no per-process view: a nonzero level is not by itself a violation,
+the delta over a scrape window is. A standalone render probe confirmed the
+values match the startup line (928514048 / 2147483648 / 1225496103).
+
+No model precision, weight, backend or context behaviour changed in this pass.

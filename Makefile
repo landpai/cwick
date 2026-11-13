@@ -20,16 +20,18 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/safetensors.c \
        src/ds_tables.c src/ds_quant.c src/ds_ops.c src/ds_model.c src/ds_engine.c \
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
+       src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
        src/spine.c src/tensor.c src/pool.c \
        src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
        src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
-       src/metal_shader.c src/metal_objc.m src/qr.m src/webui.c src/webui_embed.c \
+       src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
        src/models.c src/store.c src/server.c src/jev.c src/hub.c src/main.c
 HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/mem.h \
        src/metrics.h src/models.h src/store.h src/hub.h \
        src/tools.h src/pfx.h src/webui.h src/qr.h src/jev.h \
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
-       src/mm.h src/mm_engine.h src/mm_prompt.h
+       src/mm.h src/mm_engine.h src/mm_prompt.h \
+       src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h
 
 # The chat UI and apps are compiled into the binary (see src/webui.h).
 # web/ and apps/ are the source of truth; src/webui_embed.c is generated and
@@ -52,10 +54,11 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
             src/safetensors.c \
             src/ds_tables.c src/ds_quant.c src/ds_ops.c src/ds_model.c src/ds_engine.c \
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
+       src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
             src/spine.c src/tensor.c src/pool.c \
             src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
             src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
-            src/metal_shader.c src/metal_objc.m src/qr.m src/webui.c src/webui_embed.c \
+            src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
             src/models.c src/store.c src/server.c src/jev.c src/hub.c tests/test_cwick.c
 
 test: $(TEST_SRCS) $(HDRS)
@@ -67,6 +70,12 @@ test: $(TEST_SRCS) $(HDRS)
 # test binary because the safetensors loader reaches into mem/metrics.
 probe: tools/pf8probe.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o tools/pf8probe tools/pf8probe.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# The GPU-vs-CPU decode-step prototype for the dense checkpoint: same shape
+# mix, same number of commit+waits a real layer would make (see DECISIONS §61).
+gemvstep: tools/q35step.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/q35step tools/q35step.c \
 		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
 
 # Read the MiniMax-M3.1-Flash quantizer constants out of the shards and print
@@ -123,6 +132,13 @@ clean:
 # itself part of the answer this tool exists to give.
 tools/bfdotbench: tools/bfdotbench.c
 	$(CC) -O2 -Wall -march=armv8.2-a+bf16 -o $@ tools/bfdotbench.c
+
+# Attention kernels at the shape qwen3.5 runs: the score pass and the output
+# pass, hand-written against cblas, same MAC count. This is the tool that
+# decided the rewrite -- it prints GMAC/s for each, one thread.
+tools/attnbench: tools/attnbench.c
+	$(CC) -O2 -Wall -Wno-deprecated-declarations -o $@ tools/attnbench.c \
+		-framework Accelerate
 
 tools/mm_run: tools/mm_run.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ tools/mm_run.c \

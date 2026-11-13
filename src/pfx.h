@@ -41,12 +41,13 @@
  * rows but only the first idx_npools[s] rows of slot s are meaningful. */
 typedef struct cwick_prefix_state {
     /* Which backend captured this. 0 = the mHC/KDA/DSA checkpoint described
-     * below; 1 = DeepSeek-V4.1, whose cross-token state is a different set of
-     * buffers and travels as an opaque `blob` (built by ds_state_pack). The
-     * file format carries the same flag, so one cache directory can hold both
-     * kinds without either being able to misread the other. */
+     * below; 1 = DeepSeek-V4.1, 2 = MiniMax-M3.1, 3 = Qwen3.5, whose
+     * cross-token state is a different set of buffers and travels as an opaque
+     * `blob` (built by ds_state_pack / mm_state_pack / q35_prefix_pack). The
+     * file format carries the same flag, so one cache directory can hold all
+     * four kinds without any of them being able to misread another. */
     int kind;
-    void *blob;           /* kind 1: backend-owned snapshot bytes */
+    void *blob;           /* kind 1..3: backend-owned snapshot bytes */
     size_t blob_len;
 
     int64_t pos;          /* prefix length in tokens */

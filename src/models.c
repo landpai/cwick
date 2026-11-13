@@ -248,6 +248,8 @@ bool cwick_model_type_supported(const char *mt) {
     if (strcmp(mt, "deepseek_v41") == 0 ||
         strcmp(mt, "deepseek_v41_text") == 0) return true;
     if (TYPE_HAS_PREFIX(mt, "minimax_m3")) return true;
+    /* Qwen3.5 hybrid: Gated DeltaNet + GQA layers, dense BF16. */
+    if (TYPE_HAS_PREFIX(mt, "qwen3_5")) return true;
     if (strcmp(mt, "glm5_next") == 0 ||
         strcmp(mt, "glm-5.3-flash") == 0) return true;
     /* `cwick setup` writes tiny checkpoints that use the same kernels. */
@@ -293,7 +295,8 @@ bool cwick_model_root_supported(const char *root, char *why, size_t whycap) {
     if (!ok && why && whycap)
         snprintf(why, whycap,
                  "unsupported model_type \"%s\": this build implements the "
-                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 kernels only",
+                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 kernels "
+                 "only",
                  mt ? mt : "(missing)");
     cwick_json_free(j);
     return ok;

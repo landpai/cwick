@@ -17,6 +17,7 @@
 | **GLM-5.3-flash** | ≈306 GiB，62 分片 | 45 层，288 路由专家，top-8，FP8-E4M3 | 最初的模型，≈320B 参数 |
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB，48 分片 | 40 层，384 路由专家 top-6，MLA + FP4 专家 + FP8 attention | 仍能进笔记本的最大一个 |
 | **MiniMax-M3.1-Flash** | ≈233 GiB，48 分片 | 60 层（3 层稠密），128 专家 top-4，NVFP4 专家 + FP8 稠密 | 三者中占用最小 |
+| **Qwen3.5-9B** | ≈18 GiB，4 分片 | 32 层：24 层 Gated DeltaNet + 8 层 GQA，稠密 BF16，无专家 | 混合线性注意力；唯一不是 MoE 的一个，也是唯一整份常驻内存的一个 |
 
 质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
 
@@ -87,7 +88,8 @@
         │        └── engine.c ──► 渲染 prompt、prefill、decode、采样
         │              ├── GLM-5.3-flash : spine.c  attention.c  moe.c  pfx.c
         │              ├── DeepSeek-V4.1  : ds_model.c  ds_ops.c  ds_quant.c
-        │              └── MiniMax-M3.1   : mm_model.c  mm_prompt.c
+        │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
+        │              └── Qwen3.5-9B      : q35_model.c  q35_prompt.c
         ├── /v1/systemone ──► jev.c ──► 一次 prefill，读答案位置的分布
         ├── /v1/metrics  /v1/models  /v1/config  /v1/logs/stream
         │        └── 槽位忙时照样应答——"能看着一次 30 分钟的 prefill"就靠它
@@ -103,7 +105,7 @@
   └── 计算   : pool.c（NEON 线程池）或 metal.c（零拷贝 arena blob）
 ```
 
-- **语言与依赖**：C11，外加一个 Objective-C 文件做 Metal 桥。链接的只有 macOS 系统框架——Accelerate、Metal、CoreImage、ImageIO、CoreGraphics——以及系统自带的 `sqlite3`。没有 Python，没有 BLAS，没有运行期转换步骤。
+- **语言与依赖**：C11，外加两个 Objective-C 文件做 Metal 桥。链接的只有 macOS 系统框架——Accelerate、Metal、CoreImage、ImageIO、CoreGraphics——以及系统自带的 `sqlite3`。没有 Python，没有 BLAS，没有运行期转换步骤。
 - **一个二进制，四个子命令**：`setup`（生成合成验证模型）、`run`（单条 prompt，或多条一起批解码）、`serve`（API 服务）、`doctor`（读一遍常驻字节并打印内存计划）。
 - **web 控制台是编译进去的**（`src/webui_embed.c`），所以 `--web` 不需要磁盘上的静态资源，也没有第二个进程；应用是 `apps/` 下的文件，由同一个服务端托管，状态进 sqlite。
 - **同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。
@@ -146,6 +148,7 @@ make test       # 验证套件：引擎、采样、前缀缓存、服务端、�
 sh ./start.sh glm              # GLM-5.3-flash，      0.0.0.0:8001，500K 上下文
 sh ./start.sh deepseek         # DeepSeek-V4.1-Flash，同上
 sh ./start.sh minimax          # MiniMax-M3.1-Flash，32K 上下文（KV 是 2.3 KiB/位置/层）
+sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 GiB 加载期即 wire 常驻）
 ```
 
 `start.sh` 是推荐的入口：它打开了前缀缓存、web 控制台、局域网共享、三个模型目录和密码——这些一项一项都容易忘。不用脚本时，同一个服务是：
@@ -192,7 +195,7 @@ cwick: 2026-10-29 21:53:15.215 [info +251.55s] [req 6] decode(content) 12/24 tok
 cwick: 2026-10-29 21:53:30.104 [info +266.44s] [req 6] POST /v1/chat/completions -> 200 in 12014.7ms prompt=201 completion=18 finish=stop think=12 tools=0 content=6
 ```
 
-decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)` 或 `decode(tools)`。prefill 行没有这个区分，所以它报的是层号，token 数前面带 `~`——那是按完成的层数估出来的，不是数出来的。
+decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)` 或 `decode(tools)`。prefill 行没有这个区分，所以它报的是层号，token 数前面带 `~`——那是按完成的层数估出来的，不是数出来的。阶段切换会结算刚结束那一段的 token 数、耗时与速率（`decode phase: thinking -> content after 8 tokens (1.1s, 7.01 tok/s)`）；该状态会推给全部四个后端，所以进度行上的标签与切换行始终一致（DECISIONS §56）。
 
 `--verbose` 增加每步细节和内存预算；`--trace` 还会打印渲染后的 prompt、输出和每次工具调用（默认关闭：它会把用户内容打到 stdout）。`Ctrl+C` 任何时候都能干净停下——生成中则在下一个 token 处中断，在飞请求得到 503，快照落盘，最后一行会说明。
 
@@ -229,7 +232,7 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | `--host` / `--port` | `127.0.0.1` / `8000` | `start.sh` 绑 `0.0.0.0:8001` |
 | `--context N` | 131072 | KV 容量（token，>100K）；`run` 默认 4096。`start.sh` 用 500000，MiniMax 用 32768 |
 | `--max-tokens N` | 1000000 | 请求没带 `max_tokens` 时的默认值，会被窗口裁到剩余空间；`start.sh` 传 8192 |
-| `--backend metal\|cpu` | Apple Silicon 上为 metal | 专家 GEMV 与批式投影走 GPU |
+| `--backend metal\|cpu` | Apple Silicon 上为 metal | 专家 GEMV、批式投影，以及 Qwen3.5 的整个 decode 步都在 GPU 上 |
 | `--mem-fraction PCT` | 80 | 本进程可占用的宿主内存比例 |
 | `--max-memory GiB` | — | 绝对上限，更小时优先 |
 | `--allow-swap` | 关 | 不再锁 wired（只用于调试放不下的计划） |
@@ -334,6 +337,7 @@ prefill；`usage` 照样报 `input_tokens`、`cached_input_tokens`、`prefilled_
 | GLM-5.3-flash | 500K | MLA latent + DeltaNet 状态 | 8/288 × 42 层 | 3.6 tok/s 常驻，1.7 流式 |
 | DeepSeek-V4.1-Flash-1017 | 500K | 压缩 MLA | 6/384 × 40 层 | 2.8 tok/s |
 | MiniMax-M3.1-Flash | 32K | bf16 GQA，2.3 KiB/位置/层 | 4/128 × 57 层 | 1.48 tok/s |
+| Qwen3.5-9B | 128K | f32 GQA 64 KiB/位置 + 50 MiB DeltaNet 状态 | 无——稠密，整份常驻内存 | **20.0 tok/s** |
 
 上下文不抽象，也不免费：MiniMax 上 500K 位置就是 64 GiB 的 KV，直接从专家缓存里出，也就是直接从 token 速率里出。这就是 `start.sh minimax` 把它压在 32K 的原因——量过，不是拍脑袋。
 
@@ -356,13 +360,15 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 
 ## 思考、流式与工具
 
-思考默认打开，深度是请求字段 `reasoning_effort`，映射到一个 token 上限，而**引擎自己执行**这个上限：到达上限时引擎把闭合标记同时写进输出和上下文，所以预算用尽的这一轮仍然给答案，而不是返回 `content=""`。
+**请求不带 `reasoning_effort`（或 `thinking` / `reasoning` / `enable_thinking`）字段时默认不思考**：默认档位是「关」，与显式传 `reasoning_effort:"none"` 完全等价。没听说过这个字段的客户端拿到的是答案，而不是一段 32768 token 的思考块。思考深度是请求字段，映射到一个 token 上限，而**引擎自己执行**这个上限：到达上限时引擎把闭合标记同时写进输出和上下文，所以预算用尽的这一轮仍然给答案，而不是返回 `content=""`。
 
 | 档位 | 关 | 低 | 中 | 高 | 超高 | 极致 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 预算 | 0 | 512 | 2048 | 8192 | 16384 | 32768 |
 
 `reasoning_content` 与 `content` 在流式和非流式两条路径上都分离，且来自同一个判断——checkpoint 自己的推理标记（GLM 与 DeepSeek 是 `<think>`，MiniMax 是 `<mm:think>`），不是写死的字符串。工具声明被渲染进各 checkpoint 自己的 `<tools>`/`<tool_call>` 协议，再解析回 OpenAI `tool_calls`；工具调用正在生成时，流被标成 `decode(tools)`，而不是漏进正文。
+
+**流式工具调用在生成过程中就可见**：模型一写出函数名，三个方言就各自用空的 `arguments` 开启调用，随后追加参数增量（chat 是 `delta.tool_calls[].function.arguments`、Responses 是 `response.function_call_arguments.delta`、Messages 是 `input_json_delta`）。增量会继续落在**参数值内部**，因此「一个很长参数」的工具调用（一段 shell 脚本、一个文件正文）是逐段填充的，而不是最后整体出现。增量拼接结果与最终 payload 逐字节一致；私有进度字段 `delta.cwick_tool` 仍发给内置控制台。实测与结算规则见 DECISIONS §58、§59。
 
 ## 速度
 
@@ -376,6 +382,13 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 | DeepSeek-V4.1 | decode | 360 ms | 2.78 | 内存重构后的稳态 |
 | MiniMax-M3.1 | decode | 677 ms | **1.48** | 23 步，默认 21 GiB 缓存 |
 | MiniMax-M3.1 | prefill，550 token 的一次决策 | 95.5 s | **5.8** | 1024 token 一块；512 时是 109.3 s |
+| Qwen3.5-9B | decode，整步在 GPU 上 | 49 ms | **20.4** | 32 层装进一个 command buffer（DECISIONS §61）；`CWICK_Q35_GPU=0` 时 7.0 tok/s |
+| Qwen3.5-9B | decode，CPU 池 | 139 ms | **7.2** | 17.98 GiB 整份常驻并 wire；31K 上下文时 6.2 tok/s |
+| Qwen3.5-9B | prefill，760 token 的 prompt | 10.0 s | **76.2** | 512 位置一块；两段 attention 都是 GEMM |
+| Qwen3.5-9B | prefill，7,600 token 的 prompt | 94.8 s | **80.2** | 上下文涨十倍、速率不变 |
+| Qwen3.5-9B | prefill，14,060 token 的 prompt | 184 s | **76.2** | 平的：两段 attention 都是 GEMM（DECISIONS §54） |
+| Qwen3.5-9B | prefill，30,970 token 的 prompt | 436 s | **71.0** | 30K 处仍有平地的 94%——一块里 attention 2.3 s、投影 4.5 s |
+| Qwen3.5-9B | 决策，3 题 / 525 token | 9.44 s | **55.6** | 三次 prefill，无 decode（见 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)） |
 
 ### 什么决定了 token 速率
 
@@ -386,15 +399,30 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 | GLM-5.3-flash | 3.63 tok/s | 每步约 8.06 GiB 专家 | 专家库装不进 RAM |
 | DeepSeek-V4.1 | 2.78 tok/s | 约 18 GB，大多是 bf16 稠密 | 专家 fp4 GEMV 实测 58.5 GB/s |
 | MiniMax-M3.1 | 1.48 tok/s | 约 5 GiB 未命中 | 同 shard 读天花板；缓存超过 30 GiB 会喂给压缩器 |
+| Qwen3.5-9B | 20.0 tok/s | ~16.5 GB，全部常驻 | GPU 到内存的通路：实测 368 GB/s 中的 341（§61） |
 
-限制是算术，不是少了一个优化：一步要搬 20–30 GB，这台机器最高读 123 GB/s，而引擎一次权重读取只产出一个 token（完整推导在 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)）。同一条闭环已经拿到的是 prefill 这一侧——MiniMax 上 550 token 95.5 s（5.8 tok/s），一个三问决策共享前缀后 102 s 而不是 214 s——以及一份清楚的剩余方向：每步字节更少，或一次权重读取产出多个 token。
+限制是算术，不是少了一个优化：MoE 一步要搬 20–30 GB，CPU 集群最高读 123 GB/s，而引擎一次权重读取只产出一个 token（完整推导在 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)）。稠密模型恰好是这套推理失效的地方——16.5 GB 走 GPU 的 368 GB/s 就是每步 45 ms，它现在跑的正是这个数。同一条闭环在别处已经拿到的是 prefill 这一侧——MiniMax 上 550 token 95.5 s（5.8 tok/s），一个三问决策共享前缀后 102 s 而不是 214 s。稠密模型剩下的只有一个杠杆：一次权重读取产出多个 token。
+
+这个杠杆已经做出来并量过了，而且目前还不划算。`CWICK_Q35_VERIFY=k` 让 k 个连续位置走同一趟
+权重 pass，`CWICK_Q35_GPU_CHECK=1` 发现它的每一行都与「同一条 GPU 路径逐行跑」逐位相同——递推
+状态在 k+1 个槽里滚动，所以保留被接受的前缀只是一次 `memmove`。代价原本是 k = 8 时每多一行
+6.4 ms，现在是 4.9（81.8 ms 对 47.4）：把这个内核逐项摘掉来量，才看出边际行是激活经 threadgroup
+内存的流量而不是算术——65.8 ms 的一趟里全部乘法加在一起只占 1.8 ms——而让激活直接从 device
+内存读，就去掉了暂存和它的两个 barrier。手上唯一不读权重的草稿器——拿末尾 2–6 个 token 去
+上下文里找上一次出现并顺着抄——每趟只拿回 1.08 到 1.24 个 token，端到端比不投机还慢。盘上那个
+学出来的头现在是真的绑上并量过了，不再只是定价：每个草稿 token 要 2.52 GB，因为它共用 2.03 GB
+的词表投影（7.0 ms，换成候选切片约 1.7 ms），而它深度 1 的正确率是 35.6%、深度 2 是 12.5%、
+深度 3 是 0%——所以 `CWICK_Q35_SPEC` 的每种形状都比一步一行慢（20.19 对 20.74 tok/s），默认关闭。
+挡住 40 的已经不再是草稿的价钱，而是一趟权重 pass 能产出几个 token：40 需要 2.08 个，这个草稿器
+的上限是 1.40，而这个上限是权重的属性。每一部分与推导都在
+[docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) §62 到 §65。
 
 ## 验证
 
 Beta，且变化很快。每个改动都先在这台机器上量过才留下，输掉的那些写在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) 里——包括那些看起来显而易见的。
 
 ```sh
-make test        # 651 项断言：引擎、采样、前缀缓存、服务端、web UI、应用
+make test        # 678 项断言：引擎、采样、前缀缓存、服务端、web UI、应用
 make bench       # 不加载 checkpoint 也能测内核
 ```
 
@@ -437,6 +465,7 @@ cwick/
 │   ├── attention.c    MLA / GQA / DeltaNet 内核（NEON）
 │   ├── moe.c          路由与专家 GEMV/GEMM
 │   ├── ds_*.c         DeepSeek-V4.1 后端：FP4 专家、FP8 attention
+│   ├── q35_*.c        Qwen3.5 后端：Gated DeltaNet + 门控 GQA，稠密 BF16
 │   ├── mm_*.c         MiniMax-M3.1 后端：NVFP4 专家、bf16 GQA
 │   ├── metal*.c/.m    Metal 内核与零拷贝 arena
 │   ├── pfx.c          磁盘上的前缀缓存快照

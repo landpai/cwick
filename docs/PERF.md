@@ -828,3 +828,374 @@ that works; chopping evenly is not.
 
 Memory cost of the larger block on MiniMax: footprint 23.8 GB, swap
 1.36/3.0 GiB, no growth over the run.
+
+## 2026-11-12: the same checkpoint through all four dialects, and where 40 tok/s would have to come from
+
+Qwen3.5-9B is the one checkpoint here that fits in core: 17.98 GiB of BF16
+weights, faulted in and wired at load in 2.6 s, ~1.05 GiB of KV and DeltaNet
+state for 32K positions (`DECISIONS.md` §52). That makes it the right model for
+the question "what does the API add on top of the engine", because there is no
+storage path left to hide behind.
+
+**Method.** One fresh process, `--backend metal --context 32768`, **prefix cache
+off**, four dialects against the same 81-token prompt and `max_tokens=64`,
+thinking disabled per dialect (`reasoning_effort=none` for chat,
+`reasoning={"effort":"none"}` for responses, `thinking={"type":"disabled"}` for
+messages — a decision has no thinking to disable). Three runs each, in order
+chat → responses → messages → systemone, so the model is warm for every run.
+Driver: `tools/apibench.sh` (see Reproducing), which prints per-request wall
+clock from curl and takes the token counts from the server's own summary line.
+
+### The four dialects, one prompt, one process
+
+| dialect | prompt tok | out tok | prefill tok/s | decode tok/s | first byte | end to end |
+|---|---:|---:|---:|---:|---:|---:|
+| `POST /v1/chat/completions` | 81 | 41 | 37.65 | **7.04** | 6 ms | 7.98 s |
+| `POST /v1/responses` | 81 | 41 | 37.69 | **7.09** | 6 ms | 7.93 s |
+| `POST /v1/messages` | 81 | 41 | 37.66 | **7.09** | 6 ms | 7.94 s |
+| `POST /v1/systemone` (3 questions) | 525 | 0 | **55.60** | — | — | 9.44 s |
+
+Spread across three runs per dialect: prefill 37.3–37.9 tok/s, decode
+6.98–7.12 tok/s, wall 7.91–8.05 s. The three generating dialects are within
+**0.2%** of each other, which is the expected result: the dialect is a request
+shape, and all three end in the same `qwen3_5` forward and the same sampler. What
+the numbers do say is that **the HTTP layer and the SSE encoder cost
+nothing measurable** — 8 s of wall for 41 tokens is 5.9 s of decode plus 2.2 s of
+prefill, and the whole request/response envelope is under 10 ms.
+
+`first byte` is the first byte of the SSE stream, i.e. the response header chunk,
+**not** TTFT. Time to first token is the prefill column plus one step: 2.15 s +
+0.14 s at 81 tokens. It is reported because a client that waits for the socket
+rather than for a delta will see 6 ms and think the model answered instantly.
+
+**A decision is three prefills, not one.** `/v1/systemone` with three questions
+issued three separate ~175-token prefills (178 / 174 / 173) and zero decode, so
+525 tokens at 9.44 s = 55.6 tok/s. That is *faster* per token than the chat turn
+(37.7 tok/s) and for the same reason prefill is faster on a longer prompt: the
+weight read is per block, so 175 tokens amortise 16.5 GB over more work than 81
+does. The decision path also proves the point of the endpoint — no sampler, no
+decode loop, no second cost term.
+
+### The ceiling, for every model in the list
+
+40 tok/s was the number asked for. It is worth writing down what that requires,
+because it is not a tuning target: a decode step reads the weights it needs, and
+one token comes out per read.
+
+| model | bytes per step | 40 tok/s needs | this machine provides | best measured |
+|---|---:|---:|---:|---:|
+| Qwen3.5-9B | ~16.5 GB (all weights, minus the unused vision tower and the embedding row) | 660 GB/s | 123.5 GB/s CPU, 368 GB/s GPU | **20.4 tok/s** = 93% of the GPU's 368 GB/s |
+| GLM-5.3-flash | ~19.9 GB (8.06 GiB of experts + ~10.4 GiB resident) | 795 GB/s | 123.5 GB/s | 3.63 tok/s (experts resident) |
+| DeepSeek-V4.1-Flash-1017 | ~17.9 GB | 716 GB/s | 123.5 GB/s | 2.78 tok/s |
+| MiniMax-M3.1-Flash | ~20.8 GB (19.36 GiB) | 832 GB/s | 123.5 GB/s | 1.48 tok/s |
+
+A note on `--backend metal` for this checkpoint, revised after the fact: the CPU
+pool's 7.0 tok/s was 93% of the *CPU* bus and that was correctly read as "no
+headroom here" — but it was the wrong bus. Qwen3.5 is dense BF16, so a decode
+step is nothing but a 16.5 GB stream of weights, and the GPU can stream that at
+368 GB/s once the whole step lives in one command buffer instead of 128
+commits (§61 below, and `DECISIONS.md` §61): **20.4 tok/s**, 2.9x the CPU pool,
+text byte-identical. Dense models were never the case where "the GPU has nothing
+to drive" was true; it was true for the *expert-scattered* MoE shape.
+
+The 123.5 GB/s figure is measured on this host (4 threads saturate it; 1/4/16 GiB
+buffers all read at the same rate). So 40 tok/s asks for **5.3x to 6.7x the CPU
+memory bandwidth this machine has**, on every checkpoint in the list — and 1.8x
+the GPU's, on the one dense checkpoint that can use it. The only way to close a
+gap that size is to move fewer bytes per token, and every such route is excluded
+by the quality rule that is written into `goal.md` and enforced at load: no
+pruning, no reduced top-k, no lossy weight format. At 4 bits a 9B dense model
+would move ~4.1 GB/step and cap at 30 tok/s on the GPU's bus — still short, and
+no longer the model on disk.
+
+**What is left, and what it is worth.** The one lever that reduces *bytes per
+token* without touching precision is emitting more than one token per weight
+read. For a dense model that is a much better trade than it is for a MoE (whose
+second token widens the expert union instead of sharing it, `PERF.md` above:
+0.815x per-token bytes).
+
+This used to be projected off the CPU step, which gave 13 tok/s at k=4 and 17 at
+k=8 and the conclusion "half of 40". That projection is superseded by §61: the
+step is now 46.5 ms of GPU, not 129 ms of CPU, and on the GPU the per-row
+arithmetic is no longer free-of-headroom — the M3 Max has ~14 TFLOP/s against a
+16.5 GFLOP/token budget, so the same weight pass can verify several rows. The
+algebra that replaces it has two unknowns and both are measurable:
+
+    tok/s = k * alpha / (46.5 ms + k * c)      alpha = draft acceptance
+    -> 40 tok/s needs  k * alpha >= 1.86 + 0.040 * k * c
+
+`c` is the marginal cost of one more verified row (the projections turn from GEMV
+into a k-row GEMM over the *same* bytes, so `c` is arithmetic and dispatch, not
+DRAM) and it is measured by extending the full-step forward from `n == 1` to
+`n == k`. `alpha` needs the draft head bound: `model-mtp.safetensors`, 486 MB,
+`num_nextn_predict_layers=1`, on disk and currently unbound. The implementation
+cost is not the drafter — it is the k-row forward entry point, plus a
+snapshot/restore of the 50 MiB of DeltaNet state, because a rejected draft cannot
+be rewound through a recurrence the way a KV cache can be truncated. Both of
+those are priced, neither is done.
+
+### Reproducing
+
+```sh
+./cwick serve --root ./models/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic \
+    --backend metal --jev --context 32768 --port 8004 --password cwick-local \
+    --models-dir ./models 2>&1 | tee logs/apibench-q35.log
+
+sh tools/apibench.sh --host http://127.0.0.1:8004 --password cwick-local \
+    --tokens 64 --repeat 3 --log ./logs/apibench-q35.log
+```
+
+The script prints one row per request: endpoint, wall clock from curl, and the
+prompt / generated / prefill / decode numbers read back from the server's own
+summary line, so a client-side re-derivation cannot drift from what the engine
+reported.
+
+### The prefill column above is an 81-token number, and prefill is not flat
+
+The four-dialect table measures 81 prompt tokens, where attention is free. At
+agent scale the curve is what matters, and it used to bend hard: on a logged
+31,690-token request the rate fell from 73.4 tok/s (first block) to 14.8 tok/s at
+14K, with the ETA growing as it went. Fitting that run gives
+`t(n) = 0.0117n + 3.90e-6n²`, accurate to 1% -- a quadratic term, which is
+attention, running at 8 GMAC/s inside an engine whose GEMM path does 550.
+
+`DECISIONS.md` §53 fixed the first half of that (eight queries per K/V pass,
+NEON dots) and §54 the second: the two attention passes are GEMMs now, and the
+K/V cache is f32 so both can run through Accelerate like every other projection.
+What a caller sees, same prompt shape, one process each, `--context 131072`:
+
+| prompt | prefill | rate |
+|---|---:|---:|
+| 760 tokens | 10.0 s | 76.2 tok/s |
+| 7,600 tokens | 94.8 s | **80.2 tok/s** |
+| 14,060 tokens | 184 s | 76.2 tok/s |
+| 30,970 tokens | **436 s** | **71.0 tok/s** |
+
+Re-run on the same binary after the tree was restored (same three prompt
+shapes, one process each): 760 -> 9.79 s / 77.6 tok/s, 7,600 -> 96.9 s / 78.5,
+30,970 -> 434.0 s / 71.4. That is the usual few-percent machine drift, and the
+shape of the curve is unchanged.
+
+The rate is flat out to 14K and still 94% of flat at 31K, which is the property
+that was missing: what remains of the degradation is the part that cannot go
+away -- the score and output passes are `O(keys)` per block by definition. They
+used to cost 0.26 ms per 1000 keys per block and now cost 0.075, so a block at
+30K positions spends 2.3 s in attention instead of 7.8, and 32 layers of
+projections (4.5 s) stay the largest term.
+
+Decode reads the weights once per token whatever the context -- 111 ms of a
+139 ms step at 11K -- and attention is the only term that grows with it. That
+term was 52 ms of a 174 ms step before §54's decode kernel and is a few ms after:
+7.2 tok/s at 11K against 7.0 on a short prompt, which is to say the cache is not
+what costs, the weights are.
+
+One more number worth having: a 587-token prompt whose prefix is already cached
+prefills in **147 ms** instead of 9556 ms, because the state is a sequential read
+of one snapshot rather than 587 positions of work. That is the term that decides
+an agent's time to first token on every turn after the first.
+
+## 2026-11-13: the GPU was dismissed against the wrong ceiling
+
+The ruling above says `--backend metal` has nothing to drive for this
+checkpoint because "its GEMVs already run at 93% of the memory bus". That 93%
+was measured against **123.5 GB/s**, and 123.5 is the *CPU cluster's* path, not
+the machine's memory system. Three measurements settle it.
+
+**CPU read bandwidth** (`tools/membwbench`, 8 GiB, three kernels, 1..16
+threads):
+
+| kernel | 1 thr | 2 thr | 4 thr | 8 thr | 12 thr | 16 thr | peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 4-byte scalar sum | 75.0 | 114.9 | 122.1 | 121.7 | 121.8 | 116.8 | 123.8 |
+| 16-byte vector sum | 40.3 | 80.1 | 120.4 | 117.9 | 119.3 | 113.1 | 120.4 |
+| 16-byte + bf16 widening | 21.8 | 43.1 | 84.1 | 119.1 | 117.5 | 116.7 | 119.8 |
+
+Flat from four threads, and a single thread already pulls 75 GB/s. That is a
+shared cap around **120-124 GB/s on the CPU side**, not a per-core limit.
+
+**GPU read bandwidth** (`tools/gpubw`, 4 GiB private buffer, same loop shapes,
+10K..327K threads):
+
+| kernel | peak |
+|---|---:|
+| `uint4` grid-stride sum | **284.6 GB/s** |
+| `bf16` widening + 8 f32 adds per 16 B | **284.3 GB/s** |
+
+The bf16 variant matching the plain transport byte for byte is the point: the
+conversion a real BF16 GEMV pays is free at this rate, so 285 GB/s is available
+to the kernel that would run the projections. One dispatch over a 4 GiB buffer
+peaked at **329 GB/s** (`tools/dualbw`).
+
+**They do not add** (`tools/dualbw`, 12 CPU threads and one GPU dispatch over
+the same window, 4 GiB per side):
+
+| window | GB/s |
+|---|---:|
+| CPU only | 123.5 |
+| GPU only | **328.9** |
+| both at once | **213.7** |
+
+Running both does not reach the sum (452) and does not even hold the GPU's own
+rate: it falls to 65% of it. So splitting a projection's output rows between
+the CPU pool and the GPU — the shape of the split the other backends use — is
+a net loss here. The two engines share one pipe, and the CPU's share of it is
+the *slower* share.
+
+**What that does to the step budget.** 16.5 GB per token, one commit:
+
+| engine | step time | tok/s |
+|---|---:|---:|
+| CPU pool at 123 GB/s | 134 ms | 7.4 (measured 7.0) |
+| GPU at 285 GB/s | 58 ms | 17.1 |
+| GPU at 329 GB/s | 50 ms | 19.8 |
+
+So the headroom is real and it is 2.4x, not zero. What is *not* real is
+reaching it by pushing one projection at a time through `cwick_metal_*`.
+
+**The dispatch term eats it.** `tools/q35step` replays the checkpoint's own
+shape mix (32 layers, 13.82 GB, two rotating weight sets so nothing is cached)
+through the production batched-BF16 API, with the same group boundaries a real
+layer has — the CPU needs `in_proj` before the recurrence and `gate/up` before
+`down`, so each layer is four commits:
+
+| path | ms | GB/s | commits | us per commit+wait |
+|---|---:|---:|---:|---:|
+| CPU pool, `cwick_gemm_bf16` | 151.0 | 91.5 | — | — |
+| GPU, batched per group | 118.8 | 116.3 | 128 | **928** |
+
+1.27x, not 2.4x. With eight layers it is 0.95x. `CWICK_METAL_TIME=1` shows why:
+`wait` is consistently about twice `gpu`, i.e. half of every batch is
+scheduling, and 128 of them cost ~119 ms against a 58 ms kernel budget. This is
+the same wall the source already documents for the unbatched path ("one
+commit+wait per call costs ~450 us ... the unbatched path is opt-in and loses"),
+only worse for a model that needs four sync points per layer.
+
+**What was left, priced.** One commit per *step* instead of per group: a Metal
+forward for the whole decode step (norms, the DeltaNet recurrence, attention,
+MLP, lm_head), 32 layers inside a single command buffer. At the measured
+transport that is 50-58 ms of kernel plus one round trip, i.e. **17-20 tok/s**,
+which needs a better GEMV than the current one-simdgroup-per-row kernel to
+reach the 285 GB/s the transport offers. On top of that, the MTP head already
+on disk turns a 50-58 ms step into 2 to 2.5 tokens: `40 tok/s` needs 2.0-2.4
+accepted tokens per step, so it is reachable only as **full-step GPU forward x
+MTP**, and neither half is a tuning change.
+
+That forward now exists and measured **49 ms / 20.45 tok/s** (next section); the
+CPU pool it replaced is kept as `CWICK_Q35_GPU=0` and is still 95% of what the
+CPU bus can do, which is the point — 95% of the wrong bus was worth 2.9x.
+
+### The one-commit bound, measured
+
+`tools/q35one` encodes the same 128 GEMVs of a step into **one** command buffer
+(compute encoders inside a buffer run in submission order, so a dependent chain
+is legal without a round trip) and waits once:
+
+| encoding | ms | GB/s | implied tok/s at 16.5 GB |
+|---|---:|---:|---:|
+| 128 commits (`tools/q35step`, GPU) | 118.8 | 116 | 8.2 |
+| **1 commit, 1 weight set (496 MB)** | **37.6** | **368** | **22.3** |
+| 1 commit, 4 weight sets (2 GB) | 38.0 | 364 | 22.1 |
+
+The working-set check matters: rotating four distinct copies changes nothing,
+so 368 GB/s is the DRAM rate for this access pattern, not a cache artifact, and
+it is *above* the 285 GB/s a single grid-stride dispatch over one 4 GiB buffer
+reported (`tools/gpubw`). The chained shape — many short dispatches, each
+sweeping a 8..96 MB matrix — schedules better than one long sweep.
+
+So the dispatch wall is the whole story: 118.8 ms and 37.6 ms move the same
+bytes. The step budget for a real forward is then 37.6 ms of GEMV plus
+whatever the non-GEMV work costs (norms, the DeltaNet recurrence, attention
+over the KV cache, the logits copy back to the CPU). That is the gap between
+22 tok/s of pure GEMV and the 17-20 tok/s estimated above, and it is the thing
+the full-step forward has to hold.
+
+### The full-step forward, delivered
+
+`CWICK_Q35_GPU=1` (the default wherever a Metal device comes up) runs a decode
+position through `src/q35_gpu.c` — 32 layers, 16 kernels, **one** command
+buffer, one wait. Measured on the production configuration (128K context,
+prefix cache, over HTTP):
+
+| decode path | ms/step | tok/s |
+|---|---|---|
+| CPU pool | 143 | 7.00 |
+| GPU whole step, `cwick run`, 4K context | 49.8 | 20.10 |
+| GPU whole step, serve, 128K context + prefix cache | 48.9 | **20.45** |
+
+Kernel time is 46.5 ms of the 47.4 ms wall — 341 GB/s against the 368 GB/s the
+isolated GEMV chain measured, so 93% of what this shape mix allows is already
+being spent on moving weights and the rest is the norms, the recurrence, the
+convolution and the attention over the KV cache. Text is byte-identical to the
+CPU path for 90 greedy tokens; logits agree to 0.008 max / 0.0002 mean
+(`CWICK_Q35_GPU_CHECK=1`).
+
+### The check half, and why it is not enough
+
+40 tok/s is a drafts question: a 46.5 ms step needs 1.86 accepted tokens per
+step, and the pass that checks k tokens costs the same weight read as the pass
+that checks one. That check now exists and is exact — `CWICK_Q35_VERIFY=k` runs
+k+1 consecutive positions through one weight pass, and `CWICK_Q35_GPU_CHECK=1`
+finds every row bitwise equal to the same GPU path run a row at a time (0.00000
+max, 0 of N differ, 32 layers, k = 2/3/4/8). Keeping only the accepted prefix is
+one `memmove`, because the recurrence state rolls through k+1 slots instead of
+being rewritten in place.
+
+What it costs, as a real decode step (99 passes, best of three interleaved reps):
+
+| k | ms/pass | marginal ms/row |
+|---|---|---|
+| 1 | 47.4 | — |
+| 8 | 81.8 | 4.9 |
+
+Only the endpoints are quoted: this machine's baseline moves by more than 20%
+between runs, and the intermediate k values moved that much across sessions, so
+the marginal is read as the slope between the two ends rather than from a row a
+few passes deep. The same pass in isolation, same process, same weights
+(`tools/q35gemab`, 13.82 GB per pass) is 39.4 ms at k = 1 and 52.6 at k = 8,
+marginal 1.9 ms — the difference to the real step is the recurrence and the
+convolution, which the linear layers run once *per row*.
+
+That kernel used to stage the k activation rows in threadgroup memory. Ablating
+it one term at a time is what showed the staging was the cost: at k = 8 the
+weight read is 29 ms, the activation read 21 ms, and every N-way multiply
+together 1.8 ms, and 36.4 + 29.4 is exactly the measured 65.8 — the two memory
+streams were serialised, not overlapping. x is only 128 KB for a whole pass, so
+reading it straight out of device memory (L2-resident, no staging, no barriers)
+is 52.6 ms at k = 8 against 65.8. Detail in DECISIONS §63.
+
+The drafter is where it ends, and it is now measured rather than projected. A
+prompt lookup costs nothing and returns 1.08 to 1.24 tokens per pass (52% of
+drafts on prose, 23% on code) — measurably slower end to end than not drafting
+at all, 2022 ms against 2011. The MTP head is bound (DECISIONS §64): 486.6 MB of
+weights and **no output projection of its own**, so a draft token reads 2.52 GB
+including the shared 2.03 GB head, i.e. 7.0 ms — or ~1.7 ms against a 4096-row
+candidate slice.
+
+The assume-rate table in earlier revisions of this file was evaluated at p = 0.8.
+The measured rates are **0.356 / 0.125 / 0.0** by depth with the full head and
+**0.185 / 0.038 / 0.0** against the slice, so the expected accepted count
+A = sum of p^i saturates at 1.40 instead of reaching 2.95. One session,
+200-token prompt, greedy:
+
+| arm | tokens/pass | ms/pass | tok/s |
+|---|---|---|---|
+| one row, no drafter | 1.00 | 48.1 | **20.74** |
+| VERIFY=2, no drafter | 1.00 | 56.2 | 17.79 |
+| SPEC=1, 512-row slice | 1.18 | 60.0 | 19.72 |
+| SPEC=1, 2048-row slice | 1.18 | 59.2 | 19.94 |
+| SPEC=1, full 2.03 GB head | 1.35 | 66.8 | 20.19 |
+
+Every arm loses. The reason is in the row cost: leaving one row costs **+8.0 ms**
+(56.2 against 48.1) while every row after it costs **+1.6 ms**. DECISIONS §65
+took 2 ms off that step — batching the per-row norms, adds and SwiGLU into one
+dispatch each, and running n = 2 at RP 4 — and it did not change the sign,
+because a draft has to beat 8 ms and the best draft is right 35.6% of the time.
+
+So 40 tok/s is not "a draft that costs 1.5 ms" — that draft exists and it still
+loses. 40 tok/s at one weight read per token needs **2.08 tokens per pass**; the
+ceiling here is 1.40, because this checkpoint ships one MTP block trained for one
+depth and chaining its own residual beyond that is out of distribution
+(depth 2 = 12.5% conditional, depth 3 = 0). Closing the gap needs a trained
+multi-depth drafter, which is not in the file.
+
+Prefill is still the CPU's at 71-80 tok/s.

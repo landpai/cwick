@@ -27,6 +27,7 @@ each needs its own loader, quantizer, prompt renderer and kernels:
 | **GLM-5.3-flash** | ≈306 GiB, 62 shards | 45 layers, 288 routed experts, top-8, FP8-E4M3 | the original model, ≈320B parameters |
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB, 48 shards | 40 layers, 384 routed experts top-6, MLA + FP4 experts + FP8 attention | the largest one that still fits a laptop |
 | **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest footprint of the three |
+| **Qwen3.5-9B** | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only one that is not an MoE, and the only one held wholly in RAM |
 
 The quality rule is not negotiable and is enforced at load time: **top-k is the
 model's own `num_experts_per_token`** (never reduced), experts are never pruned,
@@ -150,7 +151,8 @@ client (curl / coding agent / desktop chat app / web console)
         │        └── engine.c ──► render prompt, prefill, decode, sample
         │              ├── GLM-5.3-flash : spine.c  attention.c  moe.c  pfx.c
         │              ├── DeepSeek-V4.1  : ds_model.c  ds_ops.c  ds_quant.c
-        │              └── MiniMax-M3.1   : mm_model.c  mm_prompt.c
+        │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
+        │              └── Qwen3.5-9B      : q35_model.c  q35_prompt.c
         ├── /v1/systemone ──► jev.c ──► one prefill, read the distribution
         ├── /v1/metrics  /v1/models  /v1/config  /v1/logs/stream
         ├── /v1/hub/*    ──► hub.c (download jobs, model catalog)
@@ -167,7 +169,7 @@ state on this machine
   └── compute  : pool.c (NEON threads) or metal.c (zero-copy arena blobs)
 ```
 
-- **Language and dependencies**: C11 plus one Objective-C file for the Metal
+- **Language and dependencies**: C11 plus two Objective-C files for the Metal
   bridge. It links nothing but macOS system frameworks — Accelerate, Metal,
   CoreImage, ImageIO, CoreGraphics — and the system `sqlite3`. No Python, no
   BLAS, no runtime conversion step.
@@ -224,6 +226,7 @@ quality knobs were tampered with.
 sh ./start.sh glm              # GLM-5.3-flash,      0.0.0.0:8001, 500K context
 sh ./start.sh deepseek         # DeepSeek-V4.1-Flash, same
 sh ./start.sh minimax          # MiniMax-M3.1-Flash, 32K context (its KV is 2.3 KiB/position/layer)
+sh ./start.sh qwen3.5-9b       # Qwen3.5-9B, 128K context (dense BF16, 18 GiB wired resident at load)
 ```
 
 `start.sh` is the recommended entry point: it turns on the prefix cache, the web
@@ -291,7 +294,11 @@ cwick: 2026-10-29 21:53:30.104 [info +266.44s] [req 6] POST /v1/chat/completions
 A decode line names which part of the answer it is counting — `decode(thinking)`,
 `decode(content)` or `decode(tools)`. A prefill line has no such split, so it
 reports a layer instead, and its token count is marked `~` because it is an
-estimate derived from layers done rather than a count.
+estimate derived from layers done rather than a count. A transition closes out
+the finished phase with its token count, elapsed time and rate
+(`decode phase: thinking -> content after 8 tokens (1.1s, 7.01 tok/s)`); the
+hint is pushed to all four backends, so the label on every progress line and
+the transition always agree (DECISIONS §56).
 
 `--verbose` adds per-step detail and the memory budget; `--trace` also prints the
 rendered prompt, the output and every tool call (off by default: it puts user
@@ -376,7 +383,7 @@ serve also have an environment twin:
 | `--host` / `--port` | `127.0.0.1` / `8000` | `start.sh` binds `0.0.0.0:8001` |
 | `--context N` | 131072 | KV capacity in tokens (>100K); `run` defaults to 4096. `start.sh` uses 500000, or 32768 for MiniMax |
 | `--max-tokens N` | 1000000 | default `max_tokens` for requests that omit it, clamped to whatever the window leaves; `start.sh` passes 8192 |
-| `--backend metal\|cpu` | metal on Apple Silicon | expert GEMV and batched projections on the GPU |
+| `--backend metal\|cpu` | metal on Apple Silicon | expert GEMV, batched projections, and the whole Qwen3.5 decode step on the GPU |
 | `--mem-fraction PCT` | 80 | share of host RAM the process may occupy |
 | `--max-memory GiB` | — | absolute ceiling; wins when it is smaller |
 | `--allow-swap` | off | stop wiring the spine and the expert arena (debugging only) |
@@ -519,6 +526,7 @@ a local fallback for a refused or slow decision.
 | GLM-5.3-flash | 500K | MLA latent + DeltaNet state | 8 of 288 × 42 layers | 3.6 tok/s warm, 1.7 streaming |
 | DeepSeek-V4.1-Flash-1017 | 500K | compressed MLA | 6 of 384 × 40 layers | 2.8 tok/s |
 | MiniMax-M3.1-Flash | 32K | bf16 GQA, 2.3 KiB/position/layer | 4 of 128 × 57 layers | 1.48 tok/s |
+| Qwen3.5-9B | 128K | f32 GQA 64 KiB/position + 50 MiB DeltaNet state | none — dense, held wholly in RAM | **20.0 tok/s** |
 
 Context is not free and it is not abstract: 500K positions on MiniMax would be
 64 GiB of KV, which comes straight out of the expert cache and therefore out of
@@ -566,11 +574,14 @@ by replays served, then by length, and only then by age.
 
 ## Thinking, streaming and tools
 
-Thinking is on by default and its depth is a request field, `reasoning_effort`,
-mapped to a token ceiling that the engine **enforces itself**: when the ceiling is
-reached the engine writes the closing marker into both the output and the
-context, so a turn that ran out of budget still answers instead of returning
-`content=""`.
+A request that sends no `reasoning_effort` (or `thinking` / `reasoning` /
+`enable_thinking`) field **does not think**: the default is level 关, exactly
+what an explicit `reasoning_effort:"none"` asks for. A client that never heard
+of the knob gets an answer, not a 32768-token reasoning block. Thinking depth
+is a request field, mapped to a token ceiling that the engine **enforces
+itself**: when the ceiling is reached the engine writes the closing marker
+into both the output and the context, so a turn that ran out of budget still
+answers instead of returning `content=""`.
 
 | level | 关 | 低 | 中 | 高 | 超高 | 极致 |
 |---|---|---|---|---|---|---|
@@ -583,6 +594,17 @@ string. Tool declarations are rendered into each checkpoint's own
 `<tools>`/`<tool_call>` protocol and parsed back into OpenAI `tool_calls`; while a
 tool call is being emitted, the stream is labelled `decode(tools)` rather than
 leaking it into the answer.
+
+A streaming tool call is **visible while it is being written**: once the model
+has produced the function name, all three dialects open the call with an empty
+`arguments` and then append argument shards (chat
+`delta.tool_calls[].function.arguments`, Responses
+`response.function_call_arguments.delta`, Messages `input_json_delta`).
+Shards continue **inside** a parameter value, so a tool call that is one long
+shell script or file body fills in progressively instead of appearing whole at
+the end. Concatenating the shards gives byte-for-byte the object in the final
+payload; the private `delta.cwick_tool` progress field is still sent for the
+bundled console. See DECISIONS §58 and §59.
 
 ## Speed
 
@@ -603,6 +625,13 @@ decode is the default 21 GiB cache from the work in
 | DeepSeek-V4.1 | decode | 360 ms | 2.78 | steady state after the memory rework |
 | MiniMax-M3.1 | decode | 677 ms | **1.48** | 23 steps, default 21 GiB cache |
 | MiniMax-M3.1 | prefill, 550-token decision | 95.5 s | **5.8** | one 1024-token block; 109.3 s at 512 |
+| Qwen3.5-9B | decode, whole step on the GPU | 49 ms | **20.4** | 32 layers in one command buffer (DECISIONS §61); 7.0 tok/s with `CWICK_Q35_GPU=0` |
+| Qwen3.5-9B | decode, CPU pool | 139 ms | **7.2** | all 17.98 GiB resident and wired; 6.2 tok/s at a 31K context |
+| Qwen3.5-9B | prefill, 760-token prompt | 10.0 s | **76.2** | 512-position blocks; both attention passes are GEMMs |
+| Qwen3.5-9B | prefill, 7,600-token prompt | 94.8 s | **80.2** | the same rate at 10x the context |
+| Qwen3.5-9B | prefill, 14,060-token prompt | 184 s | **76.2** | flat: both attention passes are GEMMs (DECISIONS §54) |
+| Qwen3.5-9B | prefill, 30,970-token prompt | 436 s | **71.0** | 94% of the flat rate at 30K — a block spends 2.3 s in attention, 4.5 s in projections |
+| Qwen3.5-9B | decision, 3 questions / 525 tokens | 9.44 s | **55.6** | three prefills, no decode (see [docs/PERF.md](docs/PERF.md)) |
 
 ### What sets the token rate
 
@@ -614,13 +643,35 @@ per step. Same method as the table above:
 | GLM-5.3-flash | 3.63 tok/s | ~8.06 GiB of experts per step | the expert bank does not fit in RAM |
 | DeepSeek-V4.1 | 2.78 tok/s | ~18 GB, mostly bf16 dense | expert fp4 GEMV measures 58.5 GB/s |
 | MiniMax-M3.1 | 1.48 tok/s | ~5 GiB of misses | same-shard read ceiling; a cache above 30 GiB feeds the compressor |
+| Qwen3.5-9B | 20.0 tok/s | ~16.5 GB, all resident | the GPU's path to memory: 341 GB/s of a measured 368 (§61) |
 
-The limits are arithmetic rather than a missing optimisation: a step moves 20–30 GB,
-this machine reads at most 123 GB/s, and the engine serves one token per weight read
-(the full derivation is in [docs/PERF.md](docs/PERF.md)). What the same loop already
-bought is the prefill side — 550 tokens in 95.5 s on MiniMax (5.8 tok/s), and a
-three-question decision sharing one prefix in 102 s instead of 214 s — and a clear
-shape for what is left: fewer bytes per step, or more than one token per weight read.
+The limits are arithmetic rather than a missing optimisation: an MoE step moves 20–30 GB,
+the CPU cluster reads at most 123 GB/s, and the engine serves one token per weight read
+(the full derivation is in [docs/PERF.md](docs/PERF.md)). The dense model is where that
+argument breaks — 16.5 GB over the GPU's 368 GB/s is 45 ms a step, and that is the rate
+it now runs at. What the same loop already bought elsewhere is the prefill side — 550
+tokens in 95.5 s on MiniMax (5.8 tok/s), and a three-question decision sharing one prefix
+in 102 s instead of 214 s. What is left for the dense model is one lever only: more than
+one token per weight read.
+
+That lever is built and measured, and it does not pay yet. `CWICK_Q35_VERIFY=k` runs k
+consecutive positions through a single weight pass, and `CWICK_Q35_GPU_CHECK=1` finds every
+row of it bitwise equal to the same GPU path run one row at a time — the recurrence state
+rolls through k+1 slots, so keeping the accepted prefix is one `memmove`. That pass started
+at 6.4 ms per extra row and is now 4.9 (81.8 ms at k = 8 against 47.4), because ablating the
+kernel showed the marginal row was activation traffic through threadgroup memory rather than
+arithmetic — the multiply-adds are 1.8 ms of a 65.8 ms pass — and reading the activations
+straight out of device memory removed the staging and its barriers. The only drafter on hand
+that reads no weights — continuing from an earlier occurrence of the last 2-6 tokens —
+returns 1.08 to 1.24 tokens per pass, which is measurably slower end to end than not
+drafting at all. The learned head on disk is now bound and measured rather than priced: it
+costs 2.52 GB per draft token because it shares the 2.03 GB vocabulary projection (7.0 ms,
+or ~1.7 ms against a candidate slice), and it is right 35.6% of the time at depth 1, 12.5%
+at depth 2 and 0% at depth 3 — so every shape of `CWICK_Q35_SPEC` is slower than one row per
+step (20.19 tok/s against 20.74) and it stays off by default. What blocks 40 is no longer
+the price of a draft but the number of tokens one weight pass can yield: 40 needs 2.08, the
+drafter tops out at 1.40, and that ceiling is a property of the weights. Every part and the
+arithmetic are in [docs/DECISIONS.md](docs/DECISIONS.md) §62 through §65.
 
 ## Verification
 
@@ -629,7 +680,7 @@ kept, and the ones that lost are written down in
 [docs/DECISIONS.md](docs/DECISIONS.md) — including the ones that looked obvious.
 
 ```sh
-make test        # 651 checks: engines, sampler, prefix cache, server, web UI, apps
+make test        # 678 checks: engines, sampler, prefix cache, server, web UI, apps
 make bench       # kernel timings without loading a checkpoint
 ```
 
@@ -691,6 +742,7 @@ cwick/
 │   ├── attention.c    MLA / GQA / DeltaNet kernels (NEON)
 │   ├── moe.c          router and expert GEMV/GEMM
 │   ├── ds_*.c         DeepSeek-V4.1 backend: FP4 experts, FP8 attention
+│   ├── q35_*.c        Qwen3.5 backend: Gated DeltaNet + gated GQA, dense BF16
 │   ├── mm_*.c         MiniMax-M3.1 backend: NVFP4 experts, bf16 GQA
 │   ├── metal*.c/.m    Metal kernels and the zero-copy arena
 │   ├── pfx.c          prefix-cache snapshots on disk

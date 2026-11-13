@@ -27,6 +27,7 @@
 #include "pfx.h"
 #include "ds_engine.h"
 #include "mm_engine.h"
+#include "q35_engine.h"
 #include "sample.h"
 
 /* A turn ends on any id in the checkpoint's stop set, not just the first. */
@@ -69,6 +70,10 @@ struct cwick_engine {
      * this file asks "which backend owns this engine" at a dozen points, and a
      * wrong guess there is a crash rather than a stale number. */
     mm_engine *mm;
+    /* Qwen3.5 hybrid backend. Same deal as `ds` and `mm`: non-NULL exactly
+     * when the checkpoint is that architecture. Dense BF16, so unlike the
+     * other two it streams nothing and budgets no expert cache. */
+    q35_engine *q35;
     cwick_spine spine;
     /* `spine` is embedded, not allocated, so a second engine can share the
      * weights by copying the struct: every member is a pointer to something
@@ -236,6 +241,7 @@ void cwick_engine_set_think_budget(cwick_engine *eng, int64_t budget,
         eng->think_budget = -1;
         if (eng->ds) eng->ds->ctx.think_budget = -1;
         if (eng->mm) eng->mm->ctx.think_budget = -1;
+        if (eng->q35) eng->q35->ctx.think_budget = -1;
         return;
     }
     eng->think_budget = budget;
@@ -259,11 +265,18 @@ void cwick_engine_set_think_budget(cwick_engine *eng, int64_t budget,
         eng->mm->ctx.think_close_id = close_id;
         eng->mm->ctx.think_open_at_start = open_at_start;
     }
+    if (eng->q35) {
+        eng->q35->ctx.think_budget = budget;
+        eng->q35->ctx.think_open_id = open_id;
+        eng->q35->ctx.think_close_id = close_id;
+        eng->q35->ctx.think_open_at_start = open_at_start;
+    }
 }
 
 void cwick_engine_set_think_closed_at_start(cwick_engine *eng, bool closed) {
     if (!eng) return;
     if (eng->mm) eng->mm->ctx.think_closed_at_start = closed;
+    if (eng->q35) eng->q35->ctx.think_closed_at_start = closed;
 }
 
 cwick_status cwick_gen_window(int64_t pos, int64_t prompt_len,
@@ -341,14 +354,18 @@ static void decode_phase_label(const cwick_engine *eng, char *buf, size_t cap) {
         snprintf(buf, cap, "decode");
 }
 
-/* Publish the decode phase hint (static string, or NULL to clear). The
- * DeepSeek backend keeps its own context, so the hint has to be copied there
- * too — otherwise its progress lines would say plain "decode" forever. */
+/* Publish the decode phase hint (static string, or NULL to clear). Every
+ * backend keeps its own generation context, so the hint has to be copied to
+ * each one: a backend left out prints plain "decode" on every progress line,
+ * which is how the Qwen3.5 path lost its thinking/content/tools labels.
+ * set_think_budget, set_stop, set_abort_poll and set_verbose have the same
+ * obligation: every backend must appear in every setter. */
 void cwick_engine_set_decode_phase(cwick_engine *eng, const char *phase) {
     if (!eng) return;
     eng->decode_phase = phase;
     if (eng->ds) eng->ds->ctx.decode_phase = phase;
     if (eng->mm) eng->mm->ctx.decode_phase = phase;
+    if (eng->q35) eng->q35->ctx.decode_phase = phase;
 }
 
 /* Wall clock helper: enough resolution to price a single decode step. */
@@ -449,6 +466,7 @@ void cwick_engine_set_stop(cwick_engine *eng, volatile int *stop) {
     eng->stop = stop;
     if (eng->ds) eng->ds->ctx.stop = stop;
     if (eng->mm) eng->mm->ctx.stop = stop;
+    if (eng->q35) eng->q35->ctx.stop = stop;
 }
 
 void cwick_engine_set_abort_poll(cwick_engine *eng, bool (*poll)(void *),
@@ -464,12 +482,17 @@ void cwick_engine_set_abort_poll(cwick_engine *eng, bool (*poll)(void *),
         eng->mm->ctx.abort_poll = poll;
         eng->mm->ctx.abort_poll_user = user;
     }
+    if (eng->q35) {
+        eng->q35->ctx.abort_poll = poll;
+        eng->q35->ctx.abort_poll_user = user;
+    }
 }
 
 void cwick_engine_set_verbose(cwick_engine *eng, bool verbose) {
     if (eng) eng->verbose = verbose;
     if (eng && eng->ds) eng->ds->ctx.verbose = verbose;
     if (eng && eng->mm) eng->mm->ctx.verbose = verbose;
+    if (eng && eng->q35) eng->q35->ctx.verbose = verbose;
 }
 
 static bool engine_stopped(const cwick_engine *eng) {
@@ -2686,6 +2709,48 @@ cwick_status cwick_engine_new(const cwick_engine_options *opt, cwick_engine **ou
         return CWICK_OK;
     }
 
+    /* ---- Qwen3.5 hybrid: its own loader and forward pass, same shape as the
+     * two branches above. Dense BF16, so there is no expert cache to budget
+     * and no stream to steer; the only sizing decision is the KV window, and
+     * that is 32 KiB per position (8 attention layers of 4x256 keys and
+     * values) plus a fixed 50 MiB of DeltaNet state. ---- */
+    if (strncmp(eng->spec.model_type, "qwen3_5", 7) == 0) {
+        eng->capacity = next_capacity(&eng->spec, opt->max_context);
+        eng->q35 = cwick_xmalloc(sizeof(q35_engine));
+        if (q35_engine_open(eng->q35, opt->model_root, eng->capacity, err) != 0) {
+            free(eng->q35);
+            eng->q35 = NULL;
+            cwick_engine_free(eng);
+            return CWICK_ERR_STATE;
+        }
+        /* The loader caps the window at the checkpoint's own maximum, so take
+         * its answer rather than the request. */
+        eng->capacity = eng->q35->capacity;
+        eng->q35->ctx.stop = opt->stop;
+        eng->q35->ctx.abort_poll = NULL;
+        eng->q35->ctx.abort_poll_user = NULL;
+        eng->q35->ctx.verbose = opt->verbose;
+        eng->q35->ctx.tag = eng->req_tag;
+        eng->q35->ctx.spec = &eng->spec;
+        eng->q35->on_prefill_done = backend_prefix_hook;
+        eng->q35->on_prefill_done_user = eng;
+        eng->q35->on_prefill_checkpoint = backend_prefix_checkpoint;
+        eng->q35->on_prefill_checkpoint_user = eng;
+        eng->q35->checkpoint_block = eng->pfx_block;
+        eng->q35->smp = eng->smp;
+        eng->max_new = opt->max_new_tokens > 0 ? opt->max_new_tokens : 512;
+        CWICK_INFO("init", "qwen3_5 engine ready: %s dim=%lld layers=%lld "
+                   "(%lld linear + %lld full) context=%lld cache=%.2fGiB",
+                   eng->spec.model_type, (long long)eng->spec.hidden_size,
+                   (long long)eng->spec.num_hidden_layers,
+                   (long long)eng->spec.kda_layers,
+                   (long long)eng->spec.mla_layers,
+                   (long long)eng->capacity,
+                   cwick_gib(q35_cache_bytes(&eng->q35->m)));
+        *out = eng;
+        return CWICK_OK;
+    }
+
     /* ---- size the inference state *before* the weights are opened ------
      * KV/KDA/anchor buffers are allocated once and live for the whole run,
      * so the expert-cache budget has to subtract them first. This is also
@@ -3127,6 +3192,7 @@ int64_t cwick_engine_pos(const cwick_engine *eng) {
     if (!eng) return 0;
     if (eng->ds) return eng->ds->pos;
     if (eng->mm) return eng->mm->pos;
+    if (eng->q35) return eng->q35->pos;
     return eng->pos;
 }
 
@@ -3147,6 +3213,11 @@ cwick_status cwick_engine_reset(cwick_engine *eng, cwick_error *err) {
     if (eng->mm) {
         mm_model_reset(&eng->mm->m);
         eng->mm->pos = 0;
+        eng->pos = 0;
+        return CWICK_OK;
+    }
+    if (eng->q35) {
+        q35_engine_reset(eng->q35);
         eng->pos = 0;
         return CWICK_OK;
     }
@@ -3202,6 +3273,15 @@ void cwick_engine_free(cwick_engine *eng) {
         mm_engine_close(eng->mm);
         free(eng->mm);
         eng->mm = NULL;
+        cwick_model_spec_free(&eng->spec);
+        free(eng->model_root);
+        free(eng);
+        return;
+    }
+    if (eng->q35) {
+        q35_engine_close(eng->q35);
+        free(eng->q35);
+        eng->q35 = NULL;
         cwick_model_spec_free(&eng->spec);
         free(eng->model_root);
         free(eng);
@@ -3471,6 +3551,29 @@ cwick_status cwick_engine_capture_prefix(cwick_engine *eng, int64_t pos,
         }
         return CWICK_OK;
     }
+    if (eng->q35) {
+        /* Qwen3.5 keeps the recurrence state of 24 layers plus the KV of 8,
+         * so it travels as one opaque blob with kind 3 -- the same contract
+         * as DeepSeek and MiniMax, and the file header carries the number so
+         * a snapshot can only be applied by the backend that wrote it. */
+        free(out->blob);
+        out->blob = NULL;
+        out->blob_len = q35_prefix_bytes(&eng->q35->m, pos);
+        out->kind = 3;
+        out->pos = pos;
+        out->blob = cwick_xmalloc(out->blob_len);
+        if (!out->blob ||
+            q35_prefix_pack(&eng->q35->m, pos, out->blob, out->blob_len) != 0) {
+            free(out->blob);
+            out->blob = NULL;
+            out->blob_len = 0;
+            cwick_error_set(err, CWICK_ERR_MEMORY,
+                            "prefix: Qwen3.5 snapshot at %lld tokens failed",
+                            (long long)pos);
+            return CWICK_ERR_MEMORY;
+        }
+        return CWICK_OK;
+    }
     if (eng->ds) {
         /* The DeepSeek state is a different set of buffers, so it travels as
          * one opaque blob with kind 1 in both the struct and the file header.
@@ -3618,6 +3721,27 @@ cwick_status cwick_engine_apply_prefix(cwick_engine *eng, const cwick_prefix_sta
         if (eng->pos < pos) eng->pos = pos;   /* mirror for the summary line */
         return CWICK_OK;
     }
+    if (eng->q35) {
+        if (s->kind != 3 || !s->blob || s->blob_len == 0) {
+            cwick_error_set(err, CWICK_ERR_STATE,
+                            "prefix: state was not captured by this backend");
+            return CWICK_ERR_STATE;
+        }
+        int64_t pos = 0;
+        /* `s->pos` is the truncation the caller asked for; 0 would mean "as
+         * much as the blob holds", which only happens for a snapshot that was
+         * stored at exactly this length. */
+        if (q35_prefix_apply(&eng->q35->m, s->blob, s->blob_len, s->pos,
+                             &pos) != 0) {
+            cwick_error_set(err, CWICK_ERR_STATE,
+                            "prefix: Qwen3.5 snapshot does not match this "
+                            "checkpoint");
+            return CWICK_ERR_STATE;
+        }
+        eng->q35->pos = pos;
+        if (eng->pos < pos) eng->pos = pos;   /* mirror for the summary line */
+        return CWICK_OK;
+    }
     const cwick_model_spec *sp = &eng->spec;
     if (s->nslots != eng->kv_layers || s->L != sp->num_hidden_layers ||
         s->lin_heads != sp->linear_num_heads || s->lin_dim != sp->linear_head_dim ||
@@ -3749,6 +3873,7 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
         eng->pos = start_pos;
         if (eng->ds) eng->ds->pos = start_pos;
         if (eng->mm) eng->mm->pos = start_pos;
+        if (eng->q35) eng->q35->pos = start_pos;
     }
 
     const bool report = eng->req_tag[0] != '\0';
@@ -3798,6 +3923,25 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
             pos += n;
         }
         memcpy(logits_out, eng->mm->logits,
+               (size_t)eng->spec.vocab_size * sizeof(float));
+        free(ids);
+    } else if (eng->q35) {
+        int32_t *ids = cwick_xmalloc((size_t)prompt_len * sizeof(int32_t));
+        for (int64_t i = 0; i < prompt_len; i++) ids[i] = (int32_t)prompt[i];
+        int64_t pos = 0;
+        while (pos < prompt_len) {
+            int n = (int)(prompt_len - pos > Q35_CHUNK ? Q35_CHUNK
+                                                       : prompt_len - pos);
+            if (q35_model_forward(&eng->q35->m, ids + pos, n, eng->q35->pos,
+                                  eng->q35->logits, err) != 0) {
+                free(ids);
+                st = CWICK_ERR_STATE;
+                goto done;
+            }
+            eng->q35->pos += n;
+            pos += n;
+        }
+        memcpy(logits_out, eng->q35->logits,
                (size_t)eng->spec.vocab_size * sizeof(float));
         free(ids);
     } else if (eng->ds) {
@@ -4353,6 +4497,9 @@ cwick_status cwick_engine_generate(cwick_engine *eng, const uint32_t *prompt,
     if (eng && eng->mm)
         return mm_engine_generate(eng->mm, prompt, prompt_len, max_new,
                                   keep_prompt, NULL, NULL, result, err);
+    if (eng && eng->q35)
+        return q35_engine_generate(eng->q35, prompt, prompt_len, max_new,
+                                   keep_prompt, NULL, NULL, result, err);
     return generate_impl(eng, prompt, prompt_len, max_new, keep_prompt,
                          NULL, NULL, result, err);
 }
@@ -4597,6 +4744,9 @@ cwick_status cwick_engine_generate_stream(cwick_engine *eng, const uint32_t *pro
     if (eng && eng->mm)
         return mm_engine_generate(eng->mm, prompt, prompt_len, max_new, false,
                                   sink, user, result, err);
+    if (eng && eng->q35)
+        return q35_engine_generate(eng->q35, prompt, prompt_len, max_new, false,
+                                   sink, user, result, err);
     return generate_impl(eng, prompt, prompt_len, max_new, false,
                          sink, user, result, err);
 }

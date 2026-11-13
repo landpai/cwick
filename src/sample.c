@@ -504,6 +504,20 @@ static uint32_t nucleus_draw(cwick_sampler *s, const float *x, int64_t n,
     return (uint32_t)(n - 1);
 }
 
+bool cwick_sampler_plain_argmax(const cwick_sampler *s) {
+    if (!s) return false;
+    if (!cwick_sampler_cfg_is_greedy(&s->cfg)) return false;
+    if (s->cfg.presence_penalty != 0.0f ||
+        s->cfg.frequency_penalty != 0.0f)
+        return false;
+    if (!s->lbrk) return true;
+    /* The ban is armed exactly when some period's match count has reached its
+     * threshold -- the same test pick() runs before masking. */
+    for (int p = 1; p <= s->lper_max; p++)
+        if (s->lmatch[p] >= s->lbrk_need[p]) return false;
+    return true;
+}
+
 uint32_t cwick_sampler_pick(cwick_sampler *s, float *x, int64_t n) {
     if (!s || !x || n <= 0) return 0;
     if (n > s->vocab) n = s->vocab;   /* the table sizes follow the spec */

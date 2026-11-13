@@ -252,6 +252,13 @@ typedef struct cwick_st_tensor {
     uint64_t data_offset;         /* byte offset of the payload within the shard */
 } cwick_st_tensor;
 
+/* A byte range of a mapped shard that has been faulted in (and optionally
+ * wired). Stored so close can undo the wiring without re-deriving it. */
+typedef struct cwick_st_range {
+    void *p;
+    size_t n;
+} cwick_st_range;
+
 typedef struct cwick_safetensors {
     char *root;
     cwick_st_tensor *tensors;      /* one entry per tensor in the index */
@@ -263,6 +270,12 @@ typedef struct cwick_safetensors {
     char **shard_names;
     size_t shard_count;
     uint64_t total_bytes;         /* sum of all shard file sizes */
+    /* Residency (see cwick_safetensors_make_resident): ranges that were
+     * faulted in, and how many of them are wired. */
+    cwick_st_range *pinned;
+    size_t pinned_count;
+    uint64_t pinned_bytes;
+    int pinned_wired;
 } cwick_safetensors;
 
 cwick_status cwick_safetensors_open(const char *root, cwick_safetensors *saf,
@@ -272,6 +285,40 @@ cwick_status cwick_safetensors_get(const cwick_safetensors *saf, const char *nam
                                  cwick_st_tensor *out, cwick_error *err);
 int64_t cwick_safetensors_count_shards(const cwick_safetensors *saf);
 uint64_t cwick_safetensors_total_bytes(const cwick_safetensors *saf);
+
+/* Bytes of tensor payload whose name starts with `prefix` (NULL: everything).
+ *
+ * The distinction matters for a checkpoint that ships more than one model in
+ * the same shards: the text weights and, say, a vision tower are the same
+ * files but not the same residency decision. */
+uint64_t cwick_safetensors_bytes_under(const cwick_safetensors *saf,
+                                       const char *prefix);
+
+/* Fault the pages of every tensor under `prefix` into core, and optionally
+ * wire them. Returns the bytes made resident (0 when there was nothing to do).
+ *
+ * This is for checkpoints small enough to live in RAM: a lazily-mapped shard
+ * costs one minor fault per 16 KiB page the first time the forward pass walks
+ * over it, which for an 18 GiB BF16 model is ~1.2 M faults landing inside the
+ * first prefill chunk -- 1-2 s of pure plumbing, on the request's critical
+ * path. Doing it here moves that work to load time, where it can be done in
+ * parallel and where nobody is waiting on a first token.
+ *
+ * `wire` additionally mlock()s the ranges so the compressor and the swapper
+ * cannot take them back. Wiring is what makes the residency a guarantee rather
+ * than a hope: pages in the unified buffer cache are still reclaimable, which
+ * is how a model that measured 114 GiB/s turns into one that spends its decode
+ * steps decompressing.
+ *
+ * Ranges are merged before being touched, so the call count is proportional to
+ * the number of contiguous runs rather than to the tensor count. */
+uint64_t cwick_safetensors_make_resident(cwick_safetensors *saf,
+                                         const char *prefix, int wire);
+
+/* Undo cwick_safetensors_make_resident. Called automatically by
+ * cwick_safetensors_close; exposed so a model that drops residency early
+ * (before the switch frees the shards) can give the pages back. */
+void cwick_safetensors_release_residency(cwick_safetensors *saf);
 /* Split into resident spine bytes and routed-expert (streamed) bytes. */
 void cwick_safetensors_split(const cwick_safetensors *saf,
                             uint64_t *resident_bytes,
@@ -1325,14 +1372,21 @@ void cwick_phase_account(const cwick_tokenizer *tok, const uint32_t *tokens,
  *   中 medium           -> Low   (no middle bucket exists; stays light)
  *   高 high             -> High
  *   超高 ultra          -> Max
- *   极致 extreme/max    -> Max   (also the default when the client says nothing)
- *   off/none/disabled   -> Low   (thinking kept, at the minimum bucket)
+ *   极致 extreme/max    -> Max
+ *   off/none/disabled   -> Low   (level 关: zero budget, header Low)
  * English and Chinese spellings are accepted, case-insensitively; anything
  * else is refused (fail-closed, like every other unsupported field).
  * On success fills *level (static Chinese name, for logs) and *effort (the
- * header value to render) and returns true; NULL in/out are tolerated. */
+ * header value to render) and returns true; NULL in/out are tolerated.
+ * A request that sends none of these fields uses level 关, i.e. the same
+ * level as an explicit `none` -- see cwick_thinking_default_level(). */
 bool cwick_thinking_effort_resolve(const char *raw, const char **level,
                                   const char **effort);
+
+/* The level a chat request gets when no reasoning/thinking field was sent.
+ * Static string, never NULL. Kept as a function so the regression test can
+ * assert that the default and an explicit `none` stay identical. */
+const char *cwick_thinking_default_level(void);
 
 /* ---- thinking budget -------------------------------------------------
  * The checkpoint decides when its thought is finished; a client that asked

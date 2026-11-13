@@ -36,6 +36,7 @@
 #include "../src/store.h"
 #include "../src/models.h"
 #include "../src/hub.h"
+#include "../src/q35.h"
 #include "../src/qr.h"
 #include "pfx.h"
 #include "../src/sample.h"
@@ -265,8 +266,8 @@ static void test_contract_and_engine(void) {
         char foreign[1152];
         cwick_path_join(foreign, sizeof(foreign), root, "config-foreign.json");
         const char *fj =
-            "{\"model_type\":\"qwen3_5\",\"pad_token_id\":248055,"
-            "\"text_config\":{\"model_type\":\"qwen3_5_text\","
+            "{\"model_type\":\"mamba9\",\"pad_token_id\":248055,"
+            "\"text_config\":{\"model_type\":\"mamba9_text\","
             "\"pad_token_id\":null,\"dtype\":\"bfloat16\"}}";
         CHECK(cwick_write_file(foreign, fj, strlen(fj)) == 0,
               "contract: a foreign nested config is written");
@@ -275,7 +276,7 @@ static void test_contract_and_engine(void) {
         const char *why = cwick_error_message(&err);
         CHECK(st == CWICK_ERR_UNSUPPORTED &&
               strstr(why, "unsupported model_type") != NULL &&
-              strstr(why, "qwen3_5_text") != NULL,
+              strstr(why, "mamba9_text") != NULL,
               "contract: unknown architecture is refused by name, not by a GLM-only field");
         cwick_model_spec_free(&fspec);
         unlink(foreign);
@@ -1524,10 +1525,12 @@ static void test_models(void) {
           cwick_model_type_supported("deepseek_v41") &&
           cwick_model_type_supported("deepseek_v41_text") &&
           cwick_model_type_supported("minimax_m3_vl") &&
+          cwick_model_type_supported("qwen3_5") &&
+          cwick_model_type_supported("qwen3_5_text") &&
           cwick_model_type_supported("glm_5_3_flash_synthetic") &&
           cwick_model_type_supported("glm-5.3-flash-synthetic-mhc"),
           "compat: every architecture with kernels in this build is accepted");
-    CHECK(!cwick_model_type_supported("qwen3_5_text") &&
+    CHECK(!cwick_model_type_supported("mamba9_text") &&
           !cwick_model_type_supported("llama") &&
           !cwick_model_type_supported(NULL) &&
           !cwick_model_type_supported(""),
@@ -1544,8 +1547,8 @@ static void test_models(void) {
         cwick_mkdir_p(compat);
         snprintf(fcfg, sizeof(fcfg), "%s/config.json", compat);
         const char *fj =
-            "{\"model_type\":\"qwen3_5\",\"pad_token_id\":248055,"
-            "\"text_config\":{\"model_type\":\"qwen3_5_text\","
+            "{\"model_type\":\"mamba9\",\"pad_token_id\":248055,"
+            "\"text_config\":{\"model_type\":\"mamba9_text\","
             "\"pad_token_id\":null}}";
         CHECK(cwick_write_file(fcfg, fj, strlen(fj)) == 0,
               "compat: a foreign nested config is written");
@@ -1553,13 +1556,13 @@ static void test_models(void) {
               "compat: a synthetic checkpoint is switchable");
         CHECK(!cwick_model_root_supported(compat, why, sizeof(why)) &&
               strstr(why, "unsupported model_type") != NULL &&
-              strstr(why, "qwen3_5_text") != NULL,
+              strstr(why, "mamba9_text") != NULL,
               "compat: the inner model_type decides, and the reason names it");
         cwick_model_list fl;
         cwick_models_list_init(&fl);
-        CHECK(cwick_models_list_add(&fl, "qwen3_5", compat) &&
+        CHECK(cwick_models_list_add(&fl, "mamba9", compat) &&
               !fl.v[0].supported &&
-              strstr(fl.v[0].unsupported_reason, "qwen3_5_text") != NULL,
+              strstr(fl.v[0].unsupported_reason, "mamba9_text") != NULL,
               "compat: the catalog entry caches the verdict and its reason");
         cwick_models_list_free(&fl);
     }
@@ -1621,6 +1624,29 @@ static void test_models(void) {
     cwick_models_list_free(&l);
     CHECK(cwick_models_scan_dir("/tmp/cwick-test-no-such-dir", &l) == -1,
           "scan: an unreadable directory reports -1 (does not crash)");
+
+    /* Full residency is a size decision, not a preference. The numbers are the
+     * real ones: 18 GiB of BF16 weights and ~1.8 GiB of KV/DeltaNet state on
+     * this machine's 128 GiB, versus the same policy applied to a 306 GiB
+     * checkpoint that cannot fit. */
+    {
+        const uint64_t gib = 1ull << 30;
+        uint64_t host = 128 * gib, ceiling = (uint64_t)(128.0 * 0.8 * (double)gib);
+        CHECK(q35_resident_wanted(18 * gib, 2 * gib, host, ceiling),
+              "q35: a 20 GiB checkpoint is made resident on a 128 GiB host");
+        CHECK(!q35_resident_wanted(306 * gib, 8 * gib, host, ceiling),
+              "q35: a 306 GiB checkpoint is not (it cannot fit the ceiling)");
+        CHECK(!q35_resident_wanted(60 * gib, 8 * gib, host, ceiling),
+              "q35: more than half of RAM is left to the page cache");
+        CHECK(!q35_resident_wanted(18 * gib, 2 * gib, host, 16 * gib),
+              "q35: a ceiling smaller than the need refuses residency");
+        CHECK(!q35_resident_wanted(18 * gib, 2 * gib, 0, 0),
+              "q35: an unknown host size is a no, not a guess");
+        CHECK(!q35_resident_wanted(0, 0, host, ceiling),
+              "q35: nothing to make resident is a no");
+        CHECK(cwick_safetensors_bytes_under(NULL, NULL) == 0,
+              "residency: a missing checkpoint reports zero bytes");
+    }
     {
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "rm -rf %s", parent);
@@ -2133,6 +2159,122 @@ static void test_tools(void) {
           "a plain answer is untouched");
     free(plain);
     cwick_tool_calls_free(none, nnone);
+
+    /* ---- the nested <function=NAME> / <parameter=KEY> dialect ---- */
+    {
+        const char *q35 =
+            "Sure, I'll write that.\n"
+            "<tool_call>\n"
+            "<function=get_time>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=write_file>\n"
+            "<parameter=path>\nnotes/a.html\n</parameter>\n"
+            "<parameter=content>\nline one\nline two\n</parameter>\n"
+            "<parameter=mode>\n137\n</parameter>\n"
+            "<parameter=meta>\n{\"ok\":true}\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>";
+        cwick_tool_call *qc = NULL;
+        size_t nq = 0;
+        char *qvis = NULL;
+        rc = cwick_tools_extract(q35, &qc, &nq, &qvis, &err);
+        CHECK(rc == 0 && nq == 2,
+              "nested <function=> blocks: zero-arg and four-arg calls parsed");
+        if (rc == 0 && nq == 2) {
+            CHECK(strcmp(qc[0].name, "get_time") == 0 &&
+                  strcmp(qc[0].arguments_json, "{}") == 0,
+                  "zero-argument nested call yields {}");
+            CHECK(strcmp(qc[1].name, "write_file") == 0,
+                  "second nested call name");
+            CHECK(strcmp(qc[1].arguments_json,
+                  "{\"path\":\"notes/a.html\",\"content\":\"line one\\nline two\","
+                  "\"mode\":137,\"meta\":{\"ok\":true}}") == 0,
+                  "nested parameters keep inner newlines, numbers and JSON values");
+        }
+        CHECK(qvis && strstr(qvis, "Sure, I'll write that.") != NULL,
+              "prose before a nested call stays visible");
+        free(qvis);
+        cwick_tool_calls_free(qc, nq);
+    }
+    /* Two <function> blocks may share one <tool_call> wrapper. */
+    {
+        const char *q35 =
+            "<tool_call>\n"
+            "<function=first>\n<parameter=a>\n1\n</parameter>\n</function>\n"
+            "<function=second>\n<parameter=b>\ntwo\n</parameter>\n</function>\n"
+            "</tool_call>";
+        cwick_tool_call *qc = NULL;
+        size_t nq = 0;
+        rc = cwick_tools_extract(q35, &qc, &nq, NULL, &err);
+        CHECK(rc == 0 && nq == 2 &&
+              strcmp(qc[0].name, "first") == 0 &&
+              strcmp(qc[1].name, "second") == 0 &&
+              strcmp(qc[0].arguments_json, "{\"a\":1}") == 0 &&
+              strcmp(qc[1].arguments_json, "{\"b\":\"two\"}") == 0,
+              "two nested functions in one wrapper become two calls");
+        cwick_tool_calls_free(qc, nq);
+    }
+    /* A half-written nested block must still be refused, not silently
+     * turned into a plausible-looking call. */
+    {
+        cwick_tool_call *qc = NULL;
+        size_t nq = 0;
+        rc = cwick_tools_extract("<tool_call>\n<function=get_time>\n",
+                                 &qc, &nq, NULL, &err);
+        CHECK(rc == -1, "unterminated nested function block is refused");
+        cwick_tool_calls_free(qc, nq);
+    }
+    /* The invariant the streaming path depends on: closing a block at a
+     * mid-value position must produce an argument object whose JSON is a
+     * prefix of the final one. That is what lets a value be dribbled out
+     * before its `</parameter>` arrives — every intermediate prefix is a
+     * byte-for-byte prefix of the payload, so a client that concatenates the
+     * deltas cannot end up with anything the buffered path would not have
+     * produced. */
+    {
+        const char *full =
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\nnotes/a.html\n</parameter>\n"
+            "<parameter=body>\nfor i in 1 2 3; do echo line-$i; done\n</parameter>\n"
+            "</function>\n</tool_call>";
+        cwick_tool_call *fc = NULL;
+        size_t nf = 0;
+        rc = cwick_tools_extract(full, &fc, &nf, NULL, &err);
+        CHECK(rc == 0 && nf == 1, "the reference block parses");
+        if (rc == 0 && nf == 1) {
+            const char *final_json = fc[0].arguments_json;
+            /* Same construction the server makes for an in-flight value: the
+             * block truncated inside `body`, then closed synthetically. */
+            const char *mid =
+                "<tool_call>\n<function=write_file>\n"
+                "<parameter=path>\nnotes/a.html\n</parameter>\n"
+                "<parameter=body>\nfor i in 1 2 3; do echo li"
+                "</function>\n</tool_call>";
+            cwick_tool_call *mc = NULL;
+            size_t nm = 0;
+            rc = cwick_tools_extract(mid, &mc, &nm, NULL, &err);
+            CHECK(rc == 0 && nm == 1, "a value truncated mid-string still parses");
+            if (rc == 0 && nm == 1) {
+                char *part = mc[0].arguments_json;
+                size_t plen = strlen(part);
+                /* Drop the closing brace and the closing quote of the value:
+                 * that is exactly what the server emits as the prefix. */
+                if (plen && part[plen - 1] == '}') plen--;
+                if (plen && part[plen - 1] == '"') plen--;
+                CHECK(strncmp(final_json, part, plen) == 0,
+                      "a mid-value prefix is a byte-prefix of the final JSON");
+                CHECK(plen < strlen(final_json),
+                      "the prefix is strictly shorter than the payload");
+                CHECK(strstr((char *)final_json, "notes/a.html") != NULL &&
+                      strstr(part, "\"path\":\"notes/a.html\"") != NULL,
+                      "earlier parameters are already complete in the prefix");
+            }
+            cwick_tool_calls_free(mc, nm);
+        }
+        cwick_tool_calls_free(fc, nf);
+    }
 
     /* ---- the same <tool_call> block as one checkpoint writes it: XML, with a
      * namespace token in front of every structural tag. That token is a single
@@ -2712,6 +2854,58 @@ static void test_prefix_cache_equiv(void) {
         CHECK(ok_evict, "prefix cache: 24 later snapshots do not evict the base prefix");
         cwick_prefix_state_free(&sbase);
         cwick_prefix_state_free(&sturn);
+    }
+
+    /* Growing session at capacity: every turn's snapshot is longer than the
+     * one before, so the entry the store just wrote is always the newest *and*
+     * the longest in the cache. A policy that ranks by length makes exactly
+     * that entry the most evictable, so the store deletes the file it just
+     * wrote and the next turn re-prefills the whole tail. Only never-replayed
+     * entries may be dropped here, and the base prompt -- looked up by every
+     * turn -- has to survive all of it. */
+    if (nids > 5) {
+        const int64_t base_len = nids > 3 ? 3 : 1;
+        cwick_prefix_state sgrow;
+        memset(&sgrow, 0, sizeof(sgrow));
+        capture_at(eng, ids, base_len, &sgrow, &err);
+
+        char gdir[1152];
+        snprintf(gdir, sizeof(gdir), "%s/pfxgrow", root);
+        cwick_pfx_cache *gc = cwick_pfx_open(gdir, 1024);   /* ~1 entry of room */
+        int64_t newest = 0, kept_newest = 0, kept_base = 0;
+        if (gc && sgrow.pos == base_len) {
+            cwick_error ge;
+            cwick_error_clear(&ge);
+            cwick_pfx_store(gc, ids, base_len, &sgrow, &ge);
+            for (int64_t L = base_len + 1; L <= nids; L++) {
+                cwick_prefix_state sg;
+                memset(&sg, 0, sizeof(sg));
+                capture_at(eng, ids, L, &sg, &ge);
+                if (sg.pos == L) cwick_pfx_store(gc, ids, L, &sg, &ge);
+                cwick_prefix_state_free(&sg);
+                newest = L;
+                cwick_pfx_lookup(gc, ids, base_len);  /* every turn starts here */
+            }
+            kept_newest = cwick_pfx_lookup(gc, ids, newest);
+            kept_base = cwick_pfx_lookup(gc, ids, base_len);
+            if (kept_newest != newest) {
+                int64_t ents = 0;
+                uint64_t by = 0;
+                cwick_pfx_stats(gc, &ents, &by);
+                fprintf(stderr, "  grow: newest=%lld lookup=%lld base=%lld "
+                                "entries=%lld bytes=%llu\n",
+                        (long long)newest, (long long)kept_newest,
+                        (long long)kept_base, (long long)ents,
+                        (unsigned long long)by);
+            }
+            cwick_pfx_close(gc);
+        }
+        CHECK(newest > base_len, "prefix cache: growing session stored snapshots");
+        CHECK(kept_newest == newest,
+              "prefix cache: a growing turn's own snapshot survives its store");
+        CHECK(kept_base == base_len,
+              "prefix cache: growing turns keep the base prefix");
+        cwick_prefix_state_free(&sgrow);
     }
 
     cwick_prefix_state_free(&st);
@@ -3365,6 +3559,14 @@ static void test_thinking_effort(void) {
           !cwick_thinking_effort_resolve(NULL, &level, &effort) &&
           !cwick_thinking_effort_resolve("mediumish", &level, &effort),
           "effort: unknown values refused (fail-closed)");
+    /* A body with no reasoning field must behave exactly like `none`:
+     * level 关 (budget 0) and the Low header. An earlier default of 极致
+     * handed plain clients a 32768-token reasoning block. */
+    CHECK(cwick_thinking_effort_resolve("none", &level, &effort) &&
+          strcmp(cwick_thinking_default_level(), level) == 0 &&
+          strcmp(cwick_thinking_default_level(), "关") == 0 &&
+          strcmp(effort, "Low") == 0,
+          "effort: no-field default is 关 (identical to reasoning_effort:none)");
 }
 
 /* ------------------------------------------------------------------ */
@@ -4796,6 +4998,147 @@ static void test_think_budget(void) {
     }
 }
 
+/* The prefix snapshot is the piece of this backend that fails silently: a
+ * wrong length or a wrong stride still "works" and restores garbage, and the
+ * symptom is a slightly worse answer rather than an error. Round-trip it on a
+ * hand-built 4-layer geometry -- one full-attention layer and three DeltaNet
+ * ones -- so both halves of the blob are exercised without an 18 GiB load.
+ *
+ * This is also the regression guard for the bug this function was written
+ * after: cwick_engine_pos() had no q35 branch, so every capture was rejected
+ * with "capture position 74 outside 0..0" and the cache never held anything. */
+/* Zeroed allocation for the hand-built q35 geometry below; the test binary
+ * links only what cwick.h exports, which is the plain malloc wrapper. */
+static void *q35_test_alloc(size_t n, size_t sz) {
+    void *p = cwick_xmalloc(n * sz);
+    memset(p, 0, n * sz);
+    return p;
+}
+
+static void test_q35_prefix(void) {
+    q35_model m;
+    memset(&m, 0, sizeof(m));
+    q35_config *c = &m.cfg;
+    c->dim = 32;
+    c->n_layers = 4;
+    c->n_heads = 2;
+    c->n_kv_heads = 2;
+    c->head_dim = 8;
+    c->rotary_dim = 8;
+    c->inter_dim = 64;
+    c->vocab_size = 128;
+    c->lin_k_heads = 2;
+    c->lin_v_heads = 4;
+    c->lin_k_dim = 4;
+    c->lin_v_dim = 4;
+    c->conv_kernel = 4;
+    c->n_lin_layers = 3;
+    c->n_full_layers = 1;
+    c->max_seq_len = 64;
+    c->is_linear = q35_test_alloc(4, 1);
+    c->is_linear[0] = 1;
+    c->is_linear[1] = 1;
+    c->is_linear[2] = 0;    /* the only full-attention layer */
+    c->is_linear[3] = 1;
+
+    const int kv_row = c->n_kv_heads * c->head_dim;
+    const size_t conv_f = (size_t)(c->conv_kernel - 1) *
+                          (size_t)(2 * c->lin_k_heads * c->lin_k_dim +
+                                   c->lin_v_heads * c->lin_v_dim);
+    const size_t ssm_f = (size_t)c->lin_v_heads * c->lin_k_dim * c->lin_v_dim;
+    const size_t fixed = 3 * (conv_f + ssm_f) * sizeof(float);
+    const size_t per_pos = (size_t)2 * (size_t)kv_row * sizeof(uint16_t);
+
+    /* The cache is f32 (attention runs as GEMMs); the snapshot it packs is
+     * bf16, so the values below are chosen to be exactly representable in both
+     * -- a value that bf16 cannot hold would make a round-trip assertion test
+     * the rounding instead of the layout. */
+    m.kcache = q35_test_alloc(4, sizeof(float *));
+    m.vcache = q35_test_alloc(4, sizeof(float *));
+    m.conv_state = q35_test_alloc(4, sizeof(float *));
+    m.ssm_state = q35_test_alloc(4, sizeof(float *));
+    for (int l = 0; l < 4; l++) {
+        if (c->is_linear[l]) {
+            m.conv_state[l] = q35_test_alloc(conv_f, sizeof(float));
+            m.ssm_state[l] = q35_test_alloc(ssm_f, sizeof(float));
+            for (size_t i = 0; i < conv_f; i++)
+                m.conv_state[l][i] = (float)(100 * l + (int)i);
+            for (size_t i = 0; i < ssm_f; i++)
+                m.ssm_state[l][i] = (float)(1000 * l + (int)i);
+        } else {
+            size_t n = (size_t)c->max_seq_len * (size_t)kv_row;
+            m.kcache[l] = q35_test_alloc(n, sizeof(float));
+            m.vcache[l] = q35_test_alloc(n, sizeof(float));
+            for (size_t i = 0; i < n; i++) {
+                m.kcache[l][i] = (float)((int)i & 255);
+                m.vcache[l][i] = (float)(255 - ((int)i & 255));
+            }
+        }
+    }
+
+    const int64_t pos = 10;
+    CHECK(q35_prefix_bytes(&m, pos) == fixed + (size_t)pos * per_pos,
+          "q35 prefix: the size is the fixed state plus one KV row pair per "
+          "position");
+    CHECK(q35_prefix_bytes(&m, -5) == fixed,
+          "q35 prefix: a negative position is measured as zero");
+    CHECK(q35_prefix_bytes(&m, 1000) == fixed + 64 * per_pos,
+          "q35 prefix: a position past the window clamps to the window");
+
+    const size_t need = q35_prefix_bytes(&m, pos);
+    uint8_t *blob = cwick_xmalloc(need);
+    CHECK(q35_prefix_pack(&m, pos, blob, need) == 0, "q35 prefix: pack");
+    CHECK(q35_prefix_pack(&m, pos, blob, need - 1) == -1,
+          "q35 prefix: pack refuses a buffer that is one byte short");
+
+    /* Overwrite everything, so a restore that copies nothing cannot pass. */
+    for (int l = 0; l < 4; l++) {
+        if (c->is_linear[l]) {
+            memset(m.conv_state[l], 0, conv_f * sizeof(float));
+            memset(m.ssm_state[l], 0, ssm_f * sizeof(float));
+        } else {
+            size_t n = (size_t)c->max_seq_len * (size_t)kv_row;
+            memset(m.kcache[l], 0, n * sizeof(float));
+            memset(m.vcache[l], 0, n * sizeof(float));
+        }
+    }
+    int64_t got = -1;
+    CHECK(q35_prefix_apply(&m, blob, need, 0, &got) == 0 && got == pos,
+          "q35 prefix: apply recovers the position from the blob length");
+    CHECK(m.kcache[2][5] == 5.0f && m.vcache[2][3] == 252.0f,
+          "q35 prefix: KV rows land back at their own offsets");
+    CHECK(m.ssm_state[1][7] == 1007 && m.conv_state[3][2] == 302,
+          "q35 prefix: the DeltaNet recurrence state round-trips");
+
+    /* A whole-prompt hit re-runs the last position, so the caller asks for one
+     * row fewer than the blob holds; the copy must stop there and leave the
+     * rest of the cache alone. */
+    size_t n2 = (size_t)c->max_seq_len * (size_t)kv_row;
+    memset(m.kcache[2], 0, n2 * sizeof(float));
+    CHECK(q35_prefix_apply(&m, blob, need, 4, &got) == 0 && got == 4,
+          "q35 prefix: a truncated apply restores exactly `want` positions");
+    CHECK(m.kcache[2][3] == 3.0f && m.kcache[2][4 * kv_row] == 0.0f,
+          "q35 prefix: truncation stops at `want` rows, not at the blob's end");
+
+    CHECK(q35_prefix_apply(&m, blob, need - 1, 0, &got) == -1,
+          "q35 prefix: a blob that is not a whole number of rows is refused");
+    CHECK(q35_prefix_apply(&m, blob, 8, 0, &got) == -1,
+          "q35 prefix: a blob shorter than the fixed state is refused");
+
+    for (int l = 0; l < 4; l++) {
+        free(m.kcache[l]);
+        free(m.vcache[l]);
+        free(m.conv_state[l]);
+        free(m.ssm_state[l]);
+    }
+    free(m.kcache);
+    free(m.vcache);
+    free(m.conv_state);
+    free(m.ssm_state);
+    free(c->is_linear);
+    free(blob);
+}
+
 int main(void) {
     printf("cwick verification suite\n");
     test_bf16();
@@ -4831,6 +5174,7 @@ int main(void) {
     test_phase_account();
     test_thinking_effort();
     test_models();
+    test_q35_prefix();
     test_logcap();
     test_server_control();
     test_webui();

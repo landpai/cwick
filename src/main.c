@@ -277,8 +277,11 @@ static void select_backend(int backend) {
  * say so once at startup and keep every payload truncated. */
 static void trace_privacy_notice(void) {
     CWICK_INFO("init", "--trace is ON: prompts, outputs and tool calls are "
-                      "printed to stdout (truncated, never persisted) — do "
-                      "not enable it on a shared or logged terminal");
+                      "printed to stdout (truncated). cwick writes no log file "
+                      "of its own, but stdout usually is one -- start.sh tees "
+                      "it into ./logs/cwick-serve.log -- so treat everything "
+                      "this prints as written to disk, and do not enable it on "
+                      "a shared host");
 }
 
 /* `ran` reports whether the engine actually came up, so the caller only claims
@@ -1125,11 +1128,14 @@ static void usage(void) {
            "  cwick doctor --root DIR [--deep] [--expert-sample N]\n"
            "\n"
            "compute backend:\n"
-           "  --backend metal                  offload expert GEMV to Metal GPU\n"
+           "  --backend metal                  run the GPU decode path\n"
            "  --backend cpu                    force the CPU fallback\n"
            "  Metal is the default on Apple Silicon; CWICK_METAL=1 also enables it\n"
+           "  For Qwen3.5 the GPU takes the whole decode step (32 layers in one\n"
+           "  command buffer, 20 tok/s against 7 on the CPU pool); set\n"
+           "  CWICK_Q35_GPU=0 to keep the CPU pool for that model.\n"
            "  If no usable Metal device is found, cwick prints a warning to\n"
-           "  stderr and runs the CPU GEMV instead: identical output, slower\n"
+           "  stderr and runs the CPU kernels instead: identical output, slower\n"
            "  decode. A GPU is never allowed to break a generation.\n"
            "\n"
            "web UI:\n"

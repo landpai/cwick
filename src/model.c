@@ -503,6 +503,138 @@ static cwick_status mm_spec_fill(json_value *root, json_value *cfg,
     return CWICK_OK;
 }
 
+/* Qwen3.5 text geometry. Every field here is read because the loader and the
+ * budget code need it; the layer mix is recorded so a caller can tell how many
+ * layers keep a KV cache and how many keep a recurrence state instead. */
+static cwick_status q35_spec_fill(json_value *root, json_value *cfg,
+                                  const char *dir, cwick_model_spec *spec,
+                                  cwick_error *err) {
+    spec->quant = CWICK_QUANT_BF16;   /* BF16 on disk, decoded by q35_model.c */
+    snprintf(spec->dtype, sizeof(spec->dtype), "bfloat16");
+
+#define QREQ(name, field) do { \
+    int64_t v_ = ds_int(cfg, root, name, -1); \
+    if (v_ < 0) { \
+        cwick_error_set(err, CWICK_ERR_CONTRACT, \
+                        "qwen3_5 config is missing/invalid %s", name); \
+        return CWICK_ERR_CONTRACT; \
+    } \
+    spec->field = v_; \
+} while (0)
+
+    QREQ("hidden_size", hidden_size);
+    QREQ("num_hidden_layers", num_hidden_layers);
+    QREQ("vocab_size", vocab_size);
+    QREQ("max_position_embeddings", max_position_embeddings);
+    QREQ("num_attention_heads", num_attention_heads);
+    QREQ("num_key_value_heads", num_key_value_heads);
+    QREQ("intermediate_size", intermediate_size);
+#undef QREQ
+
+    spec->head_dim = (int)ds_int(cfg, root, "head_dim", 0);
+    if (spec->head_dim <= 0)
+        spec->head_dim = spec->hidden_size / spec->num_attention_heads;
+    spec->qk_head_dim = spec->head_dim;
+    {
+        /* partial_rotary_factor 0.25: only the first quarter of each head
+         * turns, the rest passes through. */
+        int rot = spec->head_dim;
+        json_value *rp = cwick_json_get(cfg, "rope_parameters");
+        if (rp && rp->kind == JSON_OBJECT) {
+            double prf = cwick_json_num(
+                cwick_json_get(rp, "partial_rotary_factor"), 1.0);
+            rot = (int)((double)spec->head_dim * prf);
+        }
+        if (rot <= 0 || rot > spec->head_dim) rot = spec->head_dim;
+        if (rot % 2) rot--;
+        spec->qk_rope_head_dim = rot;
+    }
+    spec->qk_nope_head_dim = spec->head_dim - spec->qk_rope_head_dim;
+    spec->value_head_dim = spec->head_dim;
+    spec->kv_lora_rank = 0;           /* plain GQA cache, no MLA latent */
+    spec->moe_intermediate_size = spec->intermediate_size;
+    spec->num_experts = 0;            /* dense: every layer runs the same MLP */
+    spec->num_experts_per_token = 0;
+    spec->num_shared_experts = 0;
+    spec->rms_norm_eps_f = (float)ds_num(cfg, root, "rms_norm_eps", 1e-6);
+    spec->rms_norm_eps = (int64_t)spec->rms_norm_eps_f;
+    spec->n_dense_layers = spec->num_hidden_layers;
+    spec->n_sparse_layers = 0;
+
+    /* The layer mix: a linear-attention layer here is a short-convolution
+     * recurrence (CWICK_LAYER_KDA is the closest existing kind), the rest are
+     * full attention. */
+    spec->layers = cwick_xmalloc((size_t)spec->num_hidden_layers *
+                                 sizeof(cwick_layer_kind));
+    spec->mlp_dense = cwick_xmalloc((size_t)spec->num_hidden_layers *
+                                    sizeof(bool));
+    {
+        json_value *lt = cwick_json_get(cfg, "layer_types");
+        int64_t interval = ds_int(cfg, root, "full_attention_interval", 4);
+        if (interval < 1) interval = 4;
+        int64_t lin = 0;
+        for (int64_t i = 0; i < spec->num_hidden_layers; i++) {
+            bool is_lin;
+            if (lt && lt->kind == JSON_ARRAY && (int64_t)lt->count ==
+                spec->num_hidden_layers) {
+                const char *s = cwick_json_str(cwick_json_array_at(lt, i));
+                is_lin = s && strstr(s, "linear") != NULL;
+            } else {
+                is_lin = ((i + 1) % interval) != 0;
+            }
+            spec->layers[i] = is_lin ? CWICK_LAYER_KDA : CWICK_LAYER_MLA;
+            spec->mlp_dense[i] = true;
+            if (is_lin) lin++;
+        }
+        spec->kda_layers = lin;
+        spec->mla_layers = spec->num_hidden_layers - lin;
+        spec->dsa_layers = 0;
+        spec->first_k_dense_replace = spec->num_hidden_layers;
+    }
+
+    /* eos/bos: the config first, generation_config.json second (that file is
+     * where this checkpoint repeats both). */
+    int64_t eos = ds_int(cfg, root, "eos_token_id", -1);
+    int64_t bos = ds_int(cfg, root, "bos_token_id", -1);
+    int64_t pad = ds_int(cfg, root, "pad_token_id", -1);
+    {
+        char gp[1152];
+        cwick_path_join(gp, sizeof(gp), dir, "generation_config.json");
+        char *text = NULL;
+        size_t len = 0;
+        if (cwick_read_file(gp, &text, &len) == 0) {
+            cwick_error jerr;
+            cwick_error_clear(&jerr);
+            json_value *g = cwick_json_parse(text, len, &jerr);
+            if (g) {
+                if (eos < 0)
+                    eos = cwick_json_int(cwick_json_get(g, "eos_token_id"), -1);
+                if (bos < 0)
+                    bos = cwick_json_int(cwick_json_get(g, "bos_token_id"), -1);
+                if (pad < 0)
+                    pad = cwick_json_int(cwick_json_get(g, "pad_token_id"), -1);
+                cwick_json_free(g);
+            }
+            free(text);
+        }
+    }
+    if (eos < 0) {
+        cwick_error_set(err, CWICK_ERR_CONTRACT,
+                        "qwen3_5 config is missing eos_token_id");
+        return CWICK_ERR_CONTRACT;
+    }
+    spec->eos_token_id = eos;
+    spec->bos_token_id = bos < 0 ? eos : bos;
+    spec->pad_token_id = pad < 0 ? eos : pad;
+    /* A turn ends on <|im_end|> as well as on the generation_config eos:
+     * the chat template closes every turn with the former, and stopping only
+     * on the latter lets the model keep writing the next turn. */
+    spec->n_eos = 0;
+    spec->eos_ids[spec->n_eos++] = eos;
+    spec->eos_ids[spec->n_eos++] = 248046;   /* <|im_end|> */
+    return CWICK_OK;
+}
+
 cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
                                  cwick_error *err) {
     cwick_error_clear(err);
@@ -539,7 +671,8 @@ cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
     if (!cwick_model_type_supported(model_type)) {
         cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
                         "unsupported model_type \"%s\": this build implements the "
-                        "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 kernels only; "
+                        "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 "
+                        "kernels only; "
                         "downloading a checkpoint does not make it loadable",
                         model_type);
         cwick_json_free(root);
@@ -549,6 +682,17 @@ cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
     if (strcmp(model_type, "deepseek_v41") == 0 ||
         strcmp(model_type, "deepseek_v41_text") == 0) {
         cwick_status st = ds_spec_fill(root, cfg, spec, err);
+        cwick_json_free(root);
+        return st;
+    }
+    if (strncmp(model_type, "qwen3_5", 7) == 0) {
+        /* The directory: generation_config.json sits beside the config and is
+         * one of the two places this checkpoint states its stop set. */
+        char dir[1152];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *slash = strrchr(dir, '/');
+        if (slash) *slash = '\0';
+        cwick_status st = q35_spec_fill(root, cfg, dir, spec, err);
         cwick_json_free(root);
         return st;
     }

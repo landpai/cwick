@@ -27,6 +27,11 @@ OpenAI API.
   content blocks in, a `message` object (or `message_start … message_stop`
   events) out. Same engine and the same adapter rule; see **Messages API**
   below.
+  Paths are matched after the query string is stripped, so the `?beta=true`
+  the Anthropic client appends to every call is harmless, and a repeated
+  `/v1/v1/` prefix is collapsed — a base URL that already ends in `/v1` is
+  served instead of answered with `404 unknown endpoint`. The access log and
+  the `--trace` line still print the path exactly as it arrived.
 - `GET /v1/metrics` (and `/metrics`) — Prometheus text, vLLM naming.
   `cwick:model_loaded` (1/0) is the live residency bit; `cwick:model_info`
   keeps the labels of the last successfully loaded checkpoint.
@@ -82,6 +87,10 @@ anything is generating.
 
 - One generated answer per request (`n` and `best_of`, if present, must be `1`).
 - `max_tokens` or `max_completion_tokens` to cap the answer.
+- If none of `reasoning_effort` / `thinking` / `reasoning` / `enable_thinking`
+  is present, the level defaults to **关** — the same as an explicit
+  `reasoning_effort:"none"`. An absent field used to mean 极致 (32768 tokens
+  of reasoning); see DECISIONS §55. Any explicit spelling still wins.
 - Streaming via server-sent events, including `stream_options.include_usage`.
 - `model` — when present, must be the model this server advertises (the
   config's `model_type`).
@@ -359,10 +368,41 @@ following XML format:
 <tool_call>{function-name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
 ```
 
-and read back out of the raw completion by `src/tools.c`. An answer containing
-well-formed `<tool_call>` blocks is returned as `message.tool_calls[]` with
-`finish_reason: "tool_calls"` (streaming clients get `delta.tool_calls`); the
-prose before the first block stays in `content`.
+A second template nests `<function=NAME>` / `<parameter=KEY>VALUE</parameter>`
+inside the same wrapper; `src/tools.c` rewrites it into the flat grammar above,
+so one parser covers every checkpoint. An answer containing well-formed
+`<tool_call>` blocks is returned as `message.tool_calls[]` with
+`finish_reason: "tool_calls"`; the prose before the first block stays in
+`content`.
+
+**Streaming tool calls (DECISIONS §58).** A streaming turn no longer stays
+silent while the call is being written. As soon as the model writes the
+function name, each dialect opens the call with an empty `arguments` and then
+appends argument shards as parameters close; concatenating them yields exactly
+the object in the final payload.
+
+| dialect | opening frame | argument shards |
+|---|---|---|
+| chat | `delta.tool_calls[0]` with `id` / `type` / `function.name` | `delta.tool_calls[0].function.arguments` |
+| responses | `response.output_item.added` (`function_call`) | `response.function_call_arguments.delta` |
+| messages | `content_block_start` (`tool_use`) | `content_block_delta` (`input_json_delta`) |
+
+`delta.cwick_tool` is still emitted for the bundled console. Shards are
+produced by feeding a closed prefix of the in-flight block to the same
+`cwick_tools_extract()` the buffered path uses, so the wire bytes and the final
+object cannot disagree; at the finish the two are reconciled. Only the first
+call is streamed (further calls arrive whole), and a block in another dialect
+falls back to the end-of-turn form unchanged.
+
+Shards land **inside** a parameter value too (DECISIONS §59): an agent's tool
+call is usually one long parameter — a shell script, a file body — and sharding
+only at `</parameter>` left that entire value arriving in the last frame. A
+value is streamed once it is certain to be a JSON string (not `{ [ " -` or a
+digit, and not still a prefix of `true`/`false`/`null`), in steps of 12 bytes,
+with trailing whitespace, an unfinished `</parameter>` and half a UTF-8
+character held back. Numeric, boolean and object values therefore still arrive
+whole, and every intermediate prefix remains a byte-prefix of the final
+`arguments`, so a concatenating client cannot disagree with a buffered one.
 
 Nothing constrains decoding, so the failure modes are handled rather than
 hoped away:

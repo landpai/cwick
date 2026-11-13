@@ -37,12 +37,15 @@ static void sb_need(strbuf *b, size_t extra) {
     b->p = cwick_xrealloc(b->p, b->cap);
 }
 
-static void sb_put(strbuf *b, const char *s) {
-    size_t n = strlen(s);
+static void sb_putn(strbuf *b, const char *s, size_t n) {
     sb_need(b, n);
     memcpy(b->p + b->len, s, n);
     b->len += n;
     b->p[b->len] = '\0';
+}
+
+static void sb_put(strbuf *b, const char *s) {
+    sb_putn(b, s, strlen(s));
 }
 
 static void sb_putc(strbuf *b, char c) {
@@ -548,6 +551,95 @@ static char *strip_ns_all(const char *text) {
     return sb_take(&b);
 }
 
+/* A second checkpoint keeps the <tool_call> wrapper but names the function and
+ * its arguments with <function=NAME> / <parameter=KEY>VALUE</parameter>:
+ *
+ *   <tool_call>
+ *   <function=write_file>
+ *   <parameter=path>
+ *   a/b.html
+ *   </parameter>
+ *   </function>
+ *   </tool_call>
+ *
+ * Rewrite that into the flat <arg_key>/<arg_value> grammar extract_impl already
+ * reads, so there is still one parser and one set of edge cases. NULL means
+ * "not this dialect" — including a half-written block, which must reach the
+ * extractor unchanged so it can refuse the turn instead of silently dropping
+ * part of a call. */
+static char *translate_function(const char *text) {
+    static const char f_open[]  = "<function=";
+    static const char f_close[] = "</function>";
+    static const char p_open[]  = "<parameter=";
+    static const char p_close[] = "</parameter>";
+
+    if (!strstr(text, f_open)) return NULL;
+    /* A text that already uses the flat grammar belongs to the other dialect;
+     * do not splice the two together. */
+    if (strstr(text, CWICK_ARG_KEY_OPEN)) return NULL;
+
+    const char *probe = text;
+    while ((probe = strstr(probe, f_open)) != NULL) {
+        const char *e = strstr(probe, f_close);
+        if (!e) return NULL;                 /* fail-closed */
+        probe = e + sizeof(f_close) - 1;
+    }
+
+    strbuf b;
+    sb_init(&b);
+    const char *p = text;
+    while (*p) {
+        if (strncmp(p, CWICK_TOOL_CALL_OPEN, strlen(CWICK_TOOL_CALL_OPEN)) == 0) {
+            p += strlen(CWICK_TOOL_CALL_OPEN);     /* outer framing */
+            continue;
+        }
+        if (strncmp(p, CWICK_TOOL_CALL_CLOSE, strlen(CWICK_TOOL_CALL_CLOSE)) == 0) {
+            p += strlen(CWICK_TOOL_CALL_CLOSE);
+            continue;
+        }
+        if (strncmp(p, f_open, sizeof(f_open) - 1) != 0) {
+            sb_putc(&b, *p++);                    /* prose before/after calls */
+            continue;
+        }
+        const char *nm = p + sizeof(f_open) - 1;
+        const char *nm_end = strchr(nm, '>');
+        const char *body_end = strstr(nm, f_close);
+        if (!nm_end || !body_end || nm_end >= body_end) {
+            free(b.p);
+            return NULL;
+        }
+        sb_put(&b, CWICK_TOOL_CALL_OPEN);
+        sb_putn(&b, nm, (size_t)(nm_end - nm));
+        const char *q = nm_end + 1;
+        while (q < body_end) {
+            if (strncmp(q, p_open, sizeof(p_open) - 1) != 0) { q++; continue; }
+            const char *key = q + sizeof(p_open) - 1;
+            const char *key_end = strchr(key, '>');
+            const char *val_end = strstr(key, p_close);
+            if (!key_end || key_end >= body_end) { q++; continue; }
+            if (val_end && val_end > body_end) val_end = NULL;
+            const char *v0 = key_end + 1;
+            const char *v1 = val_end ? val_end : body_end;
+            /* The template puts newlines around a value; they are framing,
+             * not part of the parameter. Inner newlines are kept. */
+            while (v0 < v1 && (*v0 == '\n' || *v0 == '\r' ||
+                               *v0 == ' ' || *v0 == '\t')) v0++;
+            while (v1 > v0 && (v1[-1] == '\n' || v1[-1] == '\r' ||
+                               v1[-1] == ' ' || v1[-1] == '\t')) v1--;
+            sb_put(&b, CWICK_ARG_KEY_OPEN);
+            sb_putn(&b, key, (size_t)(key_end - key));
+            sb_put(&b, CWICK_ARG_KEY_CLOSE);
+            sb_put(&b, CWICK_ARG_VAL_OPEN);
+            sb_putn(&b, v0, (size_t)(v1 - v0));
+            sb_put(&b, CWICK_ARG_VAL_CLOSE);
+            q = val_end ? val_end + sizeof(p_close) - 1 : body_end;
+        }
+        sb_put(&b, CWICK_TOOL_CALL_CLOSE);
+        p = body_end + sizeof(f_close) - 1;
+    }
+    return sb_take(&b);
+}
+
 static int extract_impl(const char *text, cwick_tool_call **calls, size_t *n,
                         char **visible, cwick_error *err);
 
@@ -568,7 +660,10 @@ int cwick_tools_extract(const char *text, cwick_tool_call **calls, size_t *n,
     const char *base = clean ? clean : text;
 
     char *tr = translate_invoke(base);
-    int rc = extract_impl(tr ? tr : base, calls, n, visible, err);
+    const char *after_invoke = tr ? tr : base;
+    char *tf = translate_function(after_invoke);
+    int rc = extract_impl(tf ? tf : after_invoke, calls, n, visible, err);
+    free(tf);
     free(tr);
     free(clean);
     return rc;

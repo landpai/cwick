@@ -29,6 +29,7 @@
 #include "json.h"
 #include "log.h"
 #include "mm_prompt.h"
+#include "q35_prompt.h"
 #include "models.h"
 #include "tools.h"
 #include "util.h"
@@ -447,12 +448,15 @@ static char *render_user(const jev_req *r, const jev_q *q) {
  * `<|assistant|>` gets a working readout, and one that speaks something else
  * fails inside the encoder with a tokenizer error the caller can act on
  * instead of being refused by this endpoint for a name it did not choose. */
-typedef enum { JEV_FAMILY_GLM = 0, JEV_FAMILY_DS = 1, JEV_FAMILY_MM = 2 } jev_family;
+typedef enum {
+    JEV_FAMILY_GLM = 0, JEV_FAMILY_DS = 1, JEV_FAMILY_MM = 2, JEV_FAMILY_Q35 = 3
+} jev_family;
 
 static jev_family family_of(const cwick_model_spec *spec) {
     const char *t = spec && spec->model_type[0] ? spec->model_type : "";
     if (strncasecmp(t, "deepseek", 8) == 0) return JEV_FAMILY_DS;
     if (strncasecmp(t, "minimax", 7) == 0) return JEV_FAMILY_MM;
+    if (strncasecmp(t, "qwen3_5", 7) == 0) return JEV_FAMILY_Q35;
     return JEV_FAMILY_GLM;
 }
 
@@ -460,6 +464,7 @@ const char *jev_family_name(const cwick_model_spec *spec) {
     switch (family_of(spec)) {
     case JEV_FAMILY_DS: return "deepseek";
     case JEV_FAMILY_MM: return "minimax";
+    case JEV_FAMILY_Q35: return "qwen3_5";
     default: return "glm";
     }
 }
@@ -480,6 +485,11 @@ void jev_adapter_default(const cwick_model_spec *spec, jev_adapter *out) {
         break;
     case JEV_FAMILY_MM:
         out->prompt = "minimax-chat-plain";
+        break;
+    case JEV_FAMILY_Q35:
+        /* q35_prompt_encode(thinking=false) writes `<think>\n\n</think>\n\n`
+         * after the assistant header, so the answer is the next token. */
+        out->prompt = "qwen3.5-chat-closed";
         break;
     default:
         /* render_chat(..., answer_at_once=true): `<|assistant|><think></think>`. */
@@ -512,7 +522,8 @@ static cwick_status encode_prompt(const cwick_tokenizer *tok,
                                   uint32_t **ids, int64_t *n, cwick_error *err) {
     switch (family_of(spec)) {
     case JEV_FAMILY_DS:
-    case JEV_FAMILY_MM: {
+    case JEV_FAMILY_MM:
+    case JEV_FAMILY_Q35: {
         json_value *msgs = messages_json(system, user, err);
         if (!msgs) return CWICK_ERR_PARSE;
         char *text = NULL;
@@ -525,10 +536,17 @@ static cwick_status encode_prompt(const cwick_tokenizer *tok,
             o.thinking = DS_THINKING_CHAT;
             text = ds_prompt_encode(msgs, NULL, &o, NULL, err);
         } else {
-            mm_prompt_opts o;
-            mm_prompt_opts_default(&o);
-            o.thinking = false;
-            text = mm_prompt_encode(msgs, NULL, &o, NULL, err);
+            if (family_of(spec) == JEV_FAMILY_Q35) {
+                q35_prompt_opts o;
+                q35_prompt_opts_default(&o);
+                o.thinking = false;
+                text = q35_prompt_encode(msgs, NULL, &o, NULL, err);
+            } else {
+                mm_prompt_opts o;
+                mm_prompt_opts_default(&o);
+                o.thinking = false;
+                text = mm_prompt_encode(msgs, NULL, &o, NULL, err);
+            }
         }
         cwick_json_free(msgs);
         if (!text) return CWICK_ERR_PARSE;

@@ -27,6 +27,7 @@
 #include "cwick.h"
 #include "ds_prompt.h"
 #include "mm_prompt.h"
+#include "q35_prompt.h"
 #include "json.h"
 #include "sample.h"
 #include "tools.h"
@@ -644,6 +645,15 @@ static const think_level THINK_LEVELS[] = {
 };
 #define THINK_LEVEL_N (sizeof(THINK_LEVELS) / sizeof(THINK_LEVELS[0]))
 
+/* What a request gets when it sends no reasoning/thinking field at all.
+ * Kept beside the ladder rather than inside the parser, so the renderers,
+ * the log fallback and the regression test all read the same value. A
+ * default is an ordinary level, not an "unset" sentinel: handing the
+ * renderers a sentinel used to leave each template to open a reasoning
+ * block while the engine was told to close it immediately. */
+#define CWICK_THINK_DEFAULT_LEVEL  "关"
+#define CWICK_THINK_DEFAULT_EFFORT "Low"
+
 static const think_level *think_level_find(const char *level) {
     if (!level) return NULL;
     for (size_t i = 0; i < THINK_LEVEL_N; i++)
@@ -706,6 +716,12 @@ bool cwick_thinking_effort_resolve(const char *raw, const char **level,
     return false;
 }
 
+/* The no-field default must stay equal to an explicit `none`. Exposed for
+ * the regression test so the two paths cannot silently diverge again. */
+const char *cwick_thinking_default_level(void) {
+    return CWICK_THINK_DEFAULT_LEVEL;
+}
+
 static const cwick_model_entry *resident_entry(server_ctx *srv);
 static const char *resident_served_name(server_ctx *srv);
 
@@ -733,6 +749,24 @@ static int64_t think_budget_effective(const char *level) {
     long long n = strtoll(v, &end, 10);
     if (end == v) return from_level;   /* not a number: keep the level */
     return (int64_t)n;
+}
+
+/* Whether a reasoning marker sits in the last few prompt tokens. Most
+ * templates end with the marker itself, so the last token answers it. Two
+ * templates instead end with the newlines that follow it (`<think>\n` or
+ * `</think>\n\n`), and there the marker is the last *non-whitespace* token --
+ * hence a small window rather than an exact test. The window is only used for
+ * those two families, because for the others a stray marker near the end of a
+ * user message would be read as part of the template. Used for both the
+ * opening and the closing marker. */
+static bool prompt_token_near_end(const uint32_t *ids, int64_t nids,
+                                  int64_t marker_id, int window) {
+    if (!ids || marker_id < 0 || nids <= 0) return false;
+    int64_t start = nids - window;
+    if (start < 0) start = 0;
+    for (int64_t i = nids - 1; i >= start; i--)
+        if ((int64_t)ids[i] == marker_id) return true;
+    return false;
 }
 
 /* Probe the two markers once per loaded tokenizer. They have to be single
@@ -1112,8 +1146,14 @@ static int validate_body(json_value *root, gen_request *gr, char *errbuf,
          * (低/中/高/超高/极致, plus 关), which map onto the three headers
          * the template was trained with — see cwick_thinking_effort_resolve.
          * Precedence: reasoning_effort > thinking > reasoning > enable_thinking.
-         * An unknown spelling is a 400, never a silent clamp. */
-        const char *level = "极致", *effort = "Max";
+         * An unknown spelling is a 400, never a silent clamp.
+         * A body with none of these fields defaults to 关: a client that
+         * never heard of the knob gets an answer, not a 32768-token
+         * reasoning block. The default is a real level and reaches the
+         * renderers, so the prompt and the engine agree on whether a
+         * block is opened. */
+        const char *level = CWICK_THINK_DEFAULT_LEVEL;
+        const char *effort = CWICK_THINK_DEFAULT_EFFORT;
         bool from_client = false;
         json_value *re = cwick_json_get(root, "reasoning_effort");
         if (re && re->kind == JSON_STRING) {
@@ -1196,8 +1236,9 @@ static int validate_body(json_value *root, gen_request *gr, char *errbuf,
     if (gr->is_chat)
         CWICK_INFO(req_tag(gr->rid), "stream=%s thinking=%s (effort=%s%s)",
                   gr->stream ? "true" : "false",
-                  gr->effort_level ? gr->effort_level : "极致",
-                  gr->reasoning_effort ? gr->reasoning_effort : "Max",
+                  gr->effort_level ? gr->effort_level : CWICK_THINK_DEFAULT_LEVEL,
+                  gr->reasoning_effort ? gr->reasoning_effort
+                                       : CWICK_THINK_DEFAULT_EFFORT,
                   gr->effort_defaulted ? ", default" : "");
     else
         CWICK_INFO(req_tag(gr->rid),
@@ -2590,13 +2631,17 @@ static int64_t query_int(const char *path, const char *key, int64_t dflt) {
     return neg ? -out : out;
 }
 
-/* OpenAI `tool_calls` array for a set of parsed calls. */
-static char *tool_calls_json(const cwick_tool_call *calls, size_t n) {
+/* OpenAI `tool_calls` array for a set of parsed calls. With `empty_first` the
+ * first call's arguments are left empty: those bytes were already pushed as
+ * streaming deltas, and a client concatenates them onto this field. */
+static char *tool_calls_json(const cwick_tool_call *calls, size_t n,
+                             bool empty_first) {
     if (!calls || n == 0) return NULL;
     char *joined = srv_asprintf("[");
     for (size_t i = 0; i < n; i++) {
-        char *args = cwick_json_stringify(calls[i].arguments_json ?
-                                         calls[i].arguments_json : "{}");
+        const char *raw = (empty_first && i == 0) ? ""
+                         : (calls[i].arguments_json ? calls[i].arguments_json : "{}");
+        char *args = cwick_json_stringify(raw);
         char *name = cwick_json_stringify(calls[i].name);
         char *next = srv_asprintf("%s%s{\"id\":\"%s\",\"type\":\"function\","
                                  "\"function\":{\"name\":%s,\"arguments\":%s}}",
@@ -2733,10 +2778,16 @@ static void phase_trk_observe(phase_trk *pt, const cwick_stream_state *st,
                               int64_t gen_index) {
     const char *ph = phase_label(st);
     if (ph == pt->phase) return;
-    if (pt->phase)
-        CWICK_INFO(pt->tag, "decode phase: %s -> %s after %lld tokens (%.1fs)",
-                  pt->phase, ph, (long long)(gen_index - pt->first_tok),
-                  (now_ms() - pt->t0_ms) / 1000.0);
+    if (pt->phase) {
+        /* Close out the previous phase with its own rate: the transition is
+         * the only place that knows how many tokens that phase cost, and a
+         * long tool argument is otherwise indistinguishable from a hang. */
+        double secs = (now_ms() - pt->t0_ms) / 1000.0;
+        int64_t ntok = gen_index - pt->first_tok;
+        CWICK_INFO(pt->tag, "decode phase: %s -> %s after %lld tokens "
+                   "(%.1fs, %.2f tok/s)", pt->phase, ph, (long long)ntok,
+                   secs, secs > 0.0 ? (double)ntok / secs : 0.0);
+    }
     else
         CWICK_INFO(pt->tag, "decode phase: %s at token %lld", ph,
                   (long long)gen_index);
@@ -2873,11 +2924,32 @@ typedef struct {
     int msg_index;                  /* next content_block index */
     int msg_think_idx;              /* -1 when no thinking block is open */
     int msg_text_idx;               /* -1 when no text block is open */
+
+    /* ---- standard tool-call progress (all three dialects) ------------
+     * `cwick_tool` is a private field only the bundled console reads. A
+     * protocol-aware client needs the call to be *opened* while the model is
+     * still writing it, and it needs the arguments in that dialect's own
+     * delta field. These fields track the one call whose arguments are
+     * dribbled out; further calls still arrive whole at the finish. */
+    bool tool_std_on;               /* in-flight block is the nested dialect */
+    bool tool_std_open;             /* opening frame already on the wire */
+    bool tool_std_closed;           /* first call settled at the finish */
+    char tool_std_id[80];
+    char tool_std_name[192];
+    int  tool_std_msg_idx;          /* Messages content_block index used */
+    int  tool_std_resp_idx;         /* Responses output_index used */
+    size_t tool_std_begin;          /* raw offset of the tool block */
+    size_t tool_std_params;         /* completed <parameter=> pairs seen */
+    size_t tool_std_val_len;        /* value bytes at the last in-flight scan */
+    char *tool_std_prefix;          /* argument-json bytes already emitted */
+    size_t tool_std_sent;           /* strlen(tool_std_prefix) */
 } stream_ctx;
 
 static void stream_ctx_free(stream_ctx *sc) {
     free(sc->raw);
     sc->raw = NULL;
+    free(sc->tool_std_prefix);
+    sc->tool_std_prefix = NULL;
     free(sc->resp_reason.p);
     sc->resp_reason.p = NULL;
     free(sc->resp_text.p);
@@ -3358,13 +3430,323 @@ bool cwick_stream_segment(const char *raw, size_t raw_len, bool final,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Standard tool-call deltas                                           */
+/* ------------------------------------------------------------------ */
+/* `cwick_tool` is a private field only the bundled console reads. A client
+ * that speaks one of the three public dialects needs the call *opened* while
+ * the model is still writing it, and it needs the arguments in that dialect's
+ * own delta field. The opening frame carries an empty `arguments`; every
+ * later frame appends to it, and the finish appends the rest. Concatenating
+ * the deltas therefore yields exactly the object in the final payload.
+ *
+ * Only the first call is dribbled out. If the model writes more, the rest
+ * arrive whole at the finish, which is also the fallback whenever the block
+ * is not in the nested <function=NAME> dialect. */
+
+static void tool_std_open_frame(stream_ctx *sc) {
+    if (sc->dead || sc->tool_std_open) return;
+    sc->tool_std_open = true;
+    char *jid = cwick_json_stringify(sc->tool_std_id);
+    char *jname = cwick_json_stringify(sc->tool_std_name);
+    char fid[96];
+    snprintf(fid, sizeof(fid), "%s-fc0", sc->idbuf);
+    char *json;
+
+    if (sc->gr->api == SRV_API_RESPONSES) {
+        /* Output items are sequential, so the text item has to close first. */
+        resp_close_reason(sc);
+        resp_close_text(sc);
+        sc->tool_std_resp_idx = sc->resp_index;
+        json = srv_asprintf(
+            "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
+            "\"item\":{\"id\":\"%s\",\"type\":\"function_call\","
+            "\"status\":\"in_progress\",\"call_id\":%s,\"name\":%s,"
+            "\"arguments\":\"\"}}",
+            sc->tool_std_resp_idx, fid, jid, jname);
+        resp_sse(sc, "response.output_item.added", json);
+    } else if (sc->gr->api == SRV_API_MESSAGES) {
+        msg_close_think(sc);
+        msg_close_text(sc);
+        sc->tool_std_msg_idx = sc->msg_index++;
+        json = srv_asprintf(
+            "{\"type\":\"content_block_start\",\"index\":%d,\"content_block\":"
+            "{\"type\":\"tool_use\",\"id\":%s,\"name\":%s,\"input\":{}}}",
+            sc->tool_std_msg_idx, jid, jname);
+        msg_sse(sc, "content_block_start", json);
+    } else {
+        json = srv_asprintf(
+            "{\"id\":\"%s\",\"object\":\"%s\",\"created\":%lld,\"model\":\"%s\","
+            "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":["
+            "{\"index\":0,\"id\":%s,\"type\":\"function\",\"function\":"
+            "{\"name\":%s,\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
+            sc->idbuf, sc->gr->is_chat ? "chat.completion.chunk" : "text_completion",
+            (long long)sc->created, sc->model, jid, jname);
+        if (!sse_frame(sc->fd, json)) sc->dead = true;
+    }
+    free(json);
+    free(jid);
+    free(jname);
+}
+
+static void tool_std_args_frame(stream_ctx *sc, const char *piece, size_t len) {
+    if (sc->dead || !sc->tool_std_open || len == 0) return;
+    char *esc = json_slice(piece, len);
+    char fid[96];
+    snprintf(fid, sizeof(fid), "%s-fc0", sc->idbuf);
+    char *json;
+
+    if (sc->gr->api == SRV_API_RESPONSES) {
+        json = srv_asprintf(
+            "{\"type\":\"response.function_call_arguments.delta\","
+            "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":%s}",
+            fid, sc->tool_std_resp_idx, esc);
+        resp_sse(sc, "response.function_call_arguments.delta", json);
+    } else if (sc->gr->api == SRV_API_MESSAGES) {
+        json = srv_asprintf(
+            "{\"type\":\"content_block_delta\",\"index\":%d,\"delta\":"
+            "{\"type\":\"input_json_delta\",\"partial_json\":%s}}",
+            sc->tool_std_msg_idx, esc);
+        msg_sse(sc, "content_block_delta", json);
+    } else {
+        json = srv_asprintf(
+            "{\"id\":\"%s\",\"object\":\"%s\",\"created\":%lld,\"model\":\"%s\","
+            "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":["
+            "{\"index\":0,\"function\":{\"arguments\":%s}}]},"
+            "\"finish_reason\":null}]}",
+            sc->idbuf, sc->gr->is_chat ? "chat.completion.chunk" : "text_completion",
+            (long long)sc->created, sc->model, esc);
+        if (!sse_frame(sc->fd, json)) sc->dead = true;
+    }
+    free(json);
+    free(esc);
+}
+
+static void tool_std_emit_prefix(stream_ctx *sc, const char *blk, size_t cut,
+                                 bool strip_value_quote);
+static void tool_std_value_scan(stream_ctx *sc, const char *blk,
+                                const char *fn_end);
+
+/* Look at everything the model has written since <tool_call> opened. Instead
+ * of a second XML grammar on the streaming side, hand a *completed* prefix of
+ * the block to the same cwick_tools_extract() the buffered path uses: that
+ * gives the argument object for every parameter whose closing tag has
+ * arrived, with the same value normalisation and the same key order. Dropping
+ * its final brace leaves a prefix that can only grow, which is what makes it
+ * safe to emit a little at a time. */
+static void tool_std_scan(stream_ctx *sc) {
+    static const char fn_open[] = "<function=";
+    static const char par_close[] = "</parameter>";
+    static const char fn_close[] = "</function>";
+    if (sc->dead || !sc->gr->stream || !sc->gr->tools.present ||
+        !sc->gr->tools.advertise || sc->raw_len <= sc->tool_std_begin) return;
+    const char *blk = sc->raw + sc->tool_std_begin;
+
+    if (!sc->tool_std_on) {
+        const char *f = strstr(blk, fn_open);
+        if (!f) return;                    /* a different checkpoint's dialect */
+        const char *nm = f + sizeof(fn_open) - 1;
+        const char *e = strchr(nm, '>');
+        if (!e) return;                    /* tag still arriving */
+        size_t nl = (size_t)(e - nm);
+        if (nl == 0 || nl >= sizeof(sc->tool_std_name)) return;
+        memcpy(sc->tool_std_name, nm, nl);
+        sc->tool_std_name[nl] = '\0';
+        snprintf(sc->tool_std_id, sizeof(sc->tool_std_id), "call_%ld_s%d",
+                 (long)getpid() % 100000, (int)(sc->created % 100000));
+        sc->tool_std_on = true;
+        tool_std_open_frame(sc);
+    }
+    if (sc->dead) return;
+
+    size_t np = 0, cut = 0;
+    for (const char *q = blk; (q = strstr(q, par_close)) != NULL;
+         q += sizeof(par_close) - 1) {
+        np++;
+        cut = (size_t)(q - blk) + sizeof(par_close) - 1;
+    }
+    /* Keep the first <function> block only; further calls arrive at the end. */
+    const char *fe = strstr(blk, fn_close);
+    if (fe) cut = cut < (size_t)(fe - blk) ? cut : (size_t)(fe - blk);
+
+    if (np > sc->tool_std_params) {
+        sc->tool_std_params = np;
+        sc->tool_std_val_len = 0;   /* a new parameter starts from zero */
+        tool_std_emit_prefix(sc, blk, cut, false);
+    }
+    /* A parameter value is the slow part of a real tool call (a shell script,
+     * a file body) and it is written after `</parameter>` has had time to
+     * arrive only at the very end. Without this the client sees the opening
+     * frame and then silence for the whole value. */
+    if (!sc->dead) tool_std_value_scan(sc, blk, fe);
+}
+
+/* Emit the argument JSON up to `cut` bytes of the block. `strip_value_quote`
+ * is for the in-flight case: the parameter is only *going* to be closed, so
+ * the closing quote the extractor adds is not part of the prefix yet. */
+static void tool_std_emit_prefix(stream_ctx *sc, const char *blk, size_t cut,
+                                 bool strip_value_quote) {
+    static const char head[] = "<tool_call>";
+    static const char tail[] = "</function></tool_call>";
+    size_t plen = sizeof(head) - 1 + cut + sizeof(tail) - 1;
+    char *probe = cwick_xmalloc(plen + 1);
+    memcpy(probe, head, sizeof(head) - 1);
+    memcpy(probe + sizeof(head) - 1, blk, cut);
+    memcpy(probe + sizeof(head) - 1 + cut, tail, sizeof(tail) - 1);
+    probe[plen] = '\0';
+
+    cwick_error e;
+    cwick_error_clear(&e);
+    cwick_tool_call *pc = NULL;
+    size_t npc = 0;
+    int rc = cwick_tools_extract(probe, &pc, &npc, NULL, &e);
+    free(probe);
+    if (rc != 0 || npc == 0) {
+        cwick_tool_calls_free(pc, npc);
+        return;
+    }
+    const char *args = pc[0].arguments_json ? pc[0].arguments_json : "";
+    size_t alen = strlen(args);
+    if (alen && args[alen - 1] == '}') alen--;    /* leave the object open */
+    if (strip_value_quote && alen && args[alen - 1] == '"') alen--;
+    if (alen > sc->tool_std_sent &&
+        strncmp(args, sc->tool_std_prefix ? sc->tool_std_prefix : "",
+                sc->tool_std_sent) == 0) {
+        tool_std_args_frame(sc, args + sc->tool_std_sent,
+                            alen - sc->tool_std_sent);
+        char *grown = cwick_xmalloc(alen + 1);
+        if (sc->tool_std_sent)
+            memcpy(grown, sc->tool_std_prefix, sc->tool_std_sent);
+        memcpy(grown + sc->tool_std_sent, args + sc->tool_std_sent,
+               alen - sc->tool_std_sent);
+        grown[alen] = '\0';
+        free(sc->tool_std_prefix);
+        sc->tool_std_prefix = grown;
+        sc->tool_std_sent = alen;
+    }
+    cwick_tool_calls_free(pc, npc);
+}
+
+/* Can the bytes written so far only ever become a JSON string? A value that
+ * starts with `{ [ " -` or a digit may still parse as JSON, and `t`/`f`/`n`
+ * may still become `true`/`false`/`null`; those are left to the closed-parameter
+ * path. A bare word (a path, a sentence, a shell script) never can. This test
+ * is monotone: once true it stays true as more bytes arrive, which is what
+ * makes it safe to commit bytes to the wire. */
+static bool value_is_definitely_string(const char *v, size_t n) {
+    if (n == 0) return false;
+    unsigned char c = (unsigned char)v[0];
+    if (c == '{' || c == '[' || c == '"' || c == '-' ||
+        (c >= '0' && c <= '9')) return false;
+    if (c == 't' || c == 'f' || c == 'n') {
+        const char *lit = c == 't' ? "true" : (c == 'f' ? "false" : "null");
+        size_t ll = strlen(lit);
+        if (n <= ll && memcmp(v, lit, n) == 0) return false;  /* still a prefix */
+    }
+    return true;
+}
+
+/* Stream the parameter that is still being written. The value is sliced at the
+ * last byte that cannot change meaning: trailing whitespace is held back (the
+ * extractor trims it) and a half UTF-8 character is held back (the wire is
+ * JSON). Everything else is handed to the same extractor the closed path uses,
+ * so escaping and key order cannot drift. */
+static void tool_std_value_scan(stream_ctx *sc, const char *blk,
+                               const char *fn_end) {
+    static const char p_open[] = "<parameter=";
+    static const char p_close[] = "</parameter>";
+    const char *end = fn_end ? fn_end : blk + strlen(blk);
+
+    const char *last_close = NULL;
+    for (const char *q = blk; (q = strstr(q, p_close)) != NULL &&
+         q < end; q += sizeof(p_close) - 1)
+        last_close = q + sizeof(p_close) - 1;
+    const char *tail = last_close ? last_close : blk;
+
+    const char *po = NULL;
+    for (const char *q = tail; (q = strstr(q, p_open)) != NULL && q < end;
+         q += sizeof(p_open) - 1)
+        po = q;
+    if (!po) return;
+    const char *gt = strchr(po, '>');
+    if (!gt || gt >= end) return;
+
+    const char *v0 = gt + 1;
+    while (v0 < end && (*v0 == '\n' || *v0 == '\r' || *v0 == ' ' || *v0 == '\t'))
+        v0++;
+    if (v0 >= end) return;
+
+    size_t n = (size_t)(end - v0);
+    while (n > 0 && (v0[n - 1] == '\n' || v0[n - 1] == '\r' ||
+                     v0[n - 1] == ' ' || v0[n - 1] == '\t'))
+        n--;
+    /* A closing tag arrives one piece at a time. A tail that could still
+     * become `</parameter>` is framing, not value: emitting it would put XML
+     * inside the JSON string and the closed-parameter path would then disagree
+     * with what is already on the wire. */
+    {
+        size_t tlen = sizeof(p_close) - 1;
+        size_t maxk = n < tlen - 1 ? n : tlen - 1;
+        for (size_t k = maxk; k > 0; k--)
+            if (memcmp(v0 + n - k, p_close, k) == 0) { n -= k; break; }
+    }
+    size_t u = utf8_incomplete_tail(v0, n);
+    n -= u;
+    if (n == 0) return;
+    if (!value_is_definitely_string(v0, n)) return;
+
+    /* Each scan re-parses the whole block, so it must not run per token for a
+     * large value. Emit in steps: the first byte of a value goes out at once
+     * (the client sees the parameter start), then every STEP bytes after it.
+     * At 6-7 tok/s a step is a fraction of a second, which reads as live. */
+    enum { STEP = 12 };
+    if (sc->tool_std_val_len && n < sc->tool_std_val_len + STEP) return;
+    sc->tool_std_val_len = n;
+
+    /* The closing quote is emitted by the same extractor as part of `"value"`,
+     * so the prefix has to stop one byte short of it. */
+    size_t cut = (size_t)(v0 - blk) + n;
+    tool_std_emit_prefix(sc, blk, cut, true);
+}
+
+/* Close out the streamed call. Returns true when the first call's arguments
+ * have gone out as deltas, so the finish must not repeat them. If the final
+ * parse disagrees with the bytes already on the wire, those bytes win: the
+ * payload is rewritten to the object they describe, which keeps a client that
+ * concatenates deltas and one that reads the final object in agreement. */
+static bool tool_std_settle(stream_ctx *sc, cwick_tool_call *calls,
+                            size_t ncalls) {
+    if (!sc->tool_std_on || !sc->tool_std_open || sc->dead || ncalls == 0)
+        return false;
+    const char *final = calls[0].arguments_json ? calls[0].arguments_json : "{}";
+    size_t flen = strlen(final);
+    const char *pre = sc->tool_std_prefix ? sc->tool_std_prefix : "";
+    if (flen >= sc->tool_std_sent &&
+        strncmp(final, pre, sc->tool_std_sent) == 0) {
+        if (flen > sc->tool_std_sent)
+            tool_std_args_frame(sc, final + sc->tool_std_sent,
+                                flen - sc->tool_std_sent);
+    } else {
+        char *wire = srv_asprintf("%s}", pre);
+        free(calls[0].arguments_json);
+        calls[0].arguments_json = wire;
+        tool_std_args_frame(sc, "}", 1);
+        CWICK_INFO(req_tag(sc->gr->rid),
+                   "streamed tool arguments did not match the final parse; "
+                   "the wire bytes became the payload");
+    }
+    snprintf(calls[0].id, sizeof(calls[0].id), "%s", sc->tool_std_id);
+    sc->tool_std_closed = true;
+    return true;
+}
+
 /* Once a <tool_call> has opened, cwick_stream_segment() stops classifying:
  * those bytes are parsing material, not content. They are still the only thing
  * happening, and a client waiting on the turn sees nothing at all for as long
  * as the block takes (tens of seconds on a slow checkpoint), so forward them as
  * `cwick_tool` — a non-standard delta field next to `content`, ignored by
- * clients that do not know it. The parsed `tool_calls` still arrive at the end;
- * this is progress, not a second copy of the answer.
+ * clients that do not know it — and, in parallel, as the standard opening and
+ * argument deltas above.
  *
  * The slice is cleaned of framing before it goes out, and a tail that could
  * still become a frame is held back until the next piece lands. */
@@ -3377,6 +3759,9 @@ static void stream_tool_progress(stream_ctx *sc, bool final) {
         static const char open[] = "<tool_call>";
         sc->tool_sent = sc->split.sent + (sizeof(open) - 1);
         if (sc->tool_sent > sc->raw_len) sc->tool_sent = sc->raw_len;
+        sc->tool_std_begin = sc->tool_sent;
+        sc->tool_std_msg_idx = -1;
+        sc->tool_std_resp_idx = -1;
     }
 
     size_t hold = final ? 0 : cwick_tool_ns_tail(sc->raw, sc->raw_len);
@@ -3389,6 +3774,7 @@ static void stream_tool_progress(stream_ctx *sc, bool final) {
         stream_delta_n(sc, "cwick_tool", clean, strlen(clean));
     free(clean);
     sc->tool_sent = lim;
+    if (!final) tool_std_scan(sc);
 }
 
 /* Emit every byte that is now unambiguously classified. With `final` set the
@@ -3510,33 +3896,36 @@ static void resp_stream_finish(stream_ctx *sc, const char *resp_body,
     for (size_t i = 0; i < ncalls && !sc->dead; i++) {
         char fid[96];
         snprintf(fid, sizeof(fid), "%s-fc%zu", sc->idbuf, i);
-        srv_buf item = {0};
-        char *jc = cwick_json_stringify(calls[i].id);
-        char *jn = cwick_json_stringify(calls[i].name);
-        sbuf_putf(&item, "{\"id\":\"%s\",\"type\":\"function_call\","
-                        "\"status\":\"in_progress\",\"call_id\":%s,\"name\":%s,"
-                        "\"arguments\":\"\"}", fid, jc, jn);
-        free(jc);
-        free(jn);
-        char *json = srv_asprintf("{\"type\":\"response.output_item.added\","
-                                  "\"output_index\":%d,\"item\":%s}",
-                                  sc->resp_index, item.p);
-        resp_sse(sc, "response.output_item.added", json);
-        free(json);
-        free(item.p);
-        /* The call is parsed out of the model's own protocol only once it is
-         * complete, so there is nothing to dribble out while it is being
-         * written — but the dialect still expects the argument events between
-         * `added` and `done`, and they are where a client looks for the
-         * payload. One delta carries the whole string. */
+        /* When the first call was streamed, its `added` and argument deltas
+         * are already on the wire; only the closing events remain. */
+        const bool streamed = (i == 0 && sc->tool_std_closed);
+        char *json = NULL;
+        if (!streamed) {
+            srv_buf item = {0};
+            char *jc = cwick_json_stringify(calls[i].id);
+            char *jn = cwick_json_stringify(calls[i].name);
+            sbuf_putf(&item, "{\"id\":\"%s\",\"type\":\"function_call\","
+                            "\"status\":\"in_progress\",\"call_id\":%s,\"name\":%s,"
+                            "\"arguments\":\"\"}", fid, jc, jn);
+            free(jc);
+            free(jn);
+            json = srv_asprintf("{\"type\":\"response.output_item.added\","
+                                "\"output_index\":%d,\"item\":%s}",
+                                sc->resp_index, item.p);
+            resp_sse(sc, "response.output_item.added", json);
+            free(json);
+            free(item.p);
+        }
         const char *args = (calls[i].arguments_json && *calls[i].arguments_json)
                                ? calls[i].arguments_json : "{}";
         char *ja = cwick_json_stringify(args);
-        json = srv_asprintf("{\"type\":\"response.function_call_arguments.delta\","
-                            "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":%s}",
-                            fid, sc->resp_index, ja);
-        resp_sse(sc, "response.function_call_arguments.delta", json);
-        free(json);
+        if (!streamed) {
+            json = srv_asprintf("{\"type\":\"response.function_call_arguments.delta\","
+                                "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":%s}",
+                                fid, sc->resp_index, ja);
+            resp_sse(sc, "response.function_call_arguments.delta", json);
+            free(json);
+        }
         json = srv_asprintf("{\"type\":\"response.function_call_arguments.done\","
                             "\"item_id\":\"%s\",\"output_index\":%d,"
                             "\"arguments\":%s}", fid, sc->resp_index, ja);
@@ -3575,26 +3964,31 @@ static void msg_stream_finish(stream_ctx *sc, const cwick_tool_call *calls,
     msg_close_think(sc);
     msg_close_text(sc);
     for (size_t i = 0; i < ncalls && !sc->dead; i++) {
-        int idx = sc->msg_index++;
-        char *jc = cwick_json_stringify(calls[i].id);
-        char *jn = cwick_json_stringify(calls[i].name);
-        char *json = srv_asprintf(
-            "{\"type\":\"content_block_start\",\"index\":%d,\"content_block\":"
-            "{\"type\":\"tool_use\",\"id\":%s,\"name\":%s,\"input\":{}}}",
-            idx, jc, jn);
-        msg_sse(sc, "content_block_start", json);
-        free(json);
-        free(jc);
-        free(jn);
-        const char *args = (calls[i].arguments_json && *calls[i].arguments_json)
-                               ? calls[i].arguments_json : "{}";
-        char *ja = cwick_json_stringify(args);
-        json = srv_asprintf(
-            "{\"type\":\"content_block_delta\",\"index\":%d,\"delta\":"
-            "{\"type\":\"input_json_delta\",\"partial_json\":%s}}", idx, ja);
-        msg_sse(sc, "content_block_delta", json);
-        free(json);
-        free(ja);
+        /* The streamed call already owns its content_block index; do not
+         * allocate a second one or repeat its input_json_delta. */
+        const bool streamed = (i == 0 && sc->tool_std_closed);
+        int idx = streamed ? sc->tool_std_msg_idx : sc->msg_index++;
+        if (!streamed) {
+            char *jc = cwick_json_stringify(calls[i].id);
+            char *jn = cwick_json_stringify(calls[i].name);
+            char *json = srv_asprintf(
+                "{\"type\":\"content_block_start\",\"index\":%d,\"content_block\":"
+                "{\"type\":\"tool_use\",\"id\":%s,\"name\":%s,\"input\":{}}}",
+                idx, jc, jn);
+            msg_sse(sc, "content_block_start", json);
+            free(json);
+            free(jc);
+            free(jn);
+            const char *args = (calls[i].arguments_json && *calls[i].arguments_json)
+                                   ? calls[i].arguments_json : "{}";
+            char *ja = cwick_json_stringify(args);
+            json = srv_asprintf(
+                "{\"type\":\"content_block_delta\",\"index\":%d,\"delta\":"
+                "{\"type\":\"input_json_delta\",\"partial_json\":%s}}", idx, ja);
+            msg_sse(sc, "content_block_delta", json);
+            free(json);
+            free(ja);
+        }
         msg_block_stop(sc, idx);
     }
     if (sc->dead) return;
@@ -3974,37 +4368,51 @@ static void pfx_save_now(void *user, cwick_prefix_state *s) {
             pfx_submit(pc->srv, s, pc->ids, P, pc->tag);
             s = NULL;   /* ownership moved */
 
-            /* And one token shorter, keyed on the same tokens minus the last.
+            /* And one boundary shorter, keyed on the tokens up to the point
+             * where the next turn will actually agree with this one.
              *
-             * A request that opens a thinking block ends its prompt with
-             * ``: the server appends it so the model starts reasoning.
-             * The NEXT turn of that same session does not resend it -- the
-             * client renders the assistant's turn as `` plus its content,
-             * so the two prompts diverge at exactly this last token and the
-             * prefix they actually share is one token short of the prompt
-             * just captured. Measured on a live session: turn N was 262
-             * tokens and turn N+1 was 405, and they agreed on the first 261;
-             * the cache held snapshots at 262 and 551, so the lookup missed
-             * and 136 s of prefill was paid again.
+             * A prompt that opens a thinking block ends with the block itself:
+             * the open marker on its own when thinking is on, or a pre-closed
+             * empty block (`<think>\n\n</think>\n\n`) when the server was asked
+             * to disable it. The next turn of that session renders the
+             * assistant's reply as the header plus its content -- it never
+             * resends the injected block -- so the two prompts agree up to the
+             * FIRST token of that block and not one token further.
              *
-             * Capturing the shorter length too is the whole fix. It costs one
-             * extra state pack -- cwick_engine_capture_prefix accepts any
-             * position <= eng->pos, so it is a ~13 MiB copy here rather than
-             * a second prefill -- and it is the same one-token rollback the
-             * whole-prompt hit path already applies on load. Gated on
-             * P == nids so the mid-prefill chunk checkpoints, whose length is
-             * only part of the prompt, do not each add a twin. */
+             * Thinking on: the block is the single open marker, so P - 1 is
+             * exactly the boundary, which is why that twin was enough for the
+             * 262-vs-405 case measured earlier. Thinking off: the injected
+             * block is four tokens on Qwen3.5, so P - 1 was still three too
+             * long. Measured on a live session, turn N was 232 tokens and turn
+             * N+1 was 265, they agreed on the first 228, the cache held 231 and
+             * 232 -- the lookup missed and the turn fell back to the 4K block
+             * checkpoint, re-prefilling 37 tokens at 30K-context rates.
+             *
+             * So: search the tail for the open marker and key the twin there.
+             * Falls back to P - 1 when there is none, which is the
+             * thinking-on case. */
             if (pc->eng && P == pc->nids && P >= 2) {
+                int64_t twin = P - 1;
+                if (pc->srv && pc->srv->think_open_id >= 0) {
+                    int64_t from = P - 1 - 8;
+                    if (from < 0) from = 0;
+                    for (int64_t k = P - 1; k >= from; k--)
+                        if ((int64_t)pc->ids[k] == pc->srv->think_open_id) {
+                            twin = k;
+                            break;
+                        }
+                }
+                if (twin < 2) twin = P - 1;
                 cwick_error e;
                 cwick_error_clear(&e);
                 cwick_prefix_state *sh = calloc(1, sizeof(*sh));
                 if (sh) {
-                    if (cwick_engine_capture_prefix(pc->eng, P - 1, sh, &e) ==
+                    if (cwick_engine_capture_prefix(pc->eng, twin, sh, &e) ==
                         CWICK_OK)
-                        pfx_submit(pc->srv, sh, pc->ids, P - 1, pc->tag);
+                        pfx_submit(pc->srv, sh, pc->ids, twin, pc->tag);
                     else
                         CWICK_VERB(pc->tag, "prefix capture at %lld tokens "
-                                  "failed: %s", (long long)(P - 1),
+                                  "failed: %s", (long long)twin,
                                   cwick_error_message(&e));
                     cwick_prefix_state_free(sh);
                     free(sh);
@@ -4131,6 +4539,59 @@ static bool model_uses_ds_template(const cwick_engine *eng) {
 static bool model_uses_mm_template(const cwick_engine *eng) {
     const cwick_model_spec *spec = eng ? cwick_engine_spec(eng) : NULL;
     return spec && strncmp(spec->model_type, "minimax_m3", 10) == 0;
+}
+
+static bool model_uses_q35_template(const cwick_engine *eng) {
+    const cwick_model_spec *spec = eng ? cwick_engine_spec(eng) : NULL;
+    return spec && strncmp(spec->model_type, "qwen3_5", 7) == 0;
+}
+
+/* Qwen3.5 renders with its own template. The thinking switch has no numeric
+ * knob there either: "off" is the assistant header followed by an empty, closed
+ * reasoning block, which is what the template itself writes. */
+static cwick_status q35_chat_encode(const cwick_tokenizer *tok,
+                                    const char *messages_json,
+                                    const char *tools_json,
+                                    const char *effort_level,
+                                    uint32_t **ids, int64_t *n_out,
+                                    cwick_error *err) {
+    cwick_error pe;
+    cwick_error_clear(&pe);
+    json_value *msgs = cwick_json_parse(messages_json, strlen(messages_json), &pe);
+    if (!msgs) {
+        cwick_error_set(err, CWICK_ERR_PARSE, "messages: %s",
+                        cwick_error_message(&pe));
+        return CWICK_ERR_PARSE;
+    }
+    json_value *tools = NULL;
+    if (tools_json) {
+        cwick_error_clear(&pe);
+        tools = cwick_json_parse(tools_json, strlen(tools_json), &pe);
+        if (!tools) {
+            cwick_json_free(msgs);
+            cwick_error_set(err, CWICK_ERR_PARSE, "tools: %s",
+                            cwick_error_message(&pe));
+            return CWICK_ERR_PARSE;
+        }
+    }
+
+    q35_prompt_opts opts;
+    q35_prompt_opts_default(&opts);
+    const think_level *tl = effort_level ? think_level_find(effort_level) : NULL;
+    opts.thinking = tl ? tl->thinks : true;
+
+    cwick_error_clear(&pe);
+    char *text = q35_prompt_encode(msgs, tools, &opts, NULL, &pe);
+    cwick_json_free(msgs);
+    if (tools) cwick_json_free(tools);
+    if (!text) {
+        cwick_error_set(err, CWICK_ERR_PARSE, "qwen3_5 prompt: %s",
+                        cwick_error_message(&pe));
+        return CWICK_ERR_PARSE;
+    }
+    cwick_status st = cwick_tokenizer_encode(tok, text, ids, n_out, err);
+    free(text);
+    return st;
 }
 
 /* MiniMax-M3.1's template has no numeric effort knob, so the "关" level is
@@ -4294,17 +4755,19 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
     trace_request(srv, gr);
 
     if (gr->is_chat && gr->messages_json && model_uses_ds_template(eng)) {
-        /* When the client said nothing, hand the renderer "unset" so it
-         * applies the checkpoint's own default (75) instead of GLM's implicit
-         * "extreme" -- the two checkpoints do not agree on what the default
-         * reasoning budget is. */
+        /* The no-field default is a real level (关), so it takes exactly the
+         * same path as an explicit reasoning_effort:none. An absent field
+         * used to be passed down as "unset" and each renderer fell back to
+         * its own checkpoint default, which opened a reasoning block that
+         * the engine's zero budget then had to close again. */
         st = ds_chat_encode(srv->tok, gr->messages_json, gr->tools_json,
-                            gr->effort_defaulted ? NULL : gr->effort_level,
-                            &ids, &nids, err);
+                            gr->effort_level, &ids, &nids, err);
     } else if (gr->is_chat && gr->messages_json && model_uses_mm_template(eng)) {
         st = mm_chat_encode(srv->tok, gr->messages_json, gr->tools_json,
-                            gr->effort_defaulted ? NULL : gr->effort_level,
-                            &ids, &nids, err);
+                            gr->effort_level, &ids, &nids, err);
+    } else if (gr->is_chat && gr->messages_json && model_uses_q35_template(eng)) {
+        st = q35_chat_encode(srv->tok, gr->messages_json, gr->tools_json,
+                             gr->effort_level, &ids, &nids, err);
     } else if (gr->is_chat) {
         st = cwick_chat_encode_messages(srv->tok, gr->msgs, gr->n_msgs,
                                        gr->tools_block, gr->reasoning_effort,
@@ -4340,7 +4803,9 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * reasoning_content with an empty content. */
     const bool pfx_closed_at_start =
         gr->is_chat && srv->think_close_id >= 0 && nids > 0 &&
-        (int64_t)ids[nids - 1] == srv->think_close_id;
+        ((int64_t)ids[nids - 1] == srv->think_close_id ||
+         ((model_uses_mm_template(eng) || model_uses_q35_template(eng)) &&
+          prompt_token_near_end(ids, nids, srv->think_close_id, 4)));
 
     /* ---- prefix cache: replay the part of the prompt already prefilled --
      * An agent client resends the same multi-thousand-token system prompt and
@@ -4459,9 +4924,18 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
             /* GLM's template ends the prompt with <think>, so the block is
              * already open; a model whose prompt is a bare assistant header
              * writes the marker itself. Reading the last prompt token tells
-             * the two apart without a per-family table. */
-            const bool open_at_start =
+             * the two apart without a per-family table. Qwen3.5 ends with the
+             * marker followed by a newline token, so that exact test misses
+             * an open block: use the same short backwards window as the
+             * close-marker check. Without it the engine waits for a marker
+             * the model will never write, the budget never fires, and the
+             * thinking phase runs until max_tokens with content=0. */
+            bool open_at_start =
                 nids > 0 && (int64_t)ids[nids - 1] == srv->think_open_id;
+            if (!open_at_start && !pfx_closed_at_start &&
+                model_uses_q35_template(eng))
+                open_at_start = prompt_token_near_end(ids, nids,
+                                                      srv->think_open_id, 4);
             /* ...and one whose template closed it (MiniMax with thinking off)
              * must not have the engine close it a second time. */
             cwick_engine_set_think_closed_at_start(eng, pfx_closed_at_start);
@@ -4697,7 +5171,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
             }
         }
     }
-    char *tcalls = tool_calls_json(calls, ncalls);
+    char *tcalls = tool_calls_json(calls, ncalls, false);
     if (reasoning && *reasoning) {
         char buf[256];
         snprintf(buf, sizeof(buf), "%s reasoning", req_tag(gr->rid));
@@ -4828,7 +5302,29 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
     if (gr->stream) {
         /* The reasoning/content deltas were already pushed from inside the
          * generation sink as the tokens were produced; here we only close the
-         * envelope (tool calls, finish frame, [DONE]). */
+         * envelope (tool calls, finish frame, [DONE]). Flush the held-back
+         * tail first so the last argument bytes are the final ones a client
+         * sees, then settle the streamed call against the parsed result. */
+        stream_flush(&sc, true);
+        if (tool_std_settle(&sc, calls, ncalls)) {
+            free(tcalls);
+            /* A single call is complete on the wire already. With several,
+             * the closing chunk still has to announce calls 1..N; the first
+             * entry carries an empty arguments field so a concatenating
+             * client does not see the streamed bytes twice. */
+            tcalls = ncalls > 1 ? tool_calls_json(calls, ncalls, true) : NULL;
+            /* The terminal Responses document embeds the call id and its
+             * arguments, so rebuild it against the settled call. */
+            if (gr->api == SRV_API_RESPONSES) {
+                free(resp_body);
+                resp_body = responses_body(idbuf, created, model, content_src,
+                                           reasoning, gr->resp_summary,
+                                           resp_incomplete, calls, ncalls,
+                                           prompt_tokens, completion_tokens,
+                                           pfx_reused, (int64_t)ph_counts[0],
+                                           gr->resp_tail);
+            }
+        }
         if (gr->api == SRV_API_RESPONSES)
             resp_stream_finish(&sc, resp_body, calls, ncalls, resp_incomplete);
         else if (gr->api == SRV_API_MESSAGES)
@@ -6692,6 +7188,17 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
     char ponly[256];
     path_only(path, ponly, sizeof(ponly));
 
+    /* SDK base URLs disagree about who owns the "/v1": Anthropic's client
+     * appends "/v1/messages" to whatever ANTHROPIC_BASE_URL it is handed, so a
+     * base URL that already ends in /v1 arrives as "/v1/v1/messages" and used
+     * to 404 on every route below. Collapse the repeated prefix so the
+     * misconfiguration is harmless; req.path keeps the raw text, which is what
+     * the access log and the trace line print. */
+    while (strncmp(ponly, "/v1/v1/", 7) == 0) {
+        const size_t n = strlen(ponly + 3);
+        memmove(ponly, ponly + 3, n + 1);
+    }
+
     /* ---- single-user auth --------------------------------------------
      * Login/status/logout are public; the login page is served only to an
      * unauthenticated browser. Everything else is gated below: static CSS/JS
@@ -7267,14 +7774,17 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         DONE(200);
     }
 
+    /* Compare the query-stripped form: the Anthropic client puts "?beta=true"
+     * on every /v1/messages call, and matching the raw path here (as this
+     * block once did) turned each of those into a 404 "unknown endpoint". */
     bool is_chat = strcmp(req.method, "POST") == 0 &&
-        (strcmp(path, "/v1/chat/completions") == 0 || strcmp(path, "/chat/completions") == 0);
+        (strcmp(ponly, "/v1/chat/completions") == 0 || strcmp(ponly, "/chat/completions") == 0);
     bool is_comp = strcmp(req.method, "POST") == 0 &&
-        (strcmp(path, "/v1/completions") == 0 || strcmp(path, "/completions") == 0);
+        (strcmp(ponly, "/v1/completions") == 0 || strcmp(ponly, "/completions") == 0);
     bool is_resp = strcmp(req.method, "POST") == 0 &&
-        (strcmp(path, "/v1/responses") == 0 || strcmp(path, "/responses") == 0);
+        (strcmp(ponly, "/v1/responses") == 0 || strcmp(ponly, "/responses") == 0);
     bool is_msgs = strcmp(req.method, "POST") == 0 &&
-        (strcmp(path, "/v1/messages") == 0 || strcmp(path, "/messages") == 0);
+        (strcmp(ponly, "/v1/messages") == 0 || strcmp(ponly, "/messages") == 0);
     const bool is_gen = is_chat || is_comp || is_resp || is_msgs;
     /* Which envelope an error from here on wears. */
     const srv_api api = is_msgs ? SRV_API_MESSAGES
