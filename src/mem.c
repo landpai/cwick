@@ -161,6 +161,21 @@ double cwick_gib(uint64_t bytes) { return (double)bytes / CWICK_GIB; }
 /* ------------------------------------------------------------------ */
 /* Swap, the compressor, and wiring                                    */
 /* ------------------------------------------------------------------ */
+/* Page size is a machine fact, not a constant: Apple Silicon has used 16 KiB
+ * pages since M1, and `wire_count` is counted in those. Multiplying by 4096
+ * under-reported wired memory by exactly 4x on every machine this runs on
+ * (8.37 GB reported against 33.4 GB actually wired), which made the one gauge
+ * that is supposed to prove "no swap" useless. sysconf is cached because this
+ * runs on every metrics scrape. */
+static uint64_t vm_page_bytes(void) {
+    static uint64_t sz;
+    if (sz == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        sz = p > 0 ? (uint64_t)p : 4096ull;
+    }
+    return sz;
+}
+
 bool cwick_vm_state_sample(cwick_vm_state *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
@@ -187,7 +202,7 @@ bool cwick_vm_state_sample(cwick_vm_state *out) {
             out->decompressions = (uint64_t)vs.decompressions;
             out->swapins = (uint64_t)vs.swapins;
             out->swapouts = (uint64_t)vs.swapouts;
-            out->wired = (uint64_t)vs.wire_count * 4096ull;
+            out->wired = (uint64_t)vs.wire_count * vm_page_bytes();
             any = true;
         }
     }

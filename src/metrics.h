@@ -96,6 +96,14 @@ void cwick_metrics_request_finish(int64_t prompt_tokens, int64_t gen_tokens,
  * failure). Still counted so `requests_total` matches the access log. */
 void cwick_metrics_request_error(const char *kind);
 
+/* A finished request that generated tokens but delivered neither content nor
+ * a tool call — the generation stopped inside its thinking block, so `content`
+ * came back empty while the HTTP status, `finish_reason` and
+ * `request_success_total` all looked healthy. This counter is the only place
+ * that turn is visible: it is what a dashboard needs to notice that the model
+ * is answering with nothing. */
+void cwick_metrics_empty_answer(void);
+
 /* ------------------------------------------------------------------ */
 /* Generation internals (engine side)                                  */
 /* ------------------------------------------------------------------ */

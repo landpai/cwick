@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>cwick · 本地对话</title>
+<title data-i18n="doc.title">cwick · 本地对话</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236f8cff'/%3E%3Ctext x='16' y='23' font-family='-apple-system,sans-serif' font-size='19' font-weight='700' fill='%230b0d12' text-anchor='middle'%3Ec%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/web/app.css">
 </head>
@@ -21,33 +21,33 @@
 
     <nav class="nav">
       <button class="nav-item is-active" data-view="chat">
-        <span class="ico">◍</span><span>对话</span>
+        <span class="ico">◍</span><span data-i18n="nav.chat">对话</span>
       </button>
       <button class="nav-item" data-view="apps">
-        <span class="ico">▦</span><span>应用</span>
+        <span class="ico">▦</span><span data-i18n="nav.apps">应用</span>
       </button>
       <button class="nav-item" data-view="models">
-        <span class="ico">⇩</span><span>模型</span>
+        <span class="ico">⇩</span><span data-i18n="nav.models">模型</span>
       </button>
       <button class="nav-item" data-view="logs">
-        <span class="ico">≡</span><span>日志</span>
+        <span class="ico">≡</span><span data-i18n="nav.logs">日志</span>
       </button>
       <button class="nav-item" data-view="settings">
-        <span class="ico">⚙</span><span>设置</span>
+        <span class="ico">⚙</span><span data-i18n="nav.settings">设置</span>
       </button>
     </nav>
 
     <div class="rail-section" id="sessionSection">
       <div class="rail-head">
-        <span>会话</span>
-        <button id="newChat" class="ghost-btn" title="新建会话 (Ctrl/⌘+K)">＋</button>
+        <span data-i18n="rail.sessions">会话</span>
+        <button id="newChat" class="ghost-btn" data-i18n-title="rail.newChat" title="新建会话 (Ctrl/⌘+K)">＋</button>
       </div>
       <div id="sessionList" class="sessions"></div>
     </div>
 
     <div class="rail-foot">
       <div class="mem">
-        <div class="mem-row"><span>常驻内存</span><span id="memLabel" class="mono">—</span></div>
+        <div class="mem-row"><span data-i18n="rail.memory">常驻内存</span><span id="memLabel" class="mono">—</span></div>
         <div class="bar"><i id="memBar"></i></div>
       </div>
       <div class="chips">
@@ -66,12 +66,16 @@
   <main class="main">
     <header class="topbar">
       <div class="title">
-        <h1 id="viewTitle">对话</h1>
-        <p id="viewSub">流式输出 · 思考强度可控 · 同源调用本机 OpenAI 兼容接口</p>
+        <h1 id="viewTitle" data-i18n="view.chat.title">对话</h1>
+        <p id="viewSub" data-i18n="view.chat.sub">流式输出 · 思考强度可控 · 同源调用本机 OpenAI 兼容接口</p>
       </div>
       <div class="topbar-right">
-        <span id="connPill" class="pill"><i class="dot wait"></i><span>连接中</span></span>
-        <span id="livePill" class="pill mono" title="上一次生成的解码速度">— tok/s</span>
+        <div id="langSwitch" class="lang-switch" role="group" data-i18n-title="lang.title">
+          <button type="button" class="lang-btn is-active" data-lang="zh" aria-pressed="true">中</button>
+          <button type="button" class="lang-btn" data-lang="en" aria-pressed="false">EN</button>
+        </div>
+        <span id="connPill" class="pill"><i class="dot wait"></i><span data-i18n="status.connecting">连接中</span></span>
+        <span id="livePill" class="pill mono" data-i18n-title="status.tokS" title="上一次生成的解码速度">— tok/s</span>
       </div>
     </header>
 
@@ -80,14 +84,13 @@
       <div id="messages" class="messages">
         <div class="empty" id="emptyState">
           <div class="empty-logo">c</div>
-          <h2>在这台 Mac 上直接对话</h2>
-          <p>页面由 cwick 自己托管，请求发往同源的 <code>/v1/chat/completions</code>、
-             <code>/v1/responses</code> 或 <code>/v1/messages</code>（下方"接口"可选）。
-             模型全程本地运行，权重走 SSD 流式，对话不出机器。</p>
+          <h2 data-i18n="chat.emptyTitle">在这台 Mac 上直接对话</h2>
+          <p><span data-i18n="chat.emptyBody">页面由 cwick 自己托管，请求发往同源的</span> <code>/v1/chat/completions</code>、
+             <code>/v1/responses</code> <span data-i18n="chat.emptyBody2">或</span> <code>/v1/messages</code><span data-i18n="chat.emptyBody3">（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。</span></p>
           <div class="examples">
-            <button class="example" data-prompt="用三句话解释 Mixture-of-Experts 为什么能在低内存机器上跑大模型。">解释 MoE 与低内存</button>
-            <button class="example" data-prompt="写一个 C 函数，把 UTF-8 字符串按标点切分成句子，要求不破坏多字节字符。">写一段 C 代码</button>
-            <button class="example" data-prompt="现在是 2026 年，帮我规划一个为期两周的 Metal 推理内核优化计划，按天拆解。">做一份计划</button>
+            <button class="example" data-i18n="chat.ex1" data-prompt="用三句话解释 Mixture-of-Experts 为什么能在低内存机器上跑大模型。">解释 MoE 与低内存</button>
+            <button class="example" data-i18n="chat.ex2" data-prompt="写一个 C 函数，把 UTF-8 字符串按标点切分成句子，要求不破坏多字节字符。">写一段 C 代码</button>
+            <button class="example" data-i18n="chat.ex3" data-prompt="现在是 2026 年，帮我规划一个为期两周的 Metal 推理内核优化计划，按天拆解。">做一份计划</button>
           </div>
         </div>
       </div>
@@ -98,7 +101,7 @@
           <button id="leaveQueue" class="link-btn">撤销</button>
         </div>
         <div class="composer" id="composer">
-          <textarea id="input" rows="1" placeholder="给 cwick 发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+          <textarea id="input" rows="1" data-i18n-ph="chat.placeholder" placeholder="给 cwick 发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
           <div class="composer-side">
             <button id="sendBtn" class="send" title="发送 (Enter)">
               <span aria-hidden="true">↑</span>
@@ -107,8 +110,8 @@
           </div>
         </div>
         <div class="controls">
-          <label class="field" title="这一轮对话调用的接口：两者都走同一个引擎，只是请求/响应的信封不同">
-            <span>接口</span>
+          <label class="field" data-i18n-title="chat.apiTip" title="这一轮对话调用的接口：两者都走同一个引擎，只是请求/响应的信封不同">
+            <span data-i18n="chat.api">接口</span>
             <select id="apiSel">
               <option value="chat" selected>chat/completions</option>
               <option value="responses">responses</option>
@@ -116,7 +119,7 @@
             </select>
           </label>
           <label class="field">
-            <span>思考强度</span>
+            <span data-i18n="chat.effort">思考强度</span>
             <select id="effort">
               <option value="off">关</option>
               <option value="low">低</option>
@@ -127,11 +130,11 @@
             </select>
           </label>
           <label class="field">
-            <span>最大输出</span>
+            <span data-i18n="chat.maxOutput">最大输出</span>
             <input id="maxTokens" type="number" min="16" max="1000000" step="64" value="2048">
           </label>
-          <label class="switch"><input id="streamToggle" type="checkbox" checked><span>流式</span></label>
-          <label class="switch" title="声明 get_current_time / add_numbers / system_info，模型调用时由页面在本地执行"><input id="toolToggle" type="checkbox"><span>示例工具</span></label>
+          <label class="switch"><input id="streamToggle" type="checkbox" checked><span data-i18n="chat.stream">流式</span></label>
+          <label class="switch" data-i18n-title="chat.toolsTip" title="声明 get_current_time / add_numbers / system_info，模型调用时由页面在本地执行"><input id="toolToggle" type="checkbox"><span data-i18n="chat.tools">示例工具</span></label>
           <span class="spacer"></span>
           <span id="genStats" class="gen-stats mono"></span>
         </div>
@@ -229,7 +232,7 @@
         <div class="panel-head">
           <div>
             <h3>正在下载</h3>
-            <p>进度、速率与剩余时间每秒刷新；暂停或中断后从 <code>.incomplete</code> 断点续传</p>
+            <p>进度、速率与剩余时间每秒刷新；网络中断会自动退避重试（默认 5 次），从 <code>.incomplete</code> 断点续传，不重复下载</p>
           </div>
           <span id="hubPoll" class="mono muted"></span>
         </div>
@@ -403,15 +406,34 @@
       <div class="panel">
         <div class="panel-head">
           <div>
-            <h3>本地模型</h3>
-            <p>切换会释放当前常驻权重并清空前缀缓存；生成中会被拒绝（409）</p>
+            <h3 data-i18n="set.models">本地模型</h3>
+            <p data-i18n="set.modelsTip">切换会释放当前常驻权重并清空前缀缓存；生成中会被拒绝（409）</p>
           </div>
-          <button id="modelsRefresh" class="min-btn">刷新</button>
+          <button id="modelsRefresh" class="min-btn" data-i18n="common.refresh">刷新</button>
         </div>
         <div id="modelList" class="model-list">
-          <div class="model-row muted">读取中…</div>
+          <div class="model-row muted" data-i18n="common.loading">读取中…</div>
         </div>
         <div id="switchNote" class="note" hidden></div>
+      </div>
+
+      <div class="panel" id="imageModelPanel">
+        <div class="panel-head">
+          <div>
+            <h3 data-i18n="set.image">图像模型</h3>
+            <p data-i18n="set.imageTip">与文本模型相互独立；热切换只加载图像管线，不影响正在常驻的对话模型</p>
+          </div>
+          <span id="imageStatePill" class="pill mono" data-i18n="set.imageIdle">未加载</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span data-i18n="set.imageDir">模型目录</span><b id="imageDir" class="mono">—</b></div>
+          <div class="kv"><span data-i18n="set.imageEndpoints">接口</span><b class="mono">/v1/images/generations · /v1/images/edits</b></div>
+        </div>
+        <div class="set-grid img-actions">
+          <button id="imageSwitchBtn" class="min-btn accent" type="button" data-i18n="set.imageLoad">加载 / 切换到图像模型</button>
+          <a class="min-btn" href="/v1/models" target="_blank" rel="noreferrer" data-i18n="set.checkModels">查看模型列表</a>
+        </div>
+        <div id="imageNote" class="note" hidden></div>
       </div>
 
       <div class="panel">
@@ -518,7 +540,7 @@
     </section>
 
     <footer class="statusbar">
-      <span id="statusText" class="mono">就绪</span>
+      <span id="statusText" class="mono" data-i18n="status.ready">就绪</span>
       <span class="spacer"></span>
       <span class="mono muted">cwick serve --web</span>
     </footer>

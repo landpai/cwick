@@ -313,8 +313,17 @@ cwick_status cwick_safetensors_open(const char *root, cwick_safetensors *saf,
     char *text = NULL;
     size_t len = 0;
     if (cwick_read_file(idxpath, &text, &len) != 0) {
-        cwick_error_set(err, CWICK_ERR_IO, "missing safetensors index %s", idxpath);
-        return CWICK_ERR_IO;
+        /* `save_pretrained` names a diffusers component's shards after the
+         * class, not after `model`. */
+        char alt[1152];
+        cwick_path_join(alt, sizeof(alt), root,
+                        "diffusion_pytorch_model.safetensors.index.json");
+        if (cwick_read_file(alt, &text, &len) == 0) {
+            memcpy(idxpath, alt, sizeof(idxpath));
+        } else {
+            cwick_error_set(err, CWICK_ERR_IO, "missing safetensors index %s", idxpath);
+            return CWICK_ERR_IO;
+        }
     }
     json_value *rootv = cwick_json_parse(text, len, err);
     free(text);

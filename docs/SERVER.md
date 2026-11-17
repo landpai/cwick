@@ -11,7 +11,8 @@ OpenAI API.
   resident first. Each entry carries `cwick.root`, `cwick.loaded` and
   `cwick.supported` (plus `cwick.unsupported_reason` when false), so a client
   can tell *what is answering* from *what could be* and from *what can never
-  be loaded by this build*.
+  be loaded by this build*. When an image directory is configured, an extra
+  `MiniMax-H3-Image` entry carries `cwick.kind:"image"`.
 - `GET /v1/models/<id>` (and `/models/<id>`) — one entry in that shape, or 404
   `code:"model_not_found"`. This is OpenAI's retrieve-model call; agent
   frameworks probe it once with the name from their config, so answering it
@@ -32,6 +33,12 @@ OpenAI API.
   `/v1/v1/` prefix is collapsed — a base URL that already ends in `/v1` is
   served instead of answered with `404 unknown endpoint`. The access log and
   the `--trace` line still print the path exactly as it arrived.
+- `POST /v1/images/generations` (and `/images/generations`) — JSON in,
+  `b64_json` image out.
+- `POST /v1/images/edits` (and `/images/edits`) — `multipart/form-data` with
+  repeatable `image` parts; same response shape. Both require a configured
+  image model (`--img DIR` or `CWICK_IMAGE_MODEL`, or an on-demand switch);
+  see `docs/IMAGE.md`.
 - `GET /v1/metrics` (and `/metrics`) — Prometheus text, vLLM naming.
   `cwick:model_loaded` (1/0) is the live residency bit; `cwick:model_info`
   keeps the labels of the last successfully loaded checkpoint.
@@ -40,8 +47,9 @@ OpenAI API.
   HttpOnly `cwick_session` cookie and returns a Bearer token. When a password is
   configured, every other API/metrics/logs endpoint answers 401 without it; `/`,
   app HTML and the admin pages redirect to `/login`.
-- `GET /v1/config` (and `/config`) — the options this process is running with.
-  Read-only: everything in it is a lifetime choice (see below).
+- `GET /v1/config` (and `/config`) — the options this process is running with,
+  including `image_model.dir` and `image_model.loaded`. Read-only: everything
+  in it is a lifetime choice or a state report (see below).
 - `POST /v1/models/switch` — replace the resident model with another catalog
   entry, without a restart. A checkpoint downloaded after startup is discovered
   on demand here, so no refresh call is needed. An architecture this build has
@@ -62,7 +70,12 @@ OpenAI API.
 - `GET /`, `/web/app.css`, `/web/app.js` — the built-in console (chat, apps,
   models, logs, settings; metrics and trends live in settings), and `GET /apps/manifest.json` + `/apps/<id>/...` for
   the app bundles, only when `serve` was started with `--web`. Compiled into the
-  binary; answered without taking the generation slot. Every other path 404s.
+  binary; answered without taking the generation slot. The console has a
+  **中 / EN** switch: text, placeholders and titles repaint in place without a
+  reload, the changed view fades in, and focus moves to the view title. Card
+  entrance, a slow background gradient and the active language button's glow
+  are CSS animations; interactive elements have hover/focus feedback and
+  `prefers-reduced-motion` turns the motion off. Every other path 404s.
 - `GET /v1/share` — LAN URL(s) and the tictactoe entry URL a phone can open;
   `GET /v1/share/qr?text=<url>` — the same address as a native CoreImage PNG.
   With the default loopback bind `shareable` is false; `--lan` binds `0.0.0.0`
@@ -566,6 +579,26 @@ curl -s localhost:8000/v1/models/switch \
 | 409 | `error` | a slot is busy, a request is queued, the tokenizer is held, or a swap is running |
 | 500 | `error` | the replacement engine or its tokenizer failed to load after teardown |
 
+### Switching to the image model
+
+`MiniMax-H3-Image` is accepted by `/v1/models/switch`, but it is a separate
+image pipeline, not another text checkpoint. Configure its directory with
+`--img DIR` on `cwick serve` (or `CWICK_IMAGE_MODEL`; `--img` wins). The id
+appears in `/v1/models` with `cwick.kind:"image"` as soon as a directory is
+configured; `/v1/config` reports `image_model.dir` and `image_model.loaded`.
+
+Only one model is resident at a time. A switch to `MiniMax-H3-Image` releases
+the text engine first, then opens the image pipeline and returns `switched`, or
+`already_resident` when it is already open. With `--img` at startup the text
+engine is released once initialization completes, so the image model is the
+only one loaded. A switch back to any text id releases the image pipeline
+first. With no configured directory the image switch is refused with 400. A
+switch is refused with 409 while a text generation or an image render is in
+flight, and image requests are refused with 503 during a switch. The built-in
+console's **设置** tab uses the same call, with `GET /v1/config` driving the
+state pill and the button. See `docs/IMAGE.md` for the image request contract
+and measured timings.
+
 **Validation precedes teardown.** A switch first re-reads the target's
 `config.json` and runs the full model-contract check as a dry run; only after
 that passes does it release the old engine, tokenizer, Metal arena and prefix
@@ -594,6 +627,7 @@ dashboard must use the gauge to distinguish "serving" from "no model".
  "max_request_bytes":8388608,"context_window":512,"catalog_size":2,
  "web":true,"verbose":true,"trace":false,
  "prefix_cache":{"enabled":false,"block_tokens":4096},
+ "image_model":{"dir":"./models/MiniMaxAI/MiniMax-H3-Image","loaded":true},
  "log_capture":true,"log_retained":300,"models_dirs":["/models"]}
 ```
 
@@ -851,9 +885,9 @@ talks to the remote host itself, which also avoids CORS entirely.
 | method | path | answer |
 |---|---|---|
 | GET | `/v1/hub/search?q=<text>&limit=<n>` | `{"models":[…],"count":N,"endpoint":…,"error":…}` — a small projection of the remote catalog: id, downloads, likes, tags, pipeline tag, gated/private. `limit` is 1–50 (default 12). |
-| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` — every directory under the library root, with bytes, file count, partial bytes, `complete`, `resumable`, `supported` and (when false) `unsupported_reason`. |
+| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` — every directory under the library root, with bytes, file count, partial bytes, `complete`, `resumable`, `supported`, `kind` (`text` or `image`), an image-only `served_id`, and (when unsupported) `unsupported_reason`. |
 | DELETE | `/v1/hub/models/<name>` | remove a downloaded checkpoint. 200 `{"deleted":true,"path":…,"bytes":N,"files":N}`; 404 for an unknown or unsafe name; 409 for the resident model or a directory an active download is still writing. |
-| GET | `/v1/hub/downloads` | `{"jobs":[…]}` — the live job table: state, progress, bytes, files, current file, rate, ETA and error. |
+| GET | `/v1/hub/downloads` | `{"jobs":[…]}` — the live job table: state, progress, bytes, files, current file, rate, ETA, error and the retry state (`attempts`, `max_attempts`, `retry_in_seconds`). |
 | POST | `/v1/hub/download` | body `{"repo":"owner/name"}` → one job object. Idempotent for an already-active repository. |
 | POST | `/v1/hub/download/<id>/<action>` | `pause`, `resume`, `retry` or `cancel` → the updated job object. |
 
@@ -865,8 +899,15 @@ stream, so the job table is the only shared state.
 holding the full repository id. The startup scan registers both a flat
 `./models/<name>` layout and this owner/name layout in the model catalog, so a
 download finished earlier is switchable at startup, and one finished during
-this process is discovered by `POST /v1/models/switch` on demand. A directory
-is only "complete" when `config.json` exists and no `.incomplete` file remains.
+this process is discovered by `POST /v1/models/switch` on demand. A text
+checkpoint is "complete" when `config.json` exists and no `.incomplete` file
+remains. An image pipeline uses `model_index.json` instead of `config.json`, so
+it is complete when that manifest names the image pipeline and the transformer,
+VAE, text encoder, tokenizer and fused-head shard are all present, again with
+no `.incomplete` file. It is listed with `kind:"image"` and
+`served_id:"MiniMax-H3-Image"`; the model tab uses that id for a hot switch,
+which discovers the directory from the library even when the server was not
+started with `--img`.
 
 **Deleting.** `DELETE /v1/hub/models/<name>` accepts `owner/name`, a bare
 directory name, or a flat `./models/<name>` entry. The name is percent-decoded
@@ -888,8 +929,20 @@ a reboot therefore leave exactly the same state; the next run sends
 single files above 100 GiB and repositories of a few hundred GiB are handled
 without a 2 GiB or 4 GiB assumption. If the remote ignores `Range` and answers
 `200`, the partial file is truncated instead of receiving a second copy.
-`LOW_SPEED_TIME` turns a wedged transfer into an `error` job that can be
-retried, rather than a progress bar frozen at 93%.
+`LOW_SPEED_TIME` turns a wedged transfer into a retryable failure rather than a
+progress bar frozen at 93%.
+
+**Automatic retry.** A failed listing or shard transfer is retried in the
+worker, in place, with exponential backoff (1 s, 2 s, 4 s … capped at 30 s).
+Each attempt resumes from the `.incomplete` size via `Range`, so it never
+re-downloads bytes already on disk, and a successful step resets the counter —
+the budget is per stalled step, not per job. During backoff the job stays
+`running` and exposes `attempts`, `max_attempts` and a live
+`retry_in_seconds`; the UI shows a `自动重试 N/M · X s 后` badge. Only an
+exhausted budget (default 5) ends in `error`, with the last real cause and a
+`gave up after N attempts` suffix. The wait is checked every 100 ms, so
+`pause` / `cancel` / shutdown take effect immediately. `CWICK_HUB_RETRIES`
+overrides the budget (0 disables retry and restores fail-fast behaviour).
 
 **Catalog host.** `https://hf-mirror.com` by default; `CWICK_HUB_ENDPOINT`
 overrides it, then `HF_ENDPOINT` (the same variable `download_model.sh` reads).

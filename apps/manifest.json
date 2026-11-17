@@ -21,6 +21,16 @@
       "entry": "/apps/kart/index.html",
       "description": "H5 3D 跑圈小游戏：莫比乌斯环赛道，跑满一圈会翻面。前方路障只有一个来源——当前模型：每颗都由 /v1/systemone 在“种类 × 车道”的 12 个选项里实时选出，前方距离按速度由本地算出，模型不答路上就不放东西（没有本地随机兜底）。右侧栏展示模型决策统计与卡丁车跑圈数据，全部写入服务端 sqlite。",
       "meta": "3D · 莫比乌斯 · AI 实时放路障 · 跑圈 · sqlite"
+    },
+    {
+      "id": "imagegen",
+      "name": "H5 图像生成",
+      "tag": "H5",
+      "icon": "图",
+      "version": "1.0.0",
+      "entry": "/apps/imagegen/index.html",
+      "description": "输入 prompt，上传头像/服装/姿势参考图，一键调用本机 /v1/images/edits 与 /v1/images/generations；支持进度、在线查看与下载 PNG。本机同一时刻只运行一个模型。",
+      "meta": "图像 · 三参考图 · 进度 · 在线查看 · 下载"
     }
   ]
 }

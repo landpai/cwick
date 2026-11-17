@@ -95,7 +95,7 @@
         │        └── 槽位忙时照样应答——"能看着一次 30 分钟的 prefill"就靠它
         ├── /v1/hub/*    ──► hub.c（下载任务、模型目录）
         └── /  ├── web/     单页控制台，构建时嵌进二进制
-                └── apps/   两个 H5 应用，各自一个 sqlite 文件（store.c）
+                └── apps/   三个 H5 应用，各自一个 sqlite 文件（store.c）
                 └── models/ 在线下载的 checkpoint，启动时扫描
 
 这台机器上的状态
@@ -206,11 +206,11 @@ decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)
 `--web` 由二进制自己提供单页控制台——磁盘上没有静态资源，没有第二个进程，和 API 同端口。五个标签页：**对话**（流式，端点在 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 之间由面板上的**接口**选择切换，三者走同一条渲染路径，reasoning 与 tool calls 分区显示）、**应用**（应用市场）、**模型**（模型库）、**日志**（本进程的 stdout/stderr，环形缓冲，所以浏览器能跟住一个长期运行的 serve）、**设置**（控制台与设置合一）。设置页同时承载实时 `/v1/metrics`：解码速度、常驻内存、专家/前缀缓存命中率、TTFT 的四分钟趋势图；还有一个 Prometheus 指标浏览器：列出 `/v1/metrics` 全部序列的
 HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）为它单独画趋势，计数器还能切成每秒
 增量；再加 `cwick:model_info` 的全部标签、`cwick:model_loaded` 实时状态位、生成参数自定义、
-只读运行配置，以及本地模型切换（本构建无法装载的条目标为不支持且不可选）。所有请求都是同源的，**没有**把控制台指向外部 OpenAI 兼容地址的选项；仍可签发具名 API key 供其他客户端接入本机 cwick。
+只读运行配置，以及本地模型切换（本构建无法装载的条目标为不支持且不可选）。设置页另有图像模型面板：显示 `image_model.dir` / `loaded`，可热装载 `MiniMax-H3-Image`。顶栏的**中 / EN**切换会原地重绘文案、让内容区淡入、把焦点移到视图标题；卡片入场、背景渐变与当前语言按钮的光晕构成动效，`prefers-reduced-motion` 下自动关闭。所有请求都是同源的，**没有**把控制台指向外部 OpenAI 兼容地址的选项；仍可签发具名 API key 供其他客户端接入本机 cwick。
 
 **模型**标签页列出 `./models` 下已下载的权重、正在下载的任务（进度、速率、ETA），并提供模型目录的只读检索。下载由服务端后台执行：可暂停、继续、失败重试、取消；中断留下的部分文件在重启后用 Range 请求续传。单分片超过 100 GiB、整个仓库几百 GiB 全程用 64 位尺寸处理。五个接口与落盘布局见 `docs/SERVER.zh-CN.md`。
 
-市场里随 `apps/` 带两个 H5 应用，各自有 sqlite 库和 manifest。**井字棋**你执 X 先手，机器每一手都把棋盘与各空格的战术事实交给 `POST /v1/systemone`，问「落在哪一格赢的概率最大」，右侧栏画出每个空格的概率读数与双方的对弈过程。**3D 卡丁车**在莫比乌斯环上跑圈，模型实时随机决策在前方生成路障：每次重新洗牌 12 个选项、换随机种子与加压点，目标是把跑圈难度拉满；右侧栏分别是 AI 路障统计与卡丁车统计。对话页走面板上**接口**选中的那个端点；控制台只负责托管，每个应用在手机屏和桌面屏上各自排版。开 `--lan` 后每个应用有二维码，同 Wi-Fi 的手机不用知道地址就能打开。
+市场里随 `apps/` 带三个 H5 应用，各自有 sqlite 库和 manifest。**井字棋**你执 X 先手，机器每一手都把棋盘与各空格的战术事实交给 `POST /v1/systemone`，问「落在哪一格赢的概率最大」，右侧栏画出每个空格的概率读数与双方的对弈过程。**3D 卡丁车**在莫比乌斯环上跑圈，模型实时随机决策在前方生成路障：每次重新洗牌 12 个选项、换随机种子与加压点，目标是把跑圈难度拉满；右侧栏分别是 AI 路障统计与卡丁车统计。**H5 图像生成**接受提示词与可选的头像/服装/姿势上传，调用 `/v1/images/edits`（纯文本时走 `/v1/images/generations`），显示进度、在线预览并下载 PNG。对话页走面板上**接口**选中的那个端点；控制台只负责托管，每个应用在手机屏和桌面屏上各自排版。开 `--lan` 后每个应用有二维码，同 Wi-Fi 的手机不用知道地址就能打开。
 
 模型被问的是**决策**而不是文案；每个应用把自己那份状态（一局棋、一份决策日志、一圈成绩）写进 `--store` 下自己的 sqlite 文件。
 
@@ -243,16 +243,19 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | `--jev` / `--no-jev` | 关 | 打开 `POST|GET /v1/systemone`；`start.sh` 已打开 |
 | `--password P` / `--api-key NAME` | — | 单用户登录 / 给 Agent 平台的具名 key |
 | `--models-dir DIR` | — | 额外列出（最多 8 个）可切换的 checkpoint，一次只加载一个 |
+| `--img DIR` | `CWICK_IMAGE_MODEL` | 图像 checkpoint 目录；提供 `POST /v1/images/generations` 与 `/v1/images/edits`，并允许按需切换到 `MiniMax-H3-Image` |
 | `--store DIR` | `~/.cwick/apps` | 每个应用一个 sqlite，外加 `auth.db` |
 
-环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
+环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_IMAGE_MODEL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。两者都设置时 `--img` 优先。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/v1/models` | 常驻模型，加上 `--models-dir` 下找到的模型；每条带 `supported` / `unsupported_reason` |
-| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409 |
+| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。`MiniMax-H3-Image` 改为热装载图像管线，不触碰文本模型 |
+| POST | `/v1/images/generations` | 由 JSON prompt 返回 `b64_json` 图像；需要 `--img` / `CWICK_IMAGE_MODEL` 或按需切换图像模型 |
+| POST | `/v1/images/edits` | `multipart/form-data`，`image` 字段可重复；返回同样的图像响应 |
 | POST | `/v1/completions` | 纯文本补全，流式或非流式 |
 | POST | `/v1/chat/completions` | messages、`stream`、`tools`、`reasoning_effort` |
 | POST | `/v1/responses` | Responses 方言：输入 `input` items，输出 `response` 对象 / `response.*` 事件 |
@@ -328,7 +331,7 @@ argmax。
 prefill；`usage` 照样报 `input_tokens`、`cached_input_tokens`、`prefilled_tokens`、`reused_tokens`，省了多少——或者
 一点没省——是每个请求可见的，而不是靠推断。
 
-两个内置应用都使用这个接口：井字棋按「哪个空格赢的概率最大」在空格上做一次选择，取概率最高的落子；卡丁车的路障来自「种类 × 车道」的 12 选 1，每次请求的选项顺序都会重新洗牌。没有一个在生成需要浏览器解析的对象，每个都保留本地兜底，用于被拒或过慢的决策。
+其中两个内置应用使用这个接口：井字棋按「哪个空格赢的概率最大」在空格上做一次选择，取概率最高的落子；卡丁车的路障来自「种类 × 车道」的 12 选 1，每次请求的选项顺序都会重新洗牌。没有一个在生成需要浏览器解析的对象，每个都保留本地兜底，用于被拒或过慢的决策。第三个应用「H5 图像生成」走的是两个图像接口（`/v1/images/edits` 与 `/v1/images/generations`），以提示词加可选的头像/服装/姿势上传生成图像，支持进度、在线预览与 PNG 下载。
 
 ## 模型、上下文与内存
 
@@ -474,7 +477,7 @@ cwick/
 │   ├── store.c        每个应用一个 sqlite
 │   └── webui*.c       控制台，构建时嵌入
 ├── web/               控制台源码：index.html、app.js、app.css、login.html
-├── apps/              两个 H5 应用与 manifest.json
+├── apps/              三个 H5 应用与 manifest.json
 ├── models/            在线下载的权重（.gitignore）
 ├── docs/              架构、存储、性能、决策、服务端、精度
 ├── tests/             test_cwick.c——651 项检查

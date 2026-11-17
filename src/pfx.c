@@ -44,6 +44,10 @@ struct cwick_pfx_cache {
     int n_ents, cap_ents;
     uint64_t total_bytes;
     uint64_t seq;
+    /* Everything written after the last lookup belongs to the turn that is
+     * about to answer that lookup, and must survive until that turn has had
+     * its chance to be read back. See evict_to_fit. */
+    uint64_t batch_mark;
 };
 
 /* ------------------------------------------------------------------ */
@@ -289,9 +293,27 @@ static bool older_than(const pfx_entry *a, const pfx_entry *b) {
  * first lookup. Everything else stays eligible, including hit entries: among
  * those, last-use order decides, so a long session cannot grow without bound.
  *
- * When those two protected entries are all that is left, allow one snapshot
- * of overshoot on disk instead of deleting either. Losing the base costs a
- * full prefill on every following turn; the overshoot is one file. */
+ * "Just written" was not enough. One turn writes up to three snapshots (the
+ * prompt, the twin at the thinking-block boundary, and the conversation once
+ * generation ends), and only the *last* of them holds the newest sequence
+ * number. So the third store evicted the first two, and the next turn's own
+ * store evicted the third: at 50K tokens the twin -- the only entry whose
+ * prefix the next turn actually agrees with, since a client that drops
+ * reasoning_content re-renders the assistant turn differently -- lived for
+ * exactly 0 turns. Measured on a live session: 50 warm requests with zero
+ * full hits, the replayed length frozen at 54690 while the prompt grew to
+ * 55008, 100,522 tokens re-prefilled across 47 turns.
+ *
+ * The whole batch is therefore protected instead of its last member: entries
+ * written after the most recent lookup cannot be victims. That is exactly the
+ * window in which they are about to be read back. Everything written before
+ * that lookup is fair game again, so a long session still cannot grow without
+ * bound -- it just gets to use what it wrote.
+ *
+ * When those protected entries are all that is left, allow the batch to
+ * overshoot the cap instead of deleting them. Losing the base costs a full
+ * prefill on every following turn; the overshoot is bounded by one turn's
+ * snapshots. */
 static void evict_to_fit(cwick_pfx_cache *c) {
     while (c->total_bytes > c->cap_bytes && c->n_ents > 1) {
         int base = -1;
@@ -304,6 +326,7 @@ static void evict_to_fit(cwick_pfx_cache *c) {
         int victim = -1;
         for (int i = 0; i < c->n_ents; i++) {
             if (i == base || c->ents[i].last == c->seq) continue;
+            if (c->ents[i].seq >= c->batch_mark) continue;   /* this turn's own */
             if (victim < 0 || older_than(&c->ents[i], &c->ents[victim]))
                 victim = i;
         }
@@ -320,6 +343,9 @@ cwick_pfx_cache *cwick_pfx_open(const char *dir, uint64_t cap_bytes) {
     if (!c) return NULL;
     c->dir = cwick_strdup(dir);
     c->cap_bytes = cap_bytes;
+    /* Nothing on disk belongs to a turn in flight, so the first trim may
+     * evict anything but the base and the last file indexed. */
+    c->batch_mark = UINT64_MAX;
     if (!c->dir) { free(c); return NULL; }
 
     /* Rebuild the index from the headers already on disk: a restart should
@@ -385,7 +411,13 @@ void cwick_pfx_clear(cwick_pfx_cache *c) {
 /* Lookup                                                              */
 /* ------------------------------------------------------------------ */
 int64_t cwick_pfx_lookup(cwick_pfx_cache *c, const uint32_t *ids, int64_t n) {
-    if (!c || !ids || n <= 0 || c->n_ents == 0) return 0;
+    if (!c) return 0;
+    /* A lookup opens a turn: whatever is written from now on is what that
+     * turn -- and only that turn -- is going to read back, so eviction must
+     * keep it until the next lookup. Set before the early returns so an empty
+     * cache protects its first batch too. */
+    c->batch_mark = c->seq + 1;
+    if (!ids || n <= 0 || c->n_ents == 0) return 0;
 
     /* One pass: two rolling hashes, sampled at every cached prefix length.
      * A 30K-token prompt against a handful of entries is a few microseconds

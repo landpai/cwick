@@ -76,8 +76,9 @@ case "$1" in
         exit 2 ;;
 esac
 
-CWICK_SEED=42 ./cwick serve --root "$ROOT" --host 0.0.0.0 --lan --web --jev --port 8001 \
+CWICK_SEED=42 CWICK_H3_WIRE=1 ./cwick serve --root "$ROOT" --host 0.0.0.0 --lan --web --jev --port 8001 \
     --verbose --backend metal --trace \
+    --img ./models/MiniMaxAI/MiniMax-H3-Image/ \
     --context "$CTX"  --max-tokens 8192 \
     --prefix-cache-dir ./pfxcache --password "${CWICK_PASSWORD:-cwick-local}" \
     --store ./dbs/ --models-dir ./zai-org/GLM-5.3-Flash \

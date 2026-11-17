@@ -42,7 +42,7 @@
     currentId: null,
     busy: false,
     abort: null,
-    prefs: { api: 'chat', effort: 'extreme', maxTokens: 2048, stream: true, tools: false },
+    prefs: { api: 'chat', effort: 'extreme', maxTokens: 2048, stream: true, tools: false, lang: 'zh' },
     lastTokS: 0,
     view: 'chat',
     liveTimer: 0,
@@ -80,6 +80,164 @@
   }
   function nowMs() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+  /* ------------------------------------------------------------------ */
+  /* i18n — instant, no reload.                                          */
+  /*                                                                     */
+  /* Static text lives in the document as `data-i18n="key"`, and dynamic  */
+  /* text produced by this file goes through `t(key)`. Both read the same */
+  /* table, so adding a language is one object, not a second DOM pass.    */
+  /* The saved choice is merged into prefs by loadPrefs(); nothing here   */
+  /* talks to the server — the console chrome is entirely client-side.   */
+  /* ------------------------------------------------------------------ */
+  var I18N = {
+    zh: {
+      'doc.title': 'cwick · 本地对话',
+      'lang.title': '界面语言 / Interface language',
+      'nav.chat': '对话', 'nav.apps': '应用', 'nav.models': '模型',
+      'nav.logs': '日志', 'nav.settings': '设置',
+      'rail.sessions': '会话', 'rail.newChat': '新建会话 (Ctrl/⌘+K)',
+      'rail.memory': '常驻内存',
+      'status.connecting': '连接中', 'status.ready': '就绪',
+      'status.tokS': '上一次生成的解码速度',
+      'view.chat.title': '对话',
+      'view.chat.sub': '流式输出 · 思考强度可控 · 同源调用本机 OpenAI 兼容接口',
+      'view.apps.title': '应用',
+      'view.apps.sub': '内置 H5 小应用 · 直接调用本机同源 OpenAI 兼容接口',
+      'view.models.title': '模型',
+      'view.models.sub': '本地权重 · 下载进度与断点续传 · 从模型目录检索更多权重',
+      'view.logs.title': '日志',
+      'view.logs.sub': '进程自身的 stdout / stderr · 和启动它的终端看到同一份输出',
+      'view.settings.title': '设置',
+      'view.settings.sub': '监控趋势与模型信息 · 自定义生成参数 · 切换本地模型 · 运行配置只读',
+      'chat.emptyTitle': '在这台 Mac 上直接对话',
+      'chat.emptyBody': '页面由 cwick 自己托管，请求发往同源的',
+      'chat.emptyBody2': '或',
+      'chat.emptyBody3': '（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。',
+      'chat.ex1': '解释 MoE 与低内存', 'chat.ex2': '写一段 C 代码', 'chat.ex3': '做一份计划',
+      'chat.placeholder': '给 cwick 发消息…  Enter 发送 · Shift+Enter 换行',
+      'chat.api': '接口', 'chat.apiTip': '这一轮对话调用的接口：都走同一个引擎，只是请求/响应的信封不同',
+      'chat.effort': '思考强度', 'chat.maxOutput': '最大输出', 'chat.stream': '流式',
+      'chat.tools': '示例工具', 'chat.toolsTip': '声明示例工具，模型调用时由页面在本地执行',
+      'common.refresh': '刷新', 'common.loading': '读取中…',
+      'set.models': '本地模型',
+      'set.modelsTip': '切换会释放当前常驻权重并清空前缀缓存；生成中会被拒绝（409）',
+      'set.image': '图像模型',
+      'set.imageTip': '与文本模型相互独立；热切换只加载图像管线，不影响正在常驻的对话模型',
+      'set.imageIdle': '未加载', 'set.imageReady': '已加载',
+      'set.imageDir': '模型目录', 'set.imageEndpoints': '接口',
+      'set.imageLoad': '加载 / 切换到图像模型', 'set.checkModels': '查看模型列表',
+      'set.noImage': '未配置图像目录：启动时加 --img DIR，或设置 CWICK_IMAGE_MODEL',
+      'set.imageSwitching': '正在热加载图像模型…',
+      'set.imageOk': '✓ 图像模型已就绪，两个图像接口均可调用',
+      'set.imageFail': '✗ 图像模型加载失败：',
+      'hub.ready': '完整', 'hub.partial': '未下载完',
+      'hub.unsupported': '不支持', 'hub.archMismatch': '架构未适配，不能切换',
+      'hub.switchResident': '设为常驻', 'hub.switchImage': '切换到图像模型',
+      'hub.kindImage': '图像模型', 'hub.huge': '超大权重'
+    },
+    en: {
+      'doc.title': 'cwick · Local Chat',
+      'lang.title': 'Interface language',
+      'nav.chat': 'Chat', 'nav.apps': 'Apps', 'nav.models': 'Models',
+      'nav.logs': 'Logs', 'nav.settings': 'Settings',
+      'rail.sessions': 'Sessions', 'rail.newChat': 'New chat (Ctrl/⌘+K)',
+      'rail.memory': 'Resident memory',
+      'status.connecting': 'Connecting', 'status.ready': 'Ready',
+      'status.tokS': 'Decoding speed of the last generation',
+      'view.chat.title': 'Chat',
+      'view.chat.sub': 'Streaming · adjustable reasoning effort · same-origin calls to the local OpenAI-compatible API',
+      'view.apps.title': 'Apps',
+      'view.apps.sub': 'Built-in H5 apps · same-origin calls to the local OpenAI-compatible API',
+      'view.models.title': 'Models',
+      'view.models.sub': 'Local weights · download progress and resume · browse more weights from the model hub',
+      'view.logs.title': 'Logs',
+      'view.logs.sub': 'The process stdout / stderr · exactly what the launching terminal sees',
+      'view.settings.title': 'Settings',
+      'view.settings.sub': 'Metric trends and model info · generation preferences · switch local models · read-only runtime config',
+      'chat.emptyTitle': 'Talk to the model on this Mac',
+      'chat.emptyBody': 'This page is served by cwick itself. Requests go to the same-origin',
+      'chat.emptyBody2': 'or',
+      'chat.emptyBody3': '(pick the API below). The model runs entirely on this machine, weights stream from SSD, and the conversation never leaves it.',
+      'chat.ex1': 'Explain MoE and low memory', 'chat.ex2': 'Write a C function', 'chat.ex3': 'Make a plan',
+      'chat.placeholder': 'Message cwick…  Enter to send · Shift+Enter for a new line',
+      'chat.api': 'API', 'chat.apiTip': 'The endpoint this turn uses: all reach the same engine, only the request/response envelope differs',
+      'chat.effort': 'Reasoning', 'chat.maxOutput': 'Max output', 'chat.stream': 'Stream',
+      'chat.tools': 'Sample tools', 'chat.toolsTip': 'Declare sample tools; the page executes them locally when the model calls them',
+      'common.refresh': 'Refresh', 'common.loading': 'Loading…',
+      'set.models': 'Local models',
+      'set.modelsTip': 'Switching releases the resident weights and clears the prefix cache; refused (409) while generating',
+      'set.image': 'Image model',
+      'set.imageTip': 'Independent of the text model; a hot switch loads only the image pipeline and leaves the resident chat model untouched',
+      'set.imageIdle': 'Not loaded', 'set.imageReady': 'Loaded',
+      'set.imageDir': 'Model directory', 'set.imageEndpoints': 'Endpoints',
+      'set.imageLoad': 'Load / switch to image model', 'set.checkModels': 'View model list',
+      'set.noImage': 'No image directory configured: pass --img DIR at startup, or set CWICK_IMAGE_MODEL',
+      'set.imageSwitching': 'Hot-loading the image model…',
+      'set.imageOk': 'Image model ready; both image endpoints are available',
+      'set.imageFail': 'Failed to load the image model: ',
+      'hub.ready': 'Complete', 'hub.partial': 'Incomplete',
+      'hub.unsupported': 'Unsupported', 'hub.archMismatch': 'No matching kernel',
+      'hub.switchResident': 'Make resident', 'hub.switchImage': 'Switch to image model',
+      'hub.kindImage': 'Image model', 'hub.huge': 'Huge weights'
+    }
+  };
+  function t(key) {
+    var tab = I18N[state.prefs.lang] || I18N.zh;
+    return tab[key] != null ? tab[key] : (I18N.zh[key] != null ? I18N.zh[key] : key);
+  }
+  /* Repaint every tagged node. Called on boot and on language change. */
+  function applyI18n() {
+    var lang = state.prefs.lang === 'en' ? 'en' : 'zh';
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+    var txt = document.querySelectorAll('[data-i18n]');
+    for (var i = 0; i < txt.length; i++)
+      txt[i].textContent = t(txt[i].getAttribute('data-i18n'));
+    var ph = document.querySelectorAll('[data-i18n-ph]');
+    for (var j = 0; j < ph.length; j++)
+      ph[j].setAttribute('placeholder', t(ph[j].getAttribute('data-i18n-ph')));
+    var ti = document.querySelectorAll('[data-i18n-title]');
+    for (var k = 0; k < ti.length; k++)
+      ti[k].setAttribute('title', t(ti[k].getAttribute('data-i18n-title')));
+    var btns = document.querySelectorAll('#langSwitch .lang-btn');
+    for (var m = 0; m < btns.length; m++) {
+      var on = btns[m].getAttribute('data-lang') === lang;
+      btns[m].classList.toggle('is-active', on);
+      btns[m].setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  }
+  /* Switching language must not blank the user's own session labels. Those
+   * are re-rendered from data, so only the static chrome needs repainting. */
+  function setLang(lang) {
+    if (lang !== 'en' && lang !== 'zh') return;
+    state.prefs.lang = lang;
+    savePrefs();
+    applyI18n();
+    /* Re-capture the translated empty state and repaint it if visible, so
+     * switching language cannot leave stale text in an active conversation. */
+    if ($('emptyState')) EMPTY_HTML = $('emptyState').outerHTML;
+    renderMessages();
+    renderModelInfoStrings();
+    /* Content fade-in: re-trigger the animation on the main panel so the
+     * change reads as a transition, not a jump. */
+    var main = document.querySelector('.main');
+    if (main) {
+      main.classList.remove('lang-enter');
+      void main.offsetWidth;              /* force reflow to restart CSS anim */
+      main.classList.add('lang-enter');
+    }
+    /* Focus management: move keyboard focus to the content area so a
+     * screen-reader or keyboard user lands where the text just changed. */
+    var title = $('viewTitle');
+    if (title) { title.setAttribute('tabindex', '-1'); try { title.focus({ preventScroll: true }); } catch (e) { title.focus(); } }
+  }
+  /* Dynamic strings that the i18n pass cannot see because they are built in
+   * JS. Kept in one place so setLang() can refresh them in one call. */
+  function renderModelInfoStrings() {
+    if (state.view === 'settings') {
+      loadImageModelStatus();
+    }
+  }
 
   function loadPrefs() {
     try {
@@ -2596,6 +2754,58 @@
     }
   }
 
+  function imageNote(text, cls) {
+    var n = $('imageNote');
+    if (!n) return;
+    n.hidden = !text;
+    n.className = 'note' + (cls ? ' ' + cls : '');
+    n.textContent = text || '';
+  }
+
+  async function loadImageModelStatus() {
+    if (!$('imageStatePill')) return;
+    try {
+      var r = await fetch('/v1/config', { cache: 'no-store' });
+      if (authRedirect(r)) return;
+      var j = await r.json();
+      var im = j.image_model || {};
+      var dir = im.dir || '';
+      var loaded = !!im.loaded;
+      $('imageDir').textContent = dir || '—';
+      $('imageStatePill').textContent = t(loaded ? 'set.imageReady' : 'set.imageIdle');
+      $('imageStatePill').classList.toggle('is-ready', loaded);
+      var btn = $('imageSwitchBtn');
+      if (btn) {
+        btn.disabled = !dir;
+        btn.textContent = t(loaded ? 'set.imageReady' : 'set.imageLoad');
+      }
+      if (!dir) imageNote(t('set.noImage'), '');
+    } catch (e) { /* settings still usable without the image block */ }
+  }
+
+  async function switchImageModel() {
+    var btn = $('imageSwitchBtn');
+    imageNote(t('set.imageSwitching'), '');
+    if (btn) btn.disabled = true;
+    try {
+      var res = await fetch('/v1/models/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'MiniMax-H3-Image' })
+      });
+      if (authRedirect(res)) return;
+      var j = {};
+      try { j = await res.json(); } catch (e) {}
+      var detail = (j.error && j.error.message) || j.detail || ('HTTP ' + res.status);
+      if (res.ok) imageNote(t('set.imageOk') + ' (' + detail + ')', 'ok');
+      else imageNote(t('set.imageFail') + detail, 'bad');
+      setStatus(res.ok ? 'MiniMax-H3-Image' : 'HTTP ' + res.status);
+    } catch (e) {
+      imageNote(t('set.imageFail') + (e && e.message ? e.message : e), 'bad');
+    }
+    await loadImageModelStatus();
+  }
+
   async function loadSettings() {
     try {
       var rc = await fetch('/v1/config', { cache: 'no-store' });
@@ -2605,6 +2815,7 @@
       setStatus('无法读取 /v1/config');
     }
     await loadModelList();
+    await loadImageModelStatus();
     await loadAuthState();
     await loadKeys();
   }
@@ -2694,14 +2905,19 @@
       var ready = !!m.complete;
       var huge = m.bytes >= 100 * 1073741824;
       var supported = m.supported !== false;
-      var why = m.unsupported_reason || '该模型架构没有对应的推理内核';
+      var image = m.kind === 'image';
+      var served = m.served_id || m.id;
+      var why = m.unsupported_reason || t('hub.archMismatch');
       return '<div class="hub-card ' + (ready ? 'is-ready' : 'is-partial') + '">' +
         '<div class="hub-title">' + esc(m.id) +
-          (ready ? '<span class="hub-badge ok">完整</span>'
-                 : '<span class="hub-badge warn">未下载完</span>') +
+          (ready ? '<span class="hub-badge ok">' + t('hub.ready') + '</span>'
+                 : '<span class="hub-badge warn">' + t('hub.partial') + '</span>') +
+          (image ? '<span class="hub-badge info" title="' + esc(t('set.imageTip')) +
+            '">' + t('hub.kindImage') + '</span>' : '') +
           (ready && !supported
-            ? '<span class="hub-badge warn" title="' + esc(why) + '">不支持</span>' : '') +
-          (huge ? '<span class="hub-badge info">超大权重</span>' : '') +
+            ? '<span class="hub-badge warn" title="' + esc(why) + '">' +
+              t('hub.unsupported') + '</span>' : '') +
+          (huge ? '<span class="hub-badge info">' + t('hub.huge') + '</span>' : '') +
         '</div>' +
         '<div class="hub-sub">' + esc(m.repo) + ' · ' + esc(m.path) + '</div>' +
         '<div class="hub-meta">' +
@@ -2714,9 +2930,10 @@
         '<div class="hub-actions">' +
           (ready && supported
             ? '<button class="min-btn accent" type="button" data-hub-switch="' +
-              esc(m.repo) + '">设为常驻</button>'
+              esc(served) + '"' + (image ? ' title="' + esc(t('set.imageTip')) + '"' : '') +
+              '>' + t(image ? 'hub.switchImage' : 'hub.switchResident') + '</button>'
             : (ready ? '<span class="hub-badge info" title="' + esc(why) +
-                '">架构未适配，不能切换</span>' : '')) +
+                '">' + t('hub.archMismatch') + '</span>' : '')) +
           '<button class="min-btn danger" type="button" data-hub-delete="' +
             esc(m.repo) + '" title="删除本地权重（不可恢复）">删除</button>' +
         '</div></div>';
@@ -2732,6 +2949,7 @@
     }
     box.innerHTML = hub.jobs.map(function (j) {
       var pct = Math.max(0, Math.min(100, (j.progress || 0) * 100));
+      var waiting = (j.retry_in_seconds || 0) > 0;
       var cls = j.state === 'error' ? 'is-error' :
                 (j.state === 'running' || j.state === 'listing' || j.state === 'queued')
                   ? 'is-running' : '';
@@ -2762,10 +2980,18 @@
         acts += '<button class="min-btn accent" type="button" data-hub-switch="' +
                 esc(j.repo) + '">设为常驻</button>';
       }
+      /* A retry in flight is still a "running" job: say so explicitly, and
+       * show the countdown, so a backoff pause is not mistaken for a hang. */
+      var retryBadge = waiting
+        ? '<span class="hub-badge warn">自动重试 ' + (j.attempts || 0) + '/' +
+          (j.max_attempts || 0) + ' · ' + j.retry_in_seconds + ' s 后</span>'
+        : ((j.attempts || 0) > 0 && j.state !== 'done'
+            ? '<span class="hub-badge info">已重试 ' + j.attempts + ' 次</span>' : '');
       return '<div class="hub-job ' + cls + '">' +
         '<div class="hub-title">' + esc(j.repo) + hubStateBadge(j.state) +
           (huge ? '<span class="hub-badge info">超大权重</span>' : '') +
           (j.range_resume ? '<span class="hub-badge warn">已保留断点</span>' : '') +
+          retryBadge +
         '</div>' +
         '<div class="hub-meta">' +
           '<span>进度 <b>' + pct.toFixed(1) + '%</b></span>' +
@@ -2928,24 +3154,26 @@
      * inventory carries the compatibility verdict. Check here as well so a
      * click there never sends a request the server must refuse. */
     var local = (hub.local || []).filter(function (x) {
-      return x.repo === repo || x.id === repo;
+      return x.repo === repo || x.id === repo || x.served_id === repo;
     })[0];
     if (local && local.supported === false) {
       hubLocalNote('✗ 未发起切换：' +
         (local.unsupported_reason || '该模型架构没有对应的推理内核'), true);
       return;
     }
+    var target = (local && local.served_id) ? local.served_id : repo;
     hubLocalNote('正在校验并切换到 ' + repo + '…', false);
     try {
       var j = await hubReq('/v1/models/switch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: repo })
+        body: JSON.stringify({ model: target })
       });
       if (!j) return;
       hubLocalNote('✓ 已切换到 ' + repo, false);
       setStatus('模型已切换：' + repo);
       await loadModel();
       await hubLoadLocal();
+      if (local && local.kind === 'image') await loadImageModelStatus();
     } catch (e) {
       hubLocalNote('✗ 切换失败：' + (e && e.message ? e.message : e), true);
     }
@@ -2955,16 +3183,11 @@
   /* view / wiring                                                       */
   /* ------------------------------------------------------------------ */
   var VIEW_META = {
-    chat: { title: '对话',
-            sub: '流式输出 · 思考强度可控 · 同源调用本机 OpenAI 兼容接口' },
-    apps: { title: '应用',
-            sub: '内置 H5 小应用 · 直接调用本机同源 OpenAI 兼容接口' },
-    models: { title: '模型',
-            sub: '本地权重 · 下载进度与断点续传 · 从模型目录检索更多权重' },
-    logs: { title: '日志',
-            sub: '进程自身的 stdout / stderr · 和启动它的终端看到同一份输出' },
-    settings: { title: '设置',
-                sub: '监控趋势与模型信息 · 自定义生成参数 · 切换本地模型 · 运行配置只读' }
+    chat: { title: 'view.chat.title', sub: 'view.chat.sub' },
+    apps: { title: 'view.apps.title', sub: 'view.apps.sub' },
+    models: { title: 'view.models.title', sub: 'view.models.sub' },
+    logs: { title: 'view.logs.title', sub: 'view.logs.sub' },
+    settings: { title: 'view.settings.title', sub: 'view.settings.sub' }
   };
   function showView(v) {
     if (!VIEW_META[v]) v = 'chat';
@@ -2975,8 +3198,8 @@
     $('logsView').hidden = v !== 'logs';
     $('settingsView').hidden = v !== 'settings';
     $('sessionSection').style.display = v === 'chat' ? '' : 'none';
-    $('viewTitle').textContent = VIEW_META[v].title;
-    $('viewSub').textContent = VIEW_META[v].sub;
+    $('viewTitle').textContent = t(VIEW_META[v].title);
+    $('viewSub').textContent = t(VIEW_META[v].sub);
     var items = document.querySelectorAll('.nav-item');
     for (var i = 0; i < items.length; i++) {
       items[i].classList.toggle('is-active', items[i].dataset.view === v);
@@ -3073,6 +3296,14 @@
     for (var i = 0; i < navs.length; i++) {
       navs[i].addEventListener('click', function () { showView(this.dataset.view); });
     }
+
+    /* Language switch: instant, no navigation, persisted in prefs. */
+    var langs = document.querySelectorAll('#langSwitch .lang-btn');
+    for (var li = 0; li < langs.length; li++) {
+      langs[li].addEventListener('click', function () { setLang(this.getAttribute('data-lang')); });
+    }
+    var imgBtn = $('imageSwitchBtn');
+    if (imgBtn) imgBtn.addEventListener('click', switchImageModel);
 
     $('apiSel').addEventListener('change', function () {
       state.prefs.api = normalizeApi(this.value);
@@ -3232,8 +3463,11 @@
     /* Keep the served empty state as a string: renderMessages() wipes the
        container, and a cloned node would lose the delegated listeners it
        never had anyway. */
-    EMPTY_HTML = $('emptyState') ? $('emptyState').outerHTML : '';
     loadPrefs();
+    applyI18n();
+    /* Capture after translation so a later renderMessages() cannot restore
+     * the served (Chinese) copy over an English empty state. */
+    EMPTY_HTML = $('emptyState') ? $('emptyState').outerHTML : '';
     pmLoad();
     loadLogPrefs();
     loadSessions();

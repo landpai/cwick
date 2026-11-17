@@ -6,16 +6,18 @@
 
 ## Endpoint
 
-- `GET /v1/models`（以及 `/models`）—— 本实例知道的每一个本地模型，常驻的排在前面。每个条目带有 `cwick.root`、`cwick.loaded` 和 `cwick.supported`（为 false 时还有 `cwick.unsupported_reason`），因此客户端可以区分*正在应答的是什么*、*可能应答的是什么*，以及*这个构建根本无法装载的是什么*。
+- `GET /v1/models`（以及 `/models`）—— 本实例知道的每一个本地模型，常驻的排在前面。每个条目带有 `cwick.root`、`cwick.loaded` 和 `cwick.supported`（为 false 时还有 `cwick.unsupported_reason`），因此客户端可以区分*正在应答的是什么*、*可能应答的是什么*，以及*这个构建根本无法装载的是什么*。配置了图像目录时，还会多出一条带 `cwick.kind:"image"` 的 `MiniMax-H3-Image`。
 - `GET /v1/models/<id>`（以及 `/models/<id>`）—— 该形状的单个条目，否则 404 `code:"model_not_found"`。这是 OpenAI 的 retrieve-model 调用；agent 框架会用自己配置里的名字探测它一次，所以应答它可以避免一个 `/v1/chat/completions` 本来不会抛出的 "model not found"。id 会被百分号解码，因此带空格的 checkpoint 目录也能用。
 - `POST /v1/completions`（以及 `/completions`）—— 原始文本续写。
 - `POST /v1/chat/completions`（以及 `/chat/completions`）—— 对话，使用 CWICK chat 模板（`<|begin|><|system|>…<|end|><|user|>…<|end|><|assistant|>`）。
 - `POST /v1/responses`（以及 `/responses`）—— Responses 方言：输入 `input` items，输出 `response` 对象（或 `response.*` 事件）。prompt、队列、前缀缓存与 chat 完全同一套；见下面 **Responses API**。
 - `POST /v1/messages`（以及 `/messages`）—— Anthropic 方言：输入 `system` 与 content blocks，输出 `message` 对象（或 `message_start … message_stop` 事件）。同一个引擎、同一条适配器规则；见下面 **Messages API**。
   路径是在剥掉查询串之后才比较的，所以 Anthropic 客户端给每个请求都加的 `?beta=true` 无害；重复的 `/v1/v1/` 前缀也会被折叠 —— base URL 本身已经以 `/v1` 结尾时照常服务，而不是回 `404 unknown endpoint`。访问日志和 `--trace` 行仍然原样打印收到的路径。
+- `POST /v1/images/generations`（以及 `/images/generations`）—— JSON 请求，返回 `b64_json` 图像。
+- `POST /v1/images/edits`（以及 `/images/edits`）—— `multipart/form-data`，`image` 字段可重复；返回同一个响应形态。两者都要求已配置图像模型（`--img DIR`、`CWICK_IMAGE_MODEL`，或按需切换）；见 `docs/IMAGE.zh-CN.md`。
 - `GET /v1/metrics`（以及 `/metrics`）—— Prometheus 文本，采用 vLLM 的命名。`cwick:model_loaded`（1/0）是实时的常驻状态位；`cwick:model_info` 保留上一次成功装载的 checkpoint 标签。
 - `POST /v1/auth/login`、`GET /v1/auth/status`、`POST /v1/auth/logout` —— 单用户登录 endpoint。登录接受 `{"password":"..."}`，设置 HttpOnly 的 `cwick_session` cookie 并返回一个 Bearer token。配置了密码之后，其他每一个 API/metrics/logs endpoint 在没有它时都返回 401；`/`、应用 HTML 和管理页面则重定向到 `/login`。
-- `GET /v1/config`（以及 `/config`）—— 本进程正在运行的选项。只读：其中的一切都是装载期的选择（见下文）。
+- `GET /v1/config`（以及 `/config`）—— 本进程正在运行的选项，包括 `image_model.dir` 与 `image_model.loaded`。只读：其中一切都是装载期选择或状态报告（见下文）。
 - `POST /v1/models/switch` —— 把常驻模型换成目录中的另一个条目，无需重启。启动之后才下载完的 checkpoint 会在这里按需发现，不需要额外的刷新调用。本构建没有对应内核的架构、或契约校验不通过的 config，会在**释放任何东西之前**以 400 拒绝（见下文 **切换常驻模型**）。
 - `GET /v1/hub/models`、`GET /v1/hub/downloads`、`GET /v1/hub/search?q=…`、
   `POST /v1/hub/download`、`POST /v1/hub/download/<id>/<pause|resume|retry|cancel>`
@@ -24,7 +26,7 @@
 - `POST|GET|DELETE /v1/auth/keys` —— 供非浏览器客户端使用的 API key；需要登录会话（见下文 **鉴权**）。
 - `GET /v1/logs`（以及 `/logs`）—— 本进程自己的 stdout/stderr，来自捕获环形缓冲。`?since=<seq>&limit=<n>`。
 - `GET /v1/logs/stream` —— 同一个环形缓冲的实时 SSE 跟随输出。
-- `GET /`、`/web/app.css`、`/web/app.js` —— 内置控制台（chat、apps、models、logs、settings；指标与趋势图在 settings 里），以及 `GET /apps/manifest.json` + `/apps/<id>/...` 提供应用包，这两者仅在 `serve` 以 `--web` 启动时才有。它们被编译进二进制；应答时不占用生成槽位。其他所有路径都返回 404。
+- `GET /`、`/web/app.css`、`/web/app.js` —— 内置控制台（chat、apps、models、logs、settings；指标与趋势图在 settings 里），以及 `GET /apps/manifest.json` + `/apps/<id>/...` 提供应用包，这两者仅在 `serve` 以 `--web` 启动时才有。它们被编译进二进制；应答时不占用生成槽位。控制台带**中 / EN**切换：文本、placeholder 与 title 原地重绘，不刷新页面；内容区淡入，焦点移到视图标题。卡片入场、缓慢流动的背景渐变、当前语言按钮的呼吸光晕都是 CSS 动画；交互元素有悬停/聚焦反馈，`prefers-reduced-motion` 会关闭动画。其他所有路径都返回 404。
 - `GET /v1/share` —— 局域网 URL，以及手机可以打开的 tictactoe 入口 URL；`GET /v1/share/qr?text=<url>` —— 同一地址，以原生 CoreImage PNG 返回。在默认的 loopback 绑定下 `shareable` 为 false；`--lan` 绑定 `0.0.0.0`，用于可信的同一 Wi-Fi 网络（单用户密码登录；无 TLS）。
 - `GET /v1/store`、`/v1/apps/<id>/{state,events,games}` —— 应用自己的数据，存放在**每个应用一个** sqlite 数据库里（`--store DIR`、`$CWICK_STORE`，否则 `~/.cwick/apps`，每个应用拥有 `<id>.db`，而服务端的 key 放在它们旁边的 `auth.db` 里）。`--store FILE` —— 一个本身就是文件的路径，或带 `.db`/`.sqlite` 后缀的路径 —— 保留旧的单一共享数据库。`state` 是 key → JSON，`games` 是每场比赛一行，`events` 是逐手回放日志。值与 payload 都按到达时的确切 JSON 文本存储（进来时解析只是为了证明它*确实*是 JSON），每个上限 1 MiB；`<id>` 为 `[A-Za-z0-9_-]{1,64}`，不合规时是被拒绝而不是被转义。与模型处于同一登录之后，且在生成槽位之前应答。
 
@@ -369,6 +371,12 @@ curl -s localhost:8000/v1/models/switch \
 | 409 | `error` | 某个槽位忙、有请求在排队、tokenizer 被占用，或正在换模型 |
 | 500 | `error` | 旧模型已释放之后，替换引擎或其 tokenizer 装载失败 |
 
+### 切换到图像模型
+
+`MiniMax-H3-Image` 也可以传给 `/v1/models/switch`，但它是一条独立的图像管线，不是另一个文本 checkpoint。用 `cwick serve --img DIR` 配置它的目录（或用 `CWICK_IMAGE_MODEL`；`--img` 优先）。只要配置了目录，它就会以 `cwick.kind:"image"` 出现在 `/v1/models` 中；`/v1/config` 报告 `image_model.dir` 与 `image_model.loaded`。
+
+同一时刻只驻留一个模型。切换到 `MiniMax-H3-Image` 会先释放文本引擎，再打开图像管线，返回 `switched`，已经打开时返回 `already_resident`。启动时带 `--img` 时，文本引擎会在初始化完成后释放，因此只加载图像模型。切回任意文本 id 时会先释放图像管线。没有配置目录时图像切换返回 400；文本生成或图像渲染进行中时切换返回 409，切换期间图像请求返回 503。内置控制台的**设置**标签页走同一个接口，用 `GET /v1/config` 驱动状态标记与按钮。图像请求契约与实测耗时见 `docs/IMAGE.zh-CN.md`。
+
 **校验在拆解之前。** 切换会先重读目标的 `config.json` 并跑一遍完整的模型契约检查（dry-run），只有通过了才释放旧引擎、tokenizer、Metal arena 和前缀缓存。未知的 `model_type` 会被 400 点名拒绝，而不会再掉进默认几何解析器、最后报一个无关的字段缺失（嵌套 config 里 `text_config.pad_token_id` 为 null 时，明明外层有值却报「missing pad_token_id」就是这么来的）。这两种 400 都不释放任何东西：常驻模型继续服务，`cwick:model_loaded` 保持 1，日志里也不会出现 `switching to` / `released`。
 
 换模型进行中时，生成请求会被应答 503 `code:"model_switch"` 而不是排队：它们被校验时所依据的那个模型正在被拆掉。如果**拆解之后**替换才失败（权重损坏、缺张量、tokenizer 装载不了），服务端会带着「没有模型」继续运行，并应答 503 `code:"no_model"`，直到另一次切换成功 —— 它绝不会退回一个半初始化的引擎。此时 `cwick:model_loaded` 为 `0`。`cwick:model_info` 有意保留上一次的标签（指标名和标签在一个进程生命周期里必须稳定），所以监控面板要用这个 gauge 来区分「在服务」与「没有模型」。
@@ -381,6 +389,7 @@ curl -s localhost:8000/v1/models/switch \
  "max_request_bytes":8388608,"context_window":512,"catalog_size":2,
  "web":true,"verbose":true,"trace":false,
  "prefix_cache":{"enabled":false,"block_tokens":4096},
+ "image_model":{"dir":"./models/MiniMaxAI/MiniMax-H3-Image","loaded":true},
  "log_capture":true,"log_retained":300,"models_dirs":["/models"]}
 ```
 
@@ -587,9 +596,9 @@ CORS 问题。
 | 方法 | 路径 | 应答 |
 |---|---|---|
 | GET | `/v1/hub/search?q=<text>&limit=<n>` | `{"models":[…],"count":N,"endpoint":…,"error":…}` —— 远端目录的精简投影：id、下载量、点赞、tags、pipeline tag、是否 gated/private。`limit` 为 1–50（默认 12）。 |
-| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` —— 库根下的每个模型目录，含字节数、文件数、未完成字节、`complete`、`resumable`、`supported`，以及为 false 时的 `unsupported_reason`。 |
+| GET | `/v1/hub/models` | `{"root":"./models","models":[…]}` —— 库根下的每个模型目录，含字节数、文件数、未完成字节、`complete`、`resumable`、`supported`、`kind`（`text` 或 `image`）、图像模型专有的 `served_id`，以及不支持时的 `unsupported_reason`。 |
 | DELETE | `/v1/hub/models/<name>` | 删除已下载的 checkpoint。200 `{"deleted":true,"path":…,"bytes":N,"files":N}`；名字未知或不安全 404；常驻模型、或有下载线程正在写入该目录 409。 |
-| GET | `/v1/hub/downloads` | `{"jobs":[…]}` —— 实时任务表：状态、进度、字节、分片、当前文件、速率、ETA 与错误。 |
+| GET | `/v1/hub/downloads` | `{"jobs":[…]}` —— 实时任务表：状态、进度、字节、分片、当前文件、速率、ETA、错误，以及重试状态（`attempts`、`max_attempts`、`retry_in_seconds`）。 |
 | POST | `/v1/hub/download` | body `{"repo":"owner/name"}` → 一个任务对象。对已在下载的仓库是幂等的。 |
 | POST | `/v1/hub/download/<id>/<动作>` | `pause` / `resume` / `retry` / `cancel` → 更新后的任务对象。 |
 
@@ -599,8 +608,12 @@ CORS 问题。
 **文件落在哪。** `./models/owner/name/<path>`，并写一个 `.cwick-repo` 标记保存完整仓库 id。
 启动扫描同时识别扁平的 `./models/<name>` 与 `owner/name` 两层布局并把它们登记进模型目录，
 所以上一轮下载的 checkpoint 开机即可切换；本轮进程内下载完的，则由
-`POST /v1/models/switch` 按需发现。只有存在 `config.json` 且没有任何 `.incomplete` 残留时，
-一个目录才算「完整」。
+`POST /v1/models/switch` 按需发现。文本 checkpoint 只有存在 `config.json`
+且没有任何 `.incomplete` 残留才算「完整」。图像管线用 `model_index.json`
+代替 `config.json`：清单声明它是图像管线，且 transformer、VAE、文本编码器、
+tokenizer 与融合头分片都在，同样没有 `.incomplete` 残留时，才算完整。它以
+`kind:"image"` 与 `served_id:"MiniMax-H3-Image"` 列出；模型 tab 用这个 id
+热切换，即使服务启动时没有 `--img`，也会从模型库里找到该目录。
 
 **删除。** `DELETE /v1/hub/models/<name>` 接受 `owner/name`、裸目录名，或扁平的
 `./models/<name>` 条目。名字会先做百分号解码；含 `..`、反斜杠、绝对路径、空分量或 `.`
@@ -614,7 +627,15 @@ CORS 问题。
 出错、进程被杀、重启，留下的是同一种状态；下一次发 `Range: bytes=<size>-` 接着追加。所有
 尺寸都是 64 位（`curl_off_t`），单个文件超过 100 GiB、整个仓库几百 GiB 都不会撞上 2 GiB /
 4 GiB 的假设。若远端忽略 `Range` 而返回 `200`，会先截断部分文件再写，不会把两份拼在一起。
-`LOW_SPEED_TIME` 会把卡死的传输变成可重试的 `error` 任务，而不是一根永远停在 93% 的进度条。
+`LOW_SPEED_TIME` 会把卡死的传输变成一次可重试的失败，而不是一根永远停在 93% 的进度条。
+
+**自动重试。** 目录清单或分片传输失败后，worker 原地按指数退避重试（1 秒、2 秒、4 秒……
+封顶 30 秒）。每次尝试都从 `.incomplete` 大小用 `Range` 续传，绝不重下已在盘上的字节；某一步
+成功就把计数归零 —— 预算是按「卡住的那一步」算，不是按整个任务算。退避期间任务保持
+`running`，并给出 `attempts`、`max_attempts` 和实时倒数 `retry_in_seconds`，页面显示
+`自动重试 N/M · X s 后` 徽标。只有预算耗尽（默认 5 次）才以 `error` 结束，并保留最后一次
+真实原因加 `gave up after N attempts` 后缀。等待每 100 ms 检查一次，所以 `pause` / `cancel`
+/ 退出都能立刻生效。`CWICK_HUB_RETRIES` 可覆盖预算（0 关闭重试、回到快速失败）。
 
 **目录服务地址。** 默认 `https://hf-mirror.com`；`CWICK_HUB_ENDPOINT` 优先，其次
 `HF_ENDPOINT`（与 `download_model.sh` 读的是同一个变量）。`GET /v1/config` 里的

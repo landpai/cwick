@@ -73,6 +73,11 @@ core.*
 *.onnx
 *.incomplete
 
+# Machine probes built by skills/cwick-local-deploy/scripts/deploy.sh into the
+# checkout root. Compiled binaries, never shared: rebuild with
+#   clang -O2 -o .deploy-tools/hwprobe skills/cwick-local-deploy/scripts/hwprobe.c
+/.deploy-tools/
+
 # --- runtime state ---------------------------------------------------------
 # Prefix-cache KV snapshots (~217 MiB per 1000 prompt tokens).
 /pfxcache/
@@ -104,6 +109,7 @@ apps/**/*.sqlite3
 # The working spec: requirements and target numbers that change from session to
 # session. Kept beside the code on purpose, but untracked.
 /goal.md
+/sample.txt
 
 # Methodology notes for building this kind of runtime, kept locally: the
 # markdown is long-lived reference material for whoever works on the engine,

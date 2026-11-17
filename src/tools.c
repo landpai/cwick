@@ -863,3 +863,114 @@ cwick_decl_match cwick_tool_decl_match(cwick_tool_call *call,
     }
     return CWICK_DECL_UNKNOWN;
 }
+
+/* ------------------------------------------------------------------ */
+/* A call written inside an unterminated thinking block               */
+/* ------------------------------------------------------------------ */
+
+static bool is_space_byte(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* Last occurrence of `needle` starting before `limit` (byte offset into
+ * text). NULL when there is none. */
+static const char *rfind_str(const char *text, size_t limit, const char *needle) {
+    const size_t nl = strlen(needle);
+    if (limit < nl) return NULL;
+    for (size_t at = limit - nl + 1; at > 0; at--)
+        if (memcmp(text + at - 1, needle, nl) == 0) return text + at - 1;
+    return NULL;
+}
+
+/* Is `s` nothing but complete tool-call blocks separated by whitespace?
+ * The extractor walks from one `<tool_call>` to the next and ignores prose in
+ * between, so "call A, prose, call B" would otherwise read as two clean calls.
+ * Promotion must move framing only, never a sentence the model was thinking. */
+static bool span_is_only_blocks(const char *s) {
+    const size_t olen = strlen(CWICK_TOOL_CALL_OPEN);
+    const size_t clen = strlen(CWICK_TOOL_CALL_CLOSE);
+    const char *p = s;
+    int blocks = 0;
+    for (;;) {
+        while (is_space_byte(*p)) p++;
+        if (!*p) break;
+        if (strncmp(p, CWICK_TOOL_CALL_OPEN, olen) != 0) return false;
+        const char *close = strstr(p, CWICK_TOOL_CALL_CLOSE);
+        if (!close) return false;
+        p = close + clen;
+        blocks++;
+    }
+    return blocks > 0;
+}
+
+bool cwick_tools_trailing_calls(const char *text, size_t len,
+                                const cwick_tool_set *set,
+                                size_t *start, size_t *n_calls) {
+    if (!text || !set || !set->present || set->count == 0) return false;
+
+    size_t end = len;
+    while (end > 0 && is_space_byte(text[end - 1])) end--;
+    const size_t clen = strlen(CWICK_TOOL_CALL_CLOSE);
+    if (end < clen || memcmp(text + end - clen, CWICK_TOOL_CALL_CLOSE, clen) != 0)
+        return false;
+
+    size_t best_at = 0, best_n = 0;
+    size_t limit = end;              /* the close tag the suffix must end on */
+    /* Extend left one block at a time: a model that made two calls and then
+     * stopped is the same failure, and moving only the second would leave the
+     * first in the reasoning text where no client will ever run it. The bound
+     * is only there so a pathological output cannot turn this into a scan of
+     * the whole thinking block. */
+    for (int step = 0; step < 8; step++) {
+        const char *open = rfind_str(text, limit, CWICK_TOOL_CALL_OPEN);
+        if (!open) break;
+        size_t at = (size_t)(open - text);
+
+        char *span = cwick_xmalloc(end - at + 1);
+        memcpy(span, text + at, end - at);
+        span[end - at] = '\0';
+
+        cwick_tool_call *calls = NULL;
+        size_t n = 0;
+        char *visible = NULL;
+        cwick_error err;
+        cwick_error_clear(&err);
+        bool ok = span_is_only_blocks(span) &&
+                  cwick_tools_extract(span, &calls, &n, &visible, &err) == 0 &&
+                  n > 0;
+        if (ok) {
+            for (size_t i = 0; i < n; i++) {
+                if (calls[i].n_args == 0 ||
+                    cwick_tool_decl_match(&calls[i], set) == CWICK_DECL_UNKNOWN) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        free(visible);
+        if (calls) cwick_tool_calls_free(calls, n);
+        free(span);
+        if (!ok) break;
+
+        best_at = at;
+        best_n = n;
+
+        size_t back = at;
+        while (back > 0 && is_space_byte(text[back - 1])) back--;
+        limit = back;
+        if (limit < clen ||
+            memcmp(text + limit - clen, CWICK_TOOL_CALL_CLOSE, clen) != 0)
+            break;
+    }
+
+    if (!best_n) return false;
+    /* Nothing may be left behind: if an earlier `<tool_call>` is still in the
+     * reasoning text after the chain stopped (prose broke it, or the block
+     * never closed), promoting the tail would silently drop an action the
+     * model asked for. Refuse instead — an empty answer is visible, a missing
+     * call is not. */
+    if (rfind_str(text, best_at, CWICK_TOOL_CALL_OPEN)) return false;
+    if (start) *start = best_at;
+    if (n_calls) *n_calls = best_n;
+    return true;
+}

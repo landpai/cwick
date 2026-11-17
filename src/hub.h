@@ -54,7 +54,16 @@ char *cwick_hub_search(cwick_hub *h, const char *query, int limit,
 char *cwick_hub_models(cwick_hub *h, char *err, size_t errcap);
 
 /* GET /v1/hub/downloads — the live job table. One entry per download, with
- * progress, rate and ETA; polled by the UI, never pushed. */
+ * progress, rate, ETA and the automatic-retry state (`attempts`,
+ * `retry_in_seconds`); polled by the UI, never pushed.
+ *
+ * A failed transfer is retried in the worker with exponential backoff before
+ * the job is reported as `error`: a dropped connection is the normal case for
+ * a multi-hundred-GiB download, not something to hand back to the user. Every
+ * retry is a Range request from the existing `.incomplete` size, so attempts
+ * never re-download bytes already on disk. The worker stays interruptible
+ * throughout the backoff: pause, cancel and shutdown take effect immediately.
+ * `CWICK_HUB_RETRIES` sets the number of attempts (default 5, 0 disables). */
 char *cwick_hub_downloads(cwick_hub *h, char *err, size_t errcap);
 
 /* POST /v1/hub/download {"repo":"owner/name"} — start (or resume) a job. */
@@ -92,5 +101,9 @@ char *cwick_hub_delete(cwick_hub *h, const char *wanted, int *status,
 /* The library root, for the startup banner and /v1/config. */
 const char *cwick_hub_root(const cwick_hub *h);
 const char *cwick_hub_endpoint(const cwick_hub *h);
+
+/* Effective automatic-retry budget (CWICK_HUB_RETRIES, default 5). Read-only,
+ * exposed so the configuration contract can be checked without a network. */
+int cwick_hub_max_attempts(const cwick_hub *h);
 
 #endif /* CWICK_HUB_H */

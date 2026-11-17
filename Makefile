@@ -21,6 +21,7 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/ds_tables.c src/ds_quant.c src/ds_ops.c src/ds_model.c src/ds_engine.c \
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
+       src/h3.c src/h3_gpu.c src/h3_gpu.m \
        src/spine.c src/tensor.c src/pool.c \
        src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
        src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
@@ -31,7 +32,7 @@ HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/m
        src/tools.h src/pfx.h src/webui.h src/qr.h src/jev.h \
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
        src/mm.h src/mm_engine.h src/mm_prompt.h \
-       src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h
+       src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h src/h3.h src/h3_gpu.h
 
 # The chat UI and apps are compiled into the binary (see src/webui.h).
 # web/ and apps/ are the source of truth; src/webui_embed.c is generated and
@@ -55,6 +56,7 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
             src/ds_tables.c src/ds_quant.c src/ds_ops.c src/ds_model.c src/ds_engine.c \
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
+            src/h3.c src/h3_gpu.c src/h3_gpu.m \
             src/spine.c src/tensor.c src/pool.c \
             src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
             src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \

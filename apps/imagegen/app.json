@@ -1,0 +1,8 @@
+{
+  "id": "imagegen",
+  "name": "H5 图像生成",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "description": "H5 image studio: prompt + face/outfit/pose references -> /v1/images/generations or /v1/images/edits, with staged progress, inline preview and download.",
+  "storage": "server sqlite via /v1/apps/imagegen/state (job history), localStorage:cwick.imagegen.v1 fallback"
+}

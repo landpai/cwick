@@ -267,15 +267,16 @@ static void gemm_bf16_range(void *argp, int64_t t0, int64_t t1) {
     free(arena);
 }
 
-void cwick_gemm_bf16(float *out, int64_t rows, int64_t k, int64_t cols,
-                    const float *in, const void *w_bf16) {
+void cwick_gemm_bf16_tile(float *out, int64_t rows, int64_t k, int64_t cols,
+                          const float *in, const void *w_bf16, int64_t tile) {
     if (rows <= 0 || k <= 0 || cols <= 0) return;
     if (rows == 1) { cwick_gemv_bf16(out, k, cols, in, w_bf16); return; }
-    /* Tile over output rows of W: each worker holds CWICK_DEQ_TILE rows only,
-     * so extra memory is O(threads * tile * k), never O(cols * k). The tile
-     * deliberately stays small — lm_head is [154880, 4096], and growing the
-     * tile to cut dispatch count would make each worker's arena 64 MiB. */
-    int64_t tile = CWICK_DEQ_TILE;
+    /* Tile over output rows of W: each worker holds `tile` rows only, so extra
+     * memory is O(threads * tile * k), never O(cols * k). The default stays
+     * small — lm_head is [154880, 4096], and growing the tile to cut dispatch
+     * count would make each worker's arena 64 MiB. A caller whose activations
+     * are tall enough to amortise it can ask for a wider tile. */
+    if (tile < 1) tile = 1;
     if (tile > cols) tile = cols;
     int64_t ntiles = (cols + tile - 1) / tile;
     gemm_bf16_arg a;
@@ -283,6 +284,11 @@ void cwick_gemm_bf16(float *out, int64_t rows, int64_t k, int64_t cols,
     a.rows = rows; a.k = k; a.cols = cols; a.tile = tile;
     cwick_pool_init();
     cwick_pool_for(ntiles, &a, gemm_bf16_range);
+}
+
+void cwick_gemm_bf16(float *out, int64_t rows, int64_t k, int64_t cols,
+                    const float *in, const void *w_bf16) {
+    cwick_gemm_bf16_tile(out, rows, k, cols, in, w_bf16, CWICK_DEQ_TILE);
 }
 
 typedef struct {

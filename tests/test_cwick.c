@@ -38,6 +38,7 @@
 #include "../src/hub.h"
 #include "../src/q35.h"
 #include "../src/qr.h"
+#include "../src/h3.h"
 #include "pfx.h"
 #include "../src/sample.h"
 
@@ -2424,6 +2425,96 @@ static void test_tools(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 7b. A tool call written inside an unterminated thinking block       */
+/* ------------------------------------------------------------------ */
+/* The field failure: a 50K-token agent turn where the model decided to run a
+ * command, wrote the call while still thinking, and stopped. No `</think>`
+ * ever came, so everything was filed as reasoning_content, `content` was
+ * empty and finish_reason said "stop" — HTTP 200 with nothing to do. The
+ * promotion has to move exactly that shape and nothing else. */
+static void test_tool_promotion(void) {
+    cwick_tool_decl decls[2];
+    memset(decls, 0, sizeof(decls));
+    snprintf(decls[0].name, sizeof(decls[0].name), "Bash");
+    snprintf(decls[1].name, sizeof(decls[1].name), "get_weather");
+    cwick_tool_set set;
+    memset(&set, 0, sizeof(set));
+    set.present = true;
+    set.advertise = true;
+    snprintf(set.choice, sizeof(set.choice), "auto");
+    set.items = decls;
+    set.count = 2;
+
+    /* The observed shape, one sentence of thinking in front of a complete
+     * call. The prefix must survive as reasoning, the suffix must parse. */
+    const char *observed =
+        "第二张图下载失败了，让我单独下载它。\n"
+        "<tool_call>\n<function=Bash>\n"
+        "<parameter=command>ls -la</parameter>\n"
+        "</function>\n</tool_call>";
+    size_t at = 0, n = 0;
+    bool ok = cwick_tools_trailing_calls(observed, strlen(observed), &set, &at, &n);
+    CHECK(ok && n == 1 && at == strlen("第二张图下载失败了，让我单独下载它。\n"),
+          "a call inside an unterminated thinking block is recovered");
+    if (ok) {
+        cwick_error err;
+        cwick_error_clear(&err);
+        cwick_tool_call *calls = NULL;
+        size_t nc = 0;
+        char *vis = NULL;
+        int rc = cwick_tools_extract(observed + at, &calls, &nc, &vis, &err);
+        CHECK(rc == 0 && nc == 1 && strcmp(calls[0].name, "Bash") == 0 &&
+              calls[0].n_args == 1 && strstr(calls[0].arguments_json, "ls -la"),
+              "the promoted suffix parses into one call with its argument");
+        free(vis);
+        cwick_tool_calls_free(calls, nc);
+    }
+
+    struct {
+        const char *text;
+        bool want;
+        size_t want_n;
+        const char *why;
+    } cases[] = {
+        { "<tool_call>get_weather<arg_key>city</arg_key>"
+          "<arg_value>Beijing</arg_value></tool_call>", true, 1,
+          "a canonical GLM block at the very end is promoted" },
+        { "hmm\n\n<tool_call>get_weather<arg_key>city</arg_key>"
+          "<arg_value>Beijing</arg_value></tool_call>\n\n  ", true, 1,
+          "trailing whitespace is framing, not content" },
+        { "<tool_call>\n<function=Bash>\n</function>\n</tool_call>", false, 0,
+          "a zero-argument call is not promoted (the exact observed shape)" },
+        { "<tool_call>shell<arg_key>c</arg_key><arg_value>x</arg_value>"
+          "</tool_call>", false, 0,
+          "an undeclared tool is not promoted" },
+        { "<tool_call>get_weather<arg_key>city</arg_key><arg_value>B</arg_value>"
+          "</tool_call>\nstill thinking", false, 0,
+          "a call that is not the end of the turn is left alone" },
+        { "<tool_call>get_weather<arg_key>city</arg_key><arg_value>B</arg_value>"
+          "</tool_call>\n"
+          "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value>"
+          "</tool_call>", true, 2,
+          "two consecutive calls both move (one would be stranded)" },
+        { "<tool_call>get_weather<arg_key>city</arg_key><arg_value>B</arg_value>"
+          "</tool_call>\nand then\n"
+          "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value>"
+          "</tool_call>", false, 0,
+          "prose between calls stops the chain" },
+        { "just thinking out loud", false, 0, "no call at all" },
+        { "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value>"
+          "</tool_call>", true, 1,
+          "a case-folded name still promotes (decl_match folds it)" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t a2 = 0, n2 = 0;
+        bool got = cwick_tools_trailing_calls(cases[i].text, strlen(cases[i].text),
+                                              &set, &a2, &n2);
+        CHECK(got == cases[i].want && (!got || n2 == cases[i].want_n),
+              cases[i].why);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* 8. Chat prompt carries the tools a request declares                 */
 /* ------------------------------------------------------------------ */
 static void test_chat_tools_prompt(void) {
@@ -2906,6 +2997,82 @@ static void test_prefix_cache_equiv(void) {
         CHECK(kept_base == base_len,
               "prefix cache: growing turns keep the base prefix");
         cwick_prefix_state_free(&sgrow);
+    }
+
+    /* One turn does not write one snapshot, it writes three: the prompt, the
+     * twin at the thinking-block boundary, and the conversation once
+     * generation ends. Protecting only the *last* one written is therefore not
+     * enough -- the third store evicts the first two, and the twin is exactly
+     * the entry the next turn replays (a client that drops reasoning_content
+     * re-renders the assistant turn, so it never agrees with the conversation
+     * snapshot but always agrees with the twin). Measured on a live 50K
+     * session before this: 50 warm turns, zero full hits, the replayed length
+     * frozen at 54690 while the prompt grew to 55008. */
+    if (nids >= 9) {
+        const int64_t base_len = 3;
+        const int64_t P = 6;          /* the prompt, ending in the open block */
+        const int64_t twin = P - 2;   /* where the next turn stops agreeing */
+        const int64_t conv = nids > 8 ? 8 : nids;   /* prompt + generated */
+
+        char tdir2[1152];
+        snprintf(tdir2, sizeof(tdir2), "%s/pfxbatch", root);
+        cwick_pfx_cache *bc = cwick_pfx_open(tdir2, 1024);  /* room for ~1 */
+        int64_t hit_twin = 0, kept_base2 = 0;
+
+        cwick_prefix_state sbase, sp, stw, scv;
+        memset(&sbase, 0, sizeof(sbase));
+        memset(&sp, 0, sizeof(sp));
+        memset(&stw, 0, sizeof(stw));
+        memset(&scv, 0, sizeof(scv));
+        capture_at(eng, ids, base_len, &sbase, &err);
+        capture_at(eng, ids, P, &sp, &err);
+        capture_at(eng, ids, twin, &stw, &err);
+        capture_at(eng, ids, conv, &scv, &err);
+
+        if (bc && sbase.pos == base_len && sp.pos == P && stw.pos == twin &&
+            scv.pos == conv) {
+            cwick_error be;
+            cwick_error_clear(&be);
+            cwick_pfx_store(bc, ids, base_len, &sbase, &be);
+
+            /* Turn N: the lookup opens it, then three snapshots arrive that
+             * only this turn's next lookup can use. */
+            cwick_pfx_lookup(bc, ids, base_len);
+            cwick_pfx_store(bc, ids, P, &sp, &be);
+            cwick_pfx_store(bc, ids, twin, &stw, &be);
+            cwick_pfx_store(bc, ids, conv, &scv, &be);
+
+            /* Turn N+1: same conversation, re-rendered assistant turn. It
+             * agrees with turn N up to the twin and diverges after it. */
+            uint32_t next[32];
+            memcpy(next, ids, (size_t)nids * sizeof(uint32_t));
+            for (int64_t i = twin; i < nids; i++)
+                next[i] = (uint32_t)(9000 + i * 13);
+            hit_twin = cwick_pfx_lookup(bc, next, nids);
+            kept_base2 = cwick_pfx_lookup(bc, ids, base_len);
+
+            if (hit_twin != twin) {
+                int64_t ents = 0;
+                uint64_t by = 0;
+                cwick_pfx_stats(bc, &ents, &by);
+                fprintf(stderr, "  batch: P=%lld twin=%lld conv=%lld "
+                                "next-turn hit=%lld base=%lld entries=%lld "
+                                "bytes=%llu\n",
+                        (long long)P, (long long)twin, (long long)conv,
+                        (long long)hit_twin, (long long)kept_base2,
+                        (long long)ents, (unsigned long long)by);
+            }
+            cwick_pfx_close(bc);
+        }
+        CHECK(hit_twin == twin,
+              "prefix cache: a turn's boundary twin survives the turn's other "
+              "two stores");
+        CHECK(kept_base2 == base_len,
+              "prefix cache: the batch's snapshots do not evict the base");
+        cwick_prefix_state_free(&sbase);
+        cwick_prefix_state_free(&sp);
+        cwick_prefix_state_free(&stw);
+        cwick_prefix_state_free(&scv);
     }
 
     cwick_prefix_state_free(&st);
@@ -3992,12 +4159,58 @@ static void test_hub(void) {
     CHECK(cwick_write_file(cfg, "{}", 2) == 0, "hub: config.json written");
     CHECK(cwick_write_file(weights, "w", 1) == 0, "hub: a weight file written");
 
+    /* An image pipeline has no config.json. The library must still list it
+     * as a complete, switchable checkpoint instead of calling it unfinished. */
+    {
+        char img_owner[512], img[512], manifest[512], pdd[512], sub[512];
+        static const char *const manifest_json =
+            "{\"_class_name\":\"MiniMaxH3ImagePipeline\","
+            "\"_minimax_h3\":{\"partition\":\"image\"}}";
+        snprintf(img_owner, sizeof(img_owner), "%s/MiniMaxAI", root);
+        snprintf(img, sizeof(img), "%s/MiniMax-H3-Image", img_owner);
+        snprintf(manifest, sizeof(manifest), "%s/model_index.json", img);
+        snprintf(pdd, sizeof(pdd), "%s/pdd_fused_heads.safetensors", img);
+        CHECK(cwick_mkdir_p(img) == 0, "hub: image pipeline directory is created");
+        CHECK(cwick_write_file(manifest, manifest_json, strlen(manifest_json)) == 0,
+              "hub: image pipeline manifest written");
+        CHECK(cwick_write_file(pdd, "w", 1) == 0,
+              "hub: image fused-head shard written");
+        static const char *const subs[] = {
+            "transformer", "vae", "text_encoder", "tokenizer"
+        };
+        for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+            snprintf(sub, sizeof(sub), "%s/%s", img, subs[i]);
+            CHECK(cwick_mkdir_p(sub) == 0, "hub: image submodule directory exists");
+        }
+    }
+
     cwick_hub *h = cwick_hub_open(root, NULL);
     CHECK(h != NULL, "hub: library opens without a network");
     if (!h) return;
     CHECK(strcmp(cwick_hub_endpoint(h), "https://hf-mirror.com") == 0,
           "hub: the default catalog host is used when none is given");
     CHECK(strcmp(cwick_hub_root(h), root) == 0, "hub: the library root is honoured");
+    CHECK(cwick_hub_max_attempts(h) == 5,
+          "hub: a dropped transfer is retried 5 times by default");
+
+    /* The retry budget is configurable without a rebuild. Restore the variable
+     * immediately so no later test inherits it. */
+    {
+        const char *old = getenv("CWICK_HUB_RETRIES");
+        char *saved = old ? strdup(old) : NULL;
+        setenv("CWICK_HUB_RETRIES", "2", 1);
+        cwick_hub *h2 = cwick_hub_open(root, NULL);
+        CHECK(h2 && cwick_hub_max_attempts(h2) == 2,
+              "hub: CWICK_HUB_RETRIES overrides the retry budget");
+        if (h2) cwick_hub_close(h2);
+        setenv("CWICK_HUB_RETRIES", "0", 1);
+        h2 = cwick_hub_open(root, NULL);
+        CHECK(h2 && cwick_hub_max_attempts(h2) == 0,
+              "hub: zero retries disables automatic retry");
+        if (h2) cwick_hub_close(h2);
+        if (saved) { setenv("CWICK_HUB_RETRIES", saved, 1); free(saved); }
+        else unsetenv("CWICK_HUB_RETRIES");
+    }
 
     char err[256] = "";
     char *js = cwick_hub_models(h, err, sizeof(err));
@@ -4007,6 +4220,14 @@ static void test_hub(void) {
     CHECK(js && strstr(js, "\"supported\":false") != NULL &&
           strstr(js, "\"unsupported_reason\"") != NULL,
           "hub: the inventory reports whether the engine can load the checkpoint");
+    CHECK(js && strstr(js, "\"id\":\"MiniMax-H3-Image\"") != NULL &&
+          strstr(js, "\"kind\":\"image\"") != NULL &&
+          strstr(js, "\"served_id\":\"MiniMax-H3-Image\"") != NULL,
+          "hub: the image pipeline is listed with its served id");
+    CHECK(js && strstr(js, "\"kind\":\"image\"") != NULL &&
+          strstr(js, "\"complete\":true") != NULL &&
+          strstr(js, "\"supported\":true") != NULL,
+          "hub: a finished image pipeline is complete and supported");
     free(js);
 
     char *p = cwick_hub_local_path(h, "acme/tiny");
@@ -4015,6 +4236,10 @@ static void test_hub(void) {
     free(p);
     p = cwick_hub_local_path(h, "tiny");
     CHECK(p != NULL, "hub: a bare name resolves under its owner");
+    free(p);
+    p = cwick_hub_local_path(h, "MiniMax-H3-Image");
+    CHECK(p && strstr(p, "MiniMax-H3-Image") != NULL,
+          "hub: the image pipeline resolves without a config.json");
     free(p);
     p = cwick_hub_local_path(h, "../escape");
     CHECK(p == NULL, "hub: path traversal is refused");
@@ -4245,6 +4470,8 @@ static void test_webui(void) {
           "webui: apps/manifest.json is served as JSON");
     CHECK(manifest && strstr((const char *)manifest->data, "\"kart\"") != NULL,
           "webui: the manifest lists the kart app");
+    CHECK(manifest && strstr((const char *)manifest->data, "\"imagegen\"") != NULL,
+          "webui: the manifest lists the H5 image-generation app");
     const cwick_webui_blob *apps_alias = cwick_webui_lookup("/apps");
     const cwick_webui_blob *apps_alias2 = cwick_webui_lookup("/apps/");
     CHECK(apps_alias && apps_alias2 && manifest &&
@@ -4276,6 +4503,27 @@ static void test_webui(void) {
           memcmp(appdir->data, apphtml->data, apphtml->len) == 0 &&
           memcmp(appdir2->data, apphtml->data, apphtml->len) == 0,
           "webui: app directory aliases reach index.html");
+
+    /* The third app is the image studio: it must be embedded, must call the
+     * two image endpoints on this origin, and must expose prompt + three
+     * uploads + download. Its directory aliases resolve to its document. */
+    const cwick_webui_blob *igenjs = cwick_webui_lookup("/apps/imagegen/app.js");
+    const cwick_webui_blob *igenhtml = cwick_webui_lookup("/apps/imagegen/index.html");
+    const cwick_webui_blob *igendir = cwick_webui_lookup("/apps/imagegen/");
+    CHECK(igenjs && strstr(igenjs->content_type, "javascript") != NULL &&
+          strstr((const char *)igenjs->data, "/v1/images/edits") != NULL &&
+          strstr((const char *)igenjs->data, "/v1/images/generations") != NULL &&
+          strstr((const char *)igenjs->data, "FormData") != NULL &&
+          strstr((const char *)igenjs->data, "b64_json") != NULL,
+          "webui: the image app calls both image endpoints and uploads references");
+    CHECK(igenhtml && strstr((const char *)igenhtml->data, "id=\"prompt\"") != NULL &&
+          strstr((const char *)igenhtml->data, "data-input=\"face\"") != NULL &&
+          strstr((const char *)igenhtml->data, "data-input=\"outfit\"") != NULL &&
+          strstr((const char *)igenhtml->data, "data-input=\"pose\"") != NULL &&
+          strstr((const char *)igenhtml->data, "id=\"download\"") != NULL &&
+          igendir && igendir->len == igenhtml->len &&
+          memcmp(igendir->data, igenhtml->data, igenhtml->len) == 0,
+          "webui: the image app has prompt, three uploads, download and a dir alias");
 
     const cwick_webui_blob *login = cwick_webui_lookup("/login");
     const cwick_webui_blob *login2 = cwick_webui_lookup("/login.html");
@@ -5139,6 +5387,91 @@ static void test_q35_prefix(void) {
     free(blob);
 }
 
+
+static void test_h3_png(void) {
+    /* A PNG must survive encode/decode without resizing or permuting channels:
+     * the image routes hand these bytes straight to an OpenAI client. */
+    const int w = 11, h = 7;
+    float *src = cwick_xmalloc((size_t)w * h * 3 * sizeof(float));
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            for (int c = 0; c < 3; c++)
+                src[((size_t)y * w + x) * 3 + c] =
+                    (float)((x * 17 + y * 29 + c * 61) % 256) / 255.0f;
+    cwick_error err;
+    cwick_error_clear(&err);
+    size_t len = 0;
+    unsigned char *png = h3_png_encode(src, w, h, &len, &err);
+    CHECK(png != NULL && len > 8, "h3: PNG encode produces bytes");
+    if (png) {
+        float *dec = NULL;
+        int dw = 0, dh = 0;
+        CHECK(h3_png_decode(png, len, &dec, &dw, &dh, &err),
+              "h3: encoded PNG decodes again");
+        if (dec) {
+            CHECK(dw == w && dh == h, "h3: PNG round trip keeps dimensions");
+            int worst = 0;
+            for (size_t i = 0; i < (size_t)w * h * 3; i++) {
+                int d = (int)(fabsf(dec[i] - src[i]) * 255.0f + 0.5f);
+                if (d > worst) worst = d;
+            }
+            CHECK(worst <= 1, "h3: PNG round trip is lossless to one byte");
+            free(dec);
+        }
+        h3_png_free(png);
+    }
+    free(src);
+}
+
+/* The edit route hands the multipart body to this parser and then to the PNG
+ * decoder, so what matters is that the extracted span is exactly the part's
+ * payload, in order, and still pointing into the body. */
+static void test_h3_multipart(void) {
+    const char *b = "XBOUND";
+    char body[1024];
+    int n = 0;
+    n += snprintf(body + n, sizeof(body) - (size_t)n,
+                  "--%s\r\n"
+                  "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+                  "a fox\r\n"
+                  "--%s\r\n"
+                  "Content-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n"
+                  "Content-Type: image/png\r\n\r\n", b, b);
+    const int off_a = n;
+    /* The payload's last byte is '\n', but the two bytes before the boundary
+     * are not CRLF, so nothing may be trimmed from it. */
+    memcpy(body + n, "\x89PNG\r\n\x1a\n", 8); n += 8;
+    n += snprintf(body + n, sizeof(body) - (size_t)n,
+                  "\r\n--%s\r\n"
+                  "Content-Disposition: form-data; name=\"image\"; filename=\"b.png\"\r\n"
+                  "Content-Type: image/png\r\n\r\n", b);
+    const int off_b = n;
+    memcpy(body + n, "\x11\x22\x33", 3); n += 3;
+    n += snprintf(body + n, sizeof(body) - (size_t)n, "\r\n--%s--\r\n", b);
+
+    const unsigned char *ptr[H3_MAX_REFERENCES];
+    size_t len[H3_MAX_REFERENCES];
+    int got = h3_multipart_refs(body, (size_t)n, b, ptr, len, H3_MAX_REFERENCES);
+    CHECK(got == 2, "h3: multipart collects both image parts");
+    if (got == 2) {
+        CHECK(ptr[0] == (const unsigned char *)body + off_a,
+              "h3: image parts alias the body instead of being copied");
+        CHECK(len[0] == 8, "h3: a payload ending in LF keeps all its bytes");
+        CHECK(len[1] == 3, "h3: the CRLF before the next boundary is trimmed once");
+        CHECK(ptr[1] == (const unsigned char *)body + off_b,
+              "h3: parts stay in prompt order");
+        CHECK(memcmp(ptr[0], "\x89PNG\r\n\x1a\n", 8) == 0,
+              "h3: extracted bytes are the part payload");
+        CHECK(memcmp(ptr[1], "\x11\x22\x33", 3) == 0,
+              "h3: the second part extracts clean");
+    }
+    /* A body whose parts are not images is zero, not "the first part wins". */
+    CHECK(h3_multipart_refs(body, (size_t)n, "OTHER", ptr, len, 4) == 0,
+          "h3: a boundary that matches nothing yields no references");
+    CHECK(h3_multipart_refs(body, (size_t)n, b, ptr, len, 1) == 1,
+          "h3: the reference cap is honoured");
+}
+
 int main(void) {
     printf("cwick verification suite\n");
     test_bf16();
@@ -5152,6 +5485,7 @@ int main(void) {
     test_contract_and_engine();
     test_memory_plan();
     test_tools();
+    test_tool_promotion();
     test_chat_tools_prompt();
     test_server();
     test_store_per_app();
@@ -5183,6 +5517,8 @@ int main(void) {
     test_hub();
     test_jev_errors();
     test_jev_adapter();
+    test_h3_png();
+    test_h3_multipart();
     if (g_fail) {
         printf("\nRESULT: FAIL\n");
         return 1;

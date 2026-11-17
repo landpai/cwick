@@ -4222,3 +4222,654 @@ the delta over a scrape window is. A standalone render probe confirmed the
 values match the startup line (928514048 / 2147483648 / 1225496103).
 
 No model precision, weight, backend or context behaviour changed in this pass.
+
+## 68. An empty answer was two state machines that never met
+
+A 50,783-token agent turn ran for 773.9 s and returned `content: ""`. Every
+surface said success: HTTP 200, `finish_reason: "stop"`,
+`request_success_total` +1, and not one warn or error line in 2,161 lines of
+log. The only trace was the access-log tail `think=25 tools=0 content=0
+think_cap=512`, and the trace block that showed why:
+
+```
+<tool_call>
+<function=Bash>
+</function>
+</tool_call>
+```
+
+The model had decided to run a command, wrote the call while still inside its
+thinking block, and stopped. It never emitted `</think>`.
+
+**Four layers each did the reasonable thing.** `split_reasoning()` splits on
+`</think>`; with no close tag it files the whole text under reasoning and hands
+back an empty content. `cwick_tools_extract()` reads the answer only, so it saw
+no call. The finish reason is derived from the call count, so it said "stop".
+The Responses rule "a textless turn still needs a message item" then sent the
+client a message whose content was `""`. Nothing failed; the user got a blank
+bubble and no action.
+
+**The mechanism needs thinking to be on, and that is the point.** With the
+block closed by the template (`<think></think>`, thinking off) the answer starts
+in content (`closed_at_start`), so a `<tool_call>` can only be read as a call.
+Of the 13 turns on that instance, the only empty one was one of the 7 that
+thought; the 8 that did not never produced an empty answer. Turning thinking on
+by default would not have prevented this turn — it would have made every turn a
+candidate. A/B on the same checkpoint, 3 turns at `think_cap=512`, all closed
+their block normally and returned `tool_calls`: this is a tail risk that grows
+with context and tool count, not a broken switch.
+
+**Two changes, both narrow.** The server now recovers a trailing call when, and
+only when, all of these hold: the turn is chat with tools advertised, the block
+is genuinely unterminated (no `</think>` anywhere in the output), the text ends
+(after whitespace) with whole `<tool_call>` blocks, every block names a declared
+tool, and every block carries at least one argument. The argument rule carries
+the weight: the observed call had none, and promoting that shape would have
+handed the client `Bash({})` — a request certain to fail, which an agent answers
+by retrying. A second rule refuses when an earlier call would be left behind in
+the reasoning text, because a silently dropped action is worse than a visible
+empty answer. `cwick_tools_trailing_calls()` decides all of it, and nine unit
+cases pin the matrix (recovered, whitespace, zero arguments, undeclared tool,
+call not at the end, two consecutive calls, prose between calls, no call, folded
+name).
+
+When nothing qualifies the turn is still empty — but no longer silent:
+`cwick:empty_answers_total` counts every finished request that generated tokens
+and delivered neither content nor a call, and the access log gains an
+`empty answer:` line at info level. That counter is the only signal this failure
+produces, so it belongs next to the failure rate on any dashboard. A turn that
+was recovered carries `promoted=N` on its access-log line, because the phase
+counter reads markers out of the token stream and therefore still reports
+`tools=0` there.
+
+Streaming needs no special case: the arguments were already forwarded as
+reasoning deltas and no `tool_calls` delta was sent, so `stream_finish()`
+announces the parsed call in its closing chunk (`tool_std_settle()` is false
+when nothing was streamed), and `resp_stream_finish()` emits the function_call
+item the same way. The duplicated text is reasoning, which clients render as
+thinking, not as the answer.
+
+**What this does not fix.** The same session re-prefilled a 45K prompt it
+already had on disk, 688 s of the 773.9 s it spent. That is the cache defect in
+§67, not this one.
+
+## 69. A turn writes three snapshots and §67 protected only the last one
+
+§67 removed "the longest entry is the most evictable". Production says that was
+not enough. Across the 53 chat requests of 14:09-14:41 the cache sat at
+79.90 of 80.00 GiB with 49 snapshots; the disk held the contiguous chain
+`50458 -> 54690` plus the very last `55023`, while `54726 .. 54965` -- the
+eight most recent turns -- were all gone. Of 50 warm requests, **none was a full
+hit**: the replayed length stopped at "the previous prompt minus two tokens"
+every turn, re-prefilling 81-318 tokens (2.4-7.1 s), 100,522 tokens in total,
+and the last three turns degraded from 81 to 160 / 239 / 318 (`left`, 2.9 s ->
+7.1 s of prefill). The small-prompt sessions in the same window were fine: six
+of eight warm requests fully hit, 0.35 s of prefill on average.
+
+**Why: a turn writes a batch, and the guard covered one member.** A turn stores
+three snapshots -- the full prompt P, the twin at the thinking-block boundary,
+and the conversation once generation ends -- but `last == c->seq` protects only
+the **last** one written. So the third store evicted the first two, the second
+evicted the first, and the next turn's own store evicted the third. The twin is
+the only entry the next turn actually agrees with (a client that does not echo
+`reasoning_content` re-renders the assistant turn, so it matches up to the block
+boundary and no further); it lived for exactly zero turns. Above ~45K tokens a
+session therefore only ever had one frozen base that could never advance.
+
+**The fix promotes "the entry just written" to "the batch written this turn".**
+`cwick_pfx_lookup()` records `batch_mark = seq + 1` on entry and
+`evict_to_fit()` skips every entry with `seq >= batch_mark` -- everything stored
+between the last lookup and the next one, which is exactly the window in which
+it is about to be read back. Older entries stay eligible (hit entries still rank
+by last use), so a long session still cannot grow without bound; when only
+protected entries remain, the whole batch may overshoot the cap instead of one
+of its members being deleted.
+
+The regression test `prefix cache: a turn's boundary twin survives the turn's
+other two stores` pins it: one turn stores P / twin / conv, the next turn
+queries with a prompt that diverges after the boundary, and the hit must be the
+twin. Disable the guard and it fails (`next-turn hit=3`, the base, instead of 4;
+two entries left); enable it and it passes. `make test` 699/699 PASS, no
+warnings.
+
+**Measured A/B** (same machine, same 8-9K-token growing session, 10 turns,
+`--prefix-cache-gib 2` so eviction pressure arrives by turn 6):
+
+| policy | `left to prefill`, turns 3-10 | prefill of the last turn |
+|---|---|---|
+| before | 26, 26, 26, 36, **69, 102, 135, 168** | 3467 ms |
+| after | 26, 26, 26, 36, **35, 35, 35, 35** | 1669 ms |
+
+Before, every turn from the seventh paid "previous generation + new turn + 2"
+tokens again -- the same cadence the live 45K session showed (81 -> 160 -> 239 ->
+318). After, it is a constant.
+
+**The other snapshot in the same turn that nobody reads.** P ends *inside* the
+injected thinking block, which the next turn never resends when it re-renders
+the assistant message, so it matched on zero of 50 warm requests while costing
+1.63 GiB and one eviction per turn. The twin covers it for the price of
+re-prefilling two tokens. `pfx_save_now()` therefore computes the twin first and
+does not submit P at all when there is one (verbose log: `prompt snapshot at N
+tokens not stored: the boundary twin at N-2 covers it`), which takes the writes
+per turn from three to two (measured: 30 -> 20 stores over 10 turns).
+
+**And a 4x instrument error on the way past.** `host_wired_bytes` was computed
+at 4096 bytes per page, but Apple Silicon has used 16 KiB pages since M1, so the
+one gauge meant to prove "no swap" under-reported by exactly 4x: 8.37 GB against
+33.4 GB actually wired. `src/mem.c` now reads and caches
+`sysconf(_SC_PAGESIZE)`; the same instant reads 33.59 GB.
+
+No change to model precision, weights, backend or context behaviour, and nothing
+in §68 was touched.
+
+## 70. A dropped download is a retry, not an error the user has to notice
+
+The model tab already had the hard parts: a local inventory under `./models`, a
+read-only hf-mirror catalog search, per-file `.incomplete` files with Range
+resumption, 64-bit sizes for the multi-hundred-GiB checkpoints this machine
+actually downloads, and recursive delete confined to the library root. What it
+did not have was the one behaviour a long download cannot live without: when
+the connection drops, the job used to go straight to `error` and stay there
+until somebody clicked "断点续传".
+
+That is not an edge case here. A several-hundred-GiB checkpoint over a mirror
+sees a dropped transfer as routine. Measuring it was simple: point
+`CWICK_HUB_ENDPOINT` at a local catalog that serves half a file and closes the
+socket. The old worker entered `error` in 2 s and was still `error` 10 s later,
+with `transfer closed with 3145728 bytes remaining to read` — correct diagnosis,
+useless response. The bytes already on disk were intact; they just needed a
+human to ask for them.
+
+**What changed.** Both fallible network phases now share one retry path. The
+file listing (`/api/models/<repo>/tree/main`) and each shard download are
+retried in the worker with exponential backoff — 1 s, 2 s, 4 s … capped at
+30 s — up to a budget of five attempts by default (`CWICK_HUB_RETRIES`, 0
+disables). Every retry re-enters `download_file()`, which reads the size of the
+existing `.incomplete` and asks only for the remaining bytes with a Range
+request, so an attempt never re-downloads what is already on disk. A successful
+file or listing resets the counter: the budget is per stalled step, not per
+job, so a 200-file checkpoint that fails once early is not punished at file
+150.
+
+The wait is interruptible in 100 ms ticks. `pause`, `cancel`, and server
+shutdown take effect during a backoff instead of after it, which matters when
+the cap grows to 30 s. A retry keeps the job in `running`, not `error`: from the
+outside a transient outage is a slow download, not a failed one. Only an
+exhausted budget finishes as `error`, and the message keeps the last real cause
+with a `gave up after N attempts` suffix — it never replaces the diagnosis with
+a generic summary.
+
+`GET /v1/hub/downloads` now exposes `attempts`, `max_attempts` and
+`retry_in_seconds`. The model tab renders a `自动重试 N/M · X s 后` badge while
+waiting and an `已重试 N 次` badge after a recovered attempt, so a pause that
+would otherwise look like a hang has a visible reason. The heading says the
+same thing in words: default 5 retries, resumed from `.incomplete`, no duplicate
+bytes.
+
+**Measurement.** Two runs against the controlled catalog, same binary,
+`--backend metal` throughout (the download path does not touch the engine):
+
+| scenario | before | after |
+|---|---|---|
+| one mid-stream drop, then a clean retry | `error` at 2 s, still `error` at 10 s | `retry 1/5 in 1 s` in the log, `done` at 4 s, 5 MiB complete |
+| every transfer dropped, `CWICK_HUB_RETRIES=2` | `error` immediately | `running`, `attempts` 1/2 → 2/2, then `error` with `gave up after 2 attempts` |
+| every transfer dropped, `CWICK_HUB_RETRIES=8` | — | `running`, `attempts 5/8`, `retry_in_seconds` counting down, UI badge visible |
+
+The last row was checked in a real browser: the "正在下载" panel showed
+`mock/retry 下载中 自动重试 5/8 · 1 s 后` alongside progress, current file and
+the pause/cancel buttons. A separate probe confirmed that `pause` during a
+16 s backoff moves the job to `paused` without waiting out the timer.
+
+`make test` is 702/702 (the three new checks pin the default budget, the
+override and the zero-disables case without needing a network). The default
+stays 5 because that covers a mirror blip plus one re-dial at a 30 s ceiling;
+an operator on a stable link can set 0 and get the old fail-fast behaviour.
+
+## 71. The image output was two problems, and neither was the one the docs blamed
+
+The image endpoints had been returning HTTP 200 with an unusable picture since
+they were wired: at 256×256 an all-black frame, at larger sizes textured noise.
+`docs/IMAGE.md` listed the suspects — the conditioner's chat template and
+multi-dimensional rotary positions, the DiT's token refiner and three-axis
+RoPE, the row order of the packed sequence — and inference sat behind
+`CWICK_IMAGE_UNVERIFIED=1` so that "the pipeline completes" could not be
+mistaken for "the model works".
+
+The list was wrong. Two things were going on, and the first one hides the
+second.
+
+**The checkpoint does not work below about 4 MP.** Its released resolutions
+start at 4096×4096. Asking the reference implementation for 256×256 returns
+the *same* textured noise this port produced, which rules out a porting error
+by construction: that size is outside anything the weights were trained on.
+`h3_canvas_size()` now scales a request up to `min_generation_area`
+(4194304 by default, `CWICK_H3_MIN_AREA` overrides), keeps the aspect ratio,
+rounds both sides to a multiple of 32, and Lanczos-3 resizes the decoded image
+back to the requested size. A 512×512 request therefore costs one 2048×2048
+generation and returns it downsampled.
+
+**Then the stages could be compared one at a time.** With the canvas fixed,
+`CWICK_H3_DUMP` writes every intermediate and `CWICK_H3_LATENT` feeds a
+reference latent straight into the decoder, so a divergence can be attributed
+to a stage instead of to the stack. Fixed seed, 256² canvas, rel_rms against
+the reference:
+
+| tensor | rel_rms | cos |
+|---|---:|---:|
+| conditioner, 50 layers | 1.14e-2 | 0.999985 |
+| timestep embedding | 3.0e-6 | 1.000000 |
+| token refiner | 1.26e-2 | 0.999921 |
+| packed sequence | 4.4e-3 | 0.999991 |
+| DiT block 0 / block 49 | 6.4e-3 / 4.2e-2 | 0.999987 / 0.999125 |
+| final velocity | 2.9e-2 | 0.999591 |
+| decoded latent | 5.4e-2 | 0.998514 |
+
+Nothing here is a defect. The conditioner's 1.14e-2 is the largest relative
+number and the smallest actual error: 99.4% of its energy sits on the 1% of
+channels with the biggest activations, but it is uniform across tokens and
+channels (correlation −0.096 with row index, −0.114 with magnitude), which is
+what float noise looks like and not what a wrong template looks like. Two
+attempts to remove it by rounding — the residual stream in bf16, then thirteen
+individual conditioner operators — made it worse (1.14e-2 → 2.4e-2 and
+1.9e-1) and were reverted. Feeding the reference conditioner output in place
+of this port's moves the decoded latent by 5.45e-2 → 5.57e-2, which says the
+remaining error is in the transformer's accumulation order, not in
+conditioning.
+
+**The DiT was also ten times slower than it needed to be.** Its attention was
+a hand-written loop that streamed a whole row of keys per score: 4.2 GFLOPS
+measured, and 60% of a 12.0 s step at 512². Replacing it with two
+`cblas_sgemm` calls per 256-row band, a vDSP softmax with the max subtracted
+before `exp` (a raw score above 88 overflows fp32 and turns the row into NaN),
+and folding `1/sum` into the 128-wide output instead of normalising the score
+block took the 512² DiT from 344.7 s to 35.7 s with bit-identical output. At
+2048² the same change is gemm 95 s → 64 s and attention 129 s → 64 s per step;
+widening `H3_DEQ_TILE` from the 128-row default to 512 once the activation
+stack is at least 1024 rows tall is what carries the GEMM to 2.47 TFLOPS,
+close to the 2.7 TFLOPS a bare `cblas_sgemm` reaches on these shapes.
+
+The gate is gone: `h3_generate()` no longer consults `CWICK_IMAGE_UNVERIFIED`,
+and `start.sh` no longer sets it. The one request it still refuses is an image
+edit, and that refusal is about a path that genuinely does not exist (§73).
+
+## 72. Tiling the decoder was the correct answer and four times the speed
+
+Every image came back with a regular grid over it. The decoder had just been
+split into a whole-image pass, so the first suspicion was the transformer
+again — but decoding a *reference* latent with the DiT skipped reproduced the
+grid exactly, which put the fault in the last 24 layers and nowhere else.
+
+The reason is in the released module: `MiniMaxH3ImageViTDecoder2d` ships with
+`use_tiling = True` — 256 px tiles, a 64 px minimum overlap, linear
+cross-fade — and its docstring says the released images *are* the blended-tile
+ones, so turning tiling off changes the output. A 128×128 latent decoded in
+one pass puts a ViT that was released for a 16×16 window far outside that
+window, and the per-cell modulation it returns is the grid. A 16×16 latent is
+exactly one tile, which is why the earlier 256² alignment work never saw it.
+
+`h3_vae_decode()` now reproduces the released geometry (`_split_tiles`: count
+tiles until their overlaps can span the length, then hand the slack out one
+cell at a time so every boundary stays cell-aligned — at 2048² that is 11×11
+tiles with 80 px overlaps and 64 px on the last two boundaries), the
+`1 - i/e` / `i/e` weights, and the stitch order: cross-fade against the raw
+tile above, then against the raw tile to its left, then drop the far edges.
+
+Three things fell out of it:
+
+- **Memory.** The first tiled build was killed with SIGKILL (exit 137) at tile
+  108 of 121 with a 112 GiB peak. Every tile was re-copying all 391 decoder
+  tensors out of the mapping through `h3_standalone_f32` — 1.6 GiB of fp32
+  per tile, 121 times. Those tensors are read-only; the loader now returns a
+  pointer into the mapping, resolves all 391 once per image, and parses the
+  header once instead of 24 times per tile. Peak RSS 112 GiB → 48 GiB.
+- **Speed.** Attention inside a tile is 16×16 rather than 128×128. VAE time at
+  2048² went from 114028 ms to 26469 ms.
+- **Fidelity.** `c_rgb` rel_rms went from 8.2e-2 to 2.8e-3; 99.96% of pixels
+  are identical to the reference after the 8-bit truncation, at 79.2 dB PSNR.
+
+Two details each cost a pass. The first is that the 8-bit conversion belongs
+at the very end, not inside each tile: rounding the tiles before blending them
+costs up to two levels across every overlap band. The second is the blend
+itself. The weight belongs to the offset *inside* the band, so the horizontal
+branch has to carry `i` down to the pixel; blending the whole `e`-wide strip
+once per offset leaves only the last offset's weight applied to the strip, and
+because `cur <- a*(1 - i/e) + cur*(i/e)` is idempotent once `cur == a`, the
+band silently became a hard cut on the left tile's side. What gave it away was
+that vertical bands were exact and horizontal bands were not — the vertical
+branch writes one row per offset, the horizontal branch wrote the same strip
+every time. Laying the raw tiles back out through the reference
+`_stitch_tiles` in numpy reproduced the reference image to a mean absolute
+error of 0.00001 in the band, so the tiles themselves were never in doubt; the
+dump is kept as `c_rawrow%02d` under `CWICK_H3_DUMP` for the next time.
+
+## 73. `images/edits` answered with a fresh image instead of refusing
+
+The edit endpoint is supposed to return 501, because the reference-image path
+(VAE-encoding the references, `<Picture N>` labels, the vision blocks) is not
+bound. It returned 200 and a generated image.
+
+The refusal is decided by `n_ref`, and `n_ref` is counted by the multipart
+field extractor. That function walked the parts and returned as soon as it
+found the field it was asked for — so anything positioned *after* `prompt` was
+never seen, and `curl -F prompt=… -F image=@…` puts the image second. An edit
+request therefore turned into a plain text-to-image generation that ignored
+the reference entirely, which is precisely the failure the 501 exists to
+prevent, and it did it silently.
+
+The extractor now walks every part, counts the `image` parts and remembers the
+first matching named field instead of returning from inside the loop. Both
+field orders answer 501 in about a millisecond:
+`image editing is not implemented: reference images are not conditioned on
+yet`.
+
+## 74. The edit path is one image, two size rules, two tag vectors
+
+Binding `images/edits` means binding four stages that only exist when a
+reference is present: the VAE encoder, the vision tower, an edit-shaped
+conditioner, and a DiT layout with reference rows in front of the generated
+ones. Each one had a place where the released pipeline does something that
+looks like a detail and is not.
+
+**Sizes.** One reference is fed to two consumers and they disagree. The VAE
+copy targets a short edge in `[1024, 2048]`; the vision copy targets exactly
+`1024`; neither is derived from the other, both scale from the original, and
+neither is ever scaled to the generated canvas. A reference whose short edge is
+already inside the band keeps its own size — which the packed layout cannot
+take unless both sides divide by 32 twice, and every camera image hits that
+case, so the port rounds each side to the nearest 32 (at most 16 px) instead of
+raising.
+
+**Two tag vectors, and they are not the same vector.** The conditioner's
+`mm_token_type_ids` is 1 only on `<|image_pad|>`, which is what segments the
+3-axis mrope: `<|vision_start|>` and `<|vision_end|>` are text there, so the
+label and the start token form one text run. The transformer's `token_tags`
+marks the **whole** vision block including both delimiters, and that is what
+selects the AdaLN modality row. DiT step-0 velocity was 6.46e-1 off until the
+second vector was threaded through separately; text rows are modality 1, image
+rows 0, and a reference's vision block is image-tagged even though it lives in
+the text stream. Nothing in the layout announces that: the two vectors agree
+everywhere except at four `<|vision_start|>`/`<|vision_end|>` positions per
+reference, so the error looks like a broken rope table.
+
+**Timesteps.** The reference rows are noised to 0.999 and held; the generated
+rows follow the sampler. `unique(sorted=True)` over `[0.999, t]` is what turns
+that into two AdaLN rows, and which index each row gets depends on whether `t`
+is above or below 0.999 — reversing it silently conditions the generated rows
+at the reference level. The scheduler writes only `latents[num_reference_rows:]`,
+and the output head computes all image rows and then drops the reference ones.
+
+**Deepstack lands before `all_hidden_states`.** `hs[k]` is the layer-k output
+*without* `ds[k-1]` added, because the addition happens to the hidden state
+after the list entry is appended. Diffing against `hs[k]` and getting 4.9e-1 is
+not a bug in the tower.
+
+Alignment, 1024² reference and 1036 text rows, every number against the
+released pipeline on the same seed:
+
+| Tensor | rel_rms |
+|---|---:|
+| VAE encoder moments | 1.75e-6 |
+| reference latent | 2.71e-5, 98.4% bit-identical |
+| patch embed / `x0` / block 0 | 3.8e-7 / 3.5e-7 / 2.6e-6 |
+| vision last layer / merger / three deepstacks | 8.5e-5 / 2.8e-5 / 7e-6…2.6e-5 |
+| ids / types / tags, 1036 rows | zero mismatches |
+| 3-axis mrope positions | zero mismatches |
+| `hidden_states[1…3]` | 2.6e-5 / 2.1e-5 / 1.8e-5 |
+| conditioner `hs50` | 4.5e-5 |
+| reference rows, packed and noised | 4.4e-8 |
+| step-0 velocity, 1088 image rows | 6.5e-3 |
+
+The last row is the same magnitude as the text-to-image path, so the layout is
+right and the rest is the transformer's accumulation order.
+
+## 75. A null store one branch deep became `brk #1` 117 seconds into the request
+
+The first real `images/edits` call killed the server: exit code 133, SIGTRAP,
+and `serve.log` had no line for the request at all — the previous line was the
+400 from the malformed-image test. The crash report put the PC on a `brk #0x1`
+as the last instruction of `h3_vae_encode`, which is not something that
+function contains.
+
+`h3_vae_encode` wrote its latent dims back through `int64_t *o_lw, *o_lh`, and
+both call sites passed `NULL` — the callers compute the dims themselves. Two
+dead stores through null pointers. With both call sites inlining, the optimizer
+constant-propagated `null` into the function, recognised the stores as UB, and
+replaced the whole success block — the three stores and the `return true` — with
+`unreachable`, which the backend emits as `brk #1`. So the trap appeared at the
+*end* of a function on its success path, after 117 s of correct work, with no
+allocation or bounds symptom anywhere near it.
+
+Two things made this worth a section:
+
+- The distinguishing evidence is cheap and decisive: compiling one source file
+  to IR and counting `store …, ptr null` and `unreachable` finds this class
+  before it runs. The whole module now reports zero of both.
+- CLI testing had not covered it because the CLI run that exercised the same
+  code path injected `CWICK_H3_REF_LATENT` and skipped the encoder. Every stage
+  that a debug switch can replace still has to run once with the switch off.
+
+The two parameters are gone; the callee writes only `*out_lat`.
+
+## 76. Handing the image transformer's step to the GPU was two problems, and the arithmetic was neither
+
+One sampling step at 4096 image rows issues 66.3 GB of weight reads and 1346.6
+GMAC. The byte count is *identical* at 5 rows and at 4096 — it does not shrink
+with the sequence — and on the CPU each of those bytes made three passes through
+memory: the projection kernel dequantised every weight tile into an f32 arena
+and called `cblas_sgemm` on the copy. Measured, that is 12.6 GB/s of *weight*
+throughput against 1.24 TFLOPS of dense arithmetic.
+
+A standalone BF16 simdgroup kernel on the same shapes measures 3.8-5.4 TFLOPS,
+so the work was to feed it the checkpoint's own bytes. Two kernels:
+
+- **Projection**: a 64×64 output tile per threadgroup, 128 threads, four
+  simdgroups in a 2×2 arrangement of 32×32 blocks built from 8×8 fragments, K
+  walked in 16-wide blocks staged through 10 KB of threadgroup memory. The
+  weight tile is staged in the checkpoint's own `[n][k]` order and loaded with
+  the transpose flag, so 61 GiB of weights are never rearranged.
+- **Attention**: one threadgroup per (64 query rows, head), key range walked in
+  16-key blocks, no score matrix beyond one block. This is the term that grows
+  quadratically: 64.5 s of a 136.6 s step at 4096 rows, and 933 s/step if the
+  same shape is given a 2048² canvas worth of references.
+
+Four things were worth writing down.
+
+**A non-zero buffer offset cost 1.75x.** The same kernel and the same tiles:
+passing the tensor's page-aligned lead as `setBuffer:offset:` measured 291.7 ms
+on a 4103×5376×14336 projection; passing a buffer base of zero and adding the
+byte offset inside the kernel measured 167.0 ms. The offset also has to be a
+page for a no-copy buffer, while a safetensors payload is only 8-byte aligned,
+so the argument form is the one that generalises.
+
+**One view per shard, not per projection.** A step runs a few hundred
+projections over the same 61 GiB. Building a no-copy view per projection faulted
+that tensor's pages and kept the handle for the life of the process, so step
+time grew with the number of steps already taken — 62, 68, 72 s over steps 2-4.
+The shard mappings are adopted once at model open (3.1 s for 61.7 GiB, one page
+walk) and the tensor offset rides in the argument block.
+
+**The exponent needs the row maximum.** The first version took `exp(score)`
+directly, justified by "every head is RMS-normalised before the rope". That is
+true and irrelevant: the residual stream reaches four digits inside the first
+block, so a score of a few times 10⁴ overflows fp32 and everything after the
+first block is NaN — while `c_block0` still matched to 1.2e-3, which is what
+made it look like an accumulation problem rather than a range problem. A random
+probe cannot find this, because random inputs never produce a large score; the
+probe now takes an input scale and reproduces the failure at 100× and 4700×.
+The range fix is a first pass over the keys that collects the row maximum and a
+second that exponentiates against it: a streaming pass would need the running
+maximum, and applying its correction means rescaling the output accumulator,
+which is exactly what a set of matrix fragments cannot do element-wise. It costs
+2.3 s of a 74 s step.
+
+**The straddling rows of a threadgroup were written by the wrong threads.** Two
+independent bugs at the boundary of the last 64-row block, both invisible at run
+lengths that are multiples of 64: the staging copy-out advanced by 128 instead
+of the threadgroup's 256 threads, and the per-row normalise ran without a
+barrier against the store it was scaling. The row-wise probe found them in one
+run — `row 64…68 rel 0.86, row 68 rel 1.00` — and the fix is to let the owning
+simdgroup carry its own rows out and scale them in the same pass. `rel_rms`
+against a double reference is now 2.1-2.6e-3 at every length from 69 to 1024,
+and length-independent, which is what distinguishes rounding from geometry.
+
+Net effect at 4096 image rows: step 136.6 → 74.3 s, DiT 874 → 446 s, whole
+request 949 → 536 s. Attention 64.5 → 9.0 s; projections only 63.7 → 54.3 s,
+because the CPU path was already at 1.24 TFLOPS and the kernel reaches 1.51.
+The decoded pixels differ from the f32-activation CPU path by 8.6e-2 RMS — BF16
+staging of the activations, accumulating over 50 blocks × 6 steps, same scene
+and composition. `CWICK_H3_GPU=0` keeps any of this from happening.
+
+## 77. Wiring the transformer removes the page-reclaim tax, not the arithmetic
+
+A sampling step reads the same 66.3 GB of transformer weights six times. The
+checkpoint ships as two 62 GiB trees (text encoder and transformer), so with
+124 GiB of mappings on a 128 GiB machine something has to give: the OS reclaims
+weight pages between steps and the kernel refaults them in the middle of the
+projection loop. `CWICK_H3_WIRE=1` calls `cwick_safetensors_make_resident()`
+with `wire=1` on the transformer only. The text encoder stays reclaimable on
+purpose — it is read once per request, and wiring both trees would ask for more
+physical memory than exists.
+
+A/B, same machine, same 1536×2048 generation, seed 7, `--backend metal`, six
+steps, A run before B:
+
+| | unwired | wired |
+|---|---:|---:|
+| Model open | 3.5 s | 26.9 s (61.74 GiB, 2.5 GB/s) |
+| Projections, 6-step mean | 52.57 s | 44.93 s |
+| Step, 6-step range | 62.7 … 79.9 s | 60.2 … 60.7 s |
+| Step, standard deviation | 6.29 s | 0.17 s |
+| DiT | 419.7 s | 362.2 s |
+| Whole request | 506.8 s | 449.6 s |
+
+The mean gain is 13.7% on DiT; the standard deviation collapsing by 37× is the
+actual diagnosis. An unwired projection spends anywhere from 46.0 to 61.1 s on
+the same bytes because the page cache is revolting between steps, so the number
+to plan with was never the mean. After wiring, all six land in 44.6–45.1 s.
+The wiring cost is paid once per process: a one-shot CLI loses 23.5 s at open
+and still finishes 33 s earlier, and a long-lived server pays it only once.
+
+Two things did not change: the PNGs are byte-identical (same SHA-256), and the
+text-encode and VAE timings are inside noise. The 61.74 GiB does not become
+faster to read — it stops being reclaimed. This is why the earlier 2.2% delta
+between two 3-reference requests under 45 GiB of swap was misleading: that
+comparison held the cache state roughly constant, so it measured a workload
+whose pages happened to be hot. The variance across a single unwired run was
+the evidence hidden in plain sight.
+
+## 78. One image directory, two entry points, no text-model coupling
+
+`--img DIR` is now the documented way to configure the image checkpoint;
+`CWICK_IMAGE_MODEL` remains as a launcher fallback and loses when both are
+set. The directory is a lifetime choice copied into the server at startup,
+so an HTTP client can ask for `MiniMax-H3-Image` but cannot choose an
+arbitrary path. That keeps the switch endpoint's path handling unchanged.
+
+The image pipeline lives beside the resident text engine on `server_ctx.h3`,
+not in its generation slot. `GET /v1/models` therefore adds an entry with
+`cwick.kind:"image"`, `GET /v1/models/MiniMax-H3-Image` retrieves it, and
+`GET /v1/config` carries `image_model.dir` / `loaded`. A switch to
+`MiniMax-H3-Image` opens the pipeline from the configured directory and
+returns `switched` or `already_resident`; it returns 400 with no directory,
+409 while a *text* swap is running, and 500 if opening the checkpoint fails.
+Nothing releases the text model on that path, so the image endpoints can be
+configured, advertised and loaded without taking generation offline. The
+built-in settings panel reads the same config fields and posts the same
+switch request.
+
+For the console, language is a stored preference, not a page reload:
+`data-i18n` / `data-i18n-ph` / `data-i18n-title` cover static nodes, a small
+JS dictionary covers dynamic strings, and `setLang()` repaints, re-renders
+messages with the newly translated empty state, replays the content fade and
+moves focus to the view title. The entrance fade/slide, background gradient
+flow, active-language glow and hover/focus transitions are plain CSS;
+`prefers-reduced-motion` disables all of them. Verification was static —
+matching key sets, a syntax check of the embedded script, and HTTP fetches of
+the regenerated assets — plus `make cwick` and `make test`.
+
+## 79. The model library must recognise a pipeline directory
+
+The **模型** tab showed `MiniMax-H3-Image` as `未下载完` and refused to switch
+to it. The inventory had exactly one definition of "downloaded": a
+`config.json` at the checkpoint root, plus no `.incomplete` file. That is true
+for the text checkpoints and false for an image pipeline, whose root carries
+`model_index.json`, a fused-head shard and four submodule directories. The UI
+was reporting the layout mismatch correctly and the state was still wrong.
+
+Completeness is now format-aware: a text root still needs `config.json`; an
+image root needs a manifest naming the image pipeline plus the transformer,
+VAE, text encoder, tokenizer and fused-head shard, and neither may have a
+partial file. The inventory adds `kind` and, for images, `served_id`, so the
+button posts `MiniMax-H3-Image` instead of the repository path. The same
+completeness gate is used by `cwick_hub_local_path()`, and the switch handler
+falls back to the library when no `--img` was given, so a downloaded pipeline
+can be hot-loaded without adding a second way to describe its directory.
+Tests build a synthetic pipeline with no `config.json` and assert that it is
+listed as complete and switchable while a text checkpoint with an `.incomplete`
+file stays resumable.
+
+## 80. One resident model, and the H5 image studio
+
+The two pipelines used to coexist: `main` built the text engine before
+`cwick_server_run`, and `--img` then mapped the image checkpoint on top of it.
+On this machine that left roughly 63 GiB of image weights resident alongside
+the text weights, which is exactly the condition a 128 GiB host cannot afford.
+The rule is now one model at a time.
+
+When `--img` loads successfully at startup, the text engine is released as soon
+as every initialization step that reads it — metrics, tokenizer, catalog — has
+copied what it needs, just before the listener opens. Switching to
+`MiniMax-H3-Image` releases the text engine (all slots, tokenizer, Metal arena,
+prefix snapshots, live-engine pointer) before opening the image checkpoint;
+switching to a text id releases the image pipeline first, dropping the GPU's
+no-copy views before unmapping the shards. Both directions were measured on a
+live server: startup with `--img` left only the image entry `loaded`, a switch
+back to text dropped the image entry to `loaded:false`, and a switch to image
+again took 2.8 s. The catalog keeps the startup root as a switch-back target.
+
+A render lasts about 40 minutes, so freeing its model mid-flight would be a
+use-after-free. An `img_busy` counter under `gen_lock` joins the swap gate:
+while either a text generation or an image render is in flight a switch is
+refused with 409, and image requests are refused with 503 during a switch.
+Both pipelines report their `loaded` state from the one object that is actually
+resident, so the model list cannot claim two loaded models.
+
+The third hosted app, `apps/imagegen`, is a self-contained H5 studio for the
+two image endpoints. It takes a prompt plus optional face, outfit and pose
+uploads; the edit mode posts a multipart body with one `image` part per upload
+and calls `/v1/images/edits`, while the plain mode posts JSON to
+`/v1/images/generations`. Progress shows elapsed time and the per-stage timings
+from the response's `cwick` object (the API has no progress stream), and the
+result is shown inline and downloadable as PNG. History is mirrored to the
+per-app sqlite with a localStorage fallback, and the share button uses the same
+LAN QR endpoint as the other apps. Embedded-route assertions were added to the
+test suite, alongside `make cwick` and `make test`.
+
+
+## 81. Image generation logged each phase to stdout, not just the total
+
+A render is minutes long, but the image routes printed exactly one line — after
+the PNG was already encoded. During a 40-minute request stdout was silent, so
+there was no way to tell a progressing render from a hung one, and no way to
+attribute the wait to a stage without parsing the JSON response afterwards.
+
+The phase boundaries already existed in `h3_generate()` as the `h3_timing`
+fields, so the fix is to log them where they are measured rather than to invent
+a second progress mechanism. `CWICK_INFO("image", …)` now emits an arrival line
+in `srv_image_route()` (mode, requested size, seed, reference count) and, inside
+`h3_generate()`, one line per phase: tokenize, text-encode, pack, dit, vae and
+png. The DiT phase — the long pole at six sampling steps — gets a line per step
+with its own duration and cumulative elapsed time, plus a phase total. The
+completion line in the server was expanded from `(dit, vae)` to all six phases.
+No new flag was added: the shared logger already stamps the wall clock and the
+thread-local `[req N]`, and `info` is the level a foreground `serve` prints by
+default. Everything goes through the same logger, so the lines also land in the
+ring served by `GET /v1/logs`.
+
+Live `--backend metal` runs confirmed the format for both endpoints. A full
+generation (256x256, debug area floor lowered) printed all six phases and all
+six DiT steps under one `[req 1]`, 117284 ms total with dit 50673 ms; an
+`images/edits` request with one reference printed the `edit request` arrival
+line and the same phase sequence under `[req 2]`. The edits client hit the test
+harness timeout mid-render while the server kept rendering and logging — the
+stdout sequence stayed readable throughout. `make cwick` and `make test` pass.

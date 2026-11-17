@@ -167,6 +167,7 @@ static _Atomic uint64_t m_expert_misses;
 static _Atomic uint64_t m_pfx_queries;
 static _Atomic uint64_t m_pfx_hits;
 static _Atomic uint64_t m_pfx_reused;    /* prompt tokens skipped by a hit */
+static _Atomic uint64_t m_empty_answers; /* 200 OK, but nothing in `content` */
 
 static _Atomic uint64_t m_expert_reads;
 static _Atomic uint64_t m_expert_bytes;
@@ -275,6 +276,10 @@ void cwick_metrics_request_error(const char *kind) {
 
 void cwick_metrics_observe_ttft(double seconds) {
     hist_observe(&g_hists[H_TTFT], seconds);
+}
+
+void cwick_metrics_empty_answer(void) {
+    counter_add(&m_empty_answers, 1);
 }
 
 void cwick_metrics_request_finish(int64_t prompt_tokens, int64_t gen_tokens,
@@ -611,6 +616,14 @@ char *cwick_metrics_render(size_t *out_len) {
     emit_counter(&b, "cwick:requests_aborted_total",
                  "Requests abandoned by the client or stopped by Ctrl+C.",
                  atomic_load_explicit(&m_requests_aborted, memory_order_relaxed));
+    /* The one failure mode that looks like a success on every other metric:
+     * HTTP 200, finish_reason "stop", request_success_total +1, and an empty
+     * `content`. A model that stops inside its thinking block lands here. */
+    emit_counter(&b, "cwick:empty_answers_total",
+                 "Requests that generated tokens but returned neither content "
+                 "nor a tool call (the generation stopped inside the thinking "
+                 "block, or ran out of budget there).",
+                 atomic_load_explicit(&m_empty_answers, memory_order_relaxed));
 
     /* ---- gauges ---- */
     uint64_t used = atomic_load_explicit(&g_expert_used, memory_order_relaxed);
@@ -766,4 +779,12 @@ void cwick_metrics_log_summary(const char *tag) {
                   cwick_gib(atomic_load_explicit(&m_expert_bytes,
                                                 memory_order_relaxed)),
                   (unsigned long long)steps);
+    /* Only when it happened. A zero on every shutdown line would train the
+     * reader to skip the one number that means "the model answered nothing",
+     * and this failure looks like a success on every other line. */
+    uint64_t empty = atomic_load_explicit(&m_empty_answers, memory_order_relaxed);
+    if (empty > 0)
+        CWICK_INFO(tag, "metrics: %llu empty answer(s) — turns that generated "
+                       "tokens and returned neither content nor a tool call",
+                  (unsigned long long)empty);
 }

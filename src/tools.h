@@ -100,6 +100,31 @@ typedef enum {
 cwick_decl_match cwick_tool_decl_match(cwick_tool_call *call,
                                        const cwick_tool_set *set);
 
+/* ---- a call the model wrote inside an unterminated thinking block ---- */
+/* Some checkpoints decide to call a tool *inside* their reasoning block, write
+ * the call, and then stop — never emitting `</think>`. Everything then lands
+ * in `reasoning_content`, `content` is empty, and a client that asked for
+ * tools receives `finish_reason: "stop"` with nothing to run. This answers
+ * "does the output end in complete tool calls that are safe to move?":
+ * the text must end (after trailing whitespace) with one or more whole
+ * `<tool_call>…</tool_call>` blocks, every one must name a declared tool, and
+ * every one must carry at least one argument.
+ *
+ * The argument rule is the load-bearing one: a call with no arguments (the
+ * observed shape was `<function=Bash>` followed by an empty `</function>`)
+ * would be promoted into a request the client is certain to fail, and an
+ * agent that retries on failure turns one wasted turn into a loop. The second
+ * rule is that nothing may be left behind: a call that would stay in the
+ * reasoning text is a silently dropped action, so a run of calls that is not
+ * the whole tail is refused rather than half-moved.
+ *
+ * On success `*start` is the byte offset of the first promoted block and
+ * `*n_calls` how many it holds; the caller treats text[*start, len) as the
+ * answer. Returns false when nothing qualifies. */
+bool cwick_tools_trailing_calls(const char *text, size_t len,
+                                const cwick_tool_set *set,
+                                size_t *start, size_t *n_calls);
+
 /* ---- streaming side ------------------------------------------------- */
 /* One checkpoint prefixes every structural tag of a tool block with a namespace
  * token that is a single entry in its added-token table, so the bytes are

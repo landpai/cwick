@@ -32,6 +32,8 @@
 #include "sample.h"
 #include "tools.h"
 #include "jev.h"
+#include "h3.h"
+#include "h3_gpu.h"
 #include "hub.h"
 
 #include <arpa/inet.h>
@@ -109,6 +111,10 @@ typedef struct {
      * paid for once. Per-sequence state is per slot. */
     cwick_engine *eng[CWICK_GEN_SLOTS];
     cwick_tokenizer *tok;
+    h3_model *h3;                /* image pipeline, NULL when not configured */
+    /* Copy of --img / CWICK_IMAGE_MODEL. Kept so a settings switch can load
+     * the image pipeline on demand without restarting the process. */
+    char image_dir[CWICK_MODEL_ROOT_MAX];
     /* Token ids of the two think markers, probed once per loaded tokenizer
      * (startup and every model switch). -1 means the tokenizer does not hand
      * the marker over as a single token, which turns the thinking budget off
@@ -163,6 +169,11 @@ typedef struct {
      * single-slot server does not claim "all 3 slots are in use" and mislead
      * a client into retrying against capacity that was never there. */
     int nslots;
+    /* How many image generations are in flight. The image pipeline is the
+     * other half of the single-model slot: a switch frees its mappings, so it
+     * may only start once this is zero. Guarded by gen_lock, paired with
+     * gen_cv so a switch can wait instead of racing a 40-minute render. */
+    int img_busy;
     /* In-flight connection tracking: every accepted socket is served by its
      * own detached thread (a generation runs for minutes and must not block
      * /metrics, /v1/models or any other client), and shutdown drains them
@@ -4360,16 +4371,9 @@ static void pfx_save_now(void *user, cwick_prefix_state *s) {
          * s->pos is only part of the prompt. */
         const int64_t P = s->pos;
         if (P >= CWICK_PFX_MIN_TOKENS && P <= pc->nids) {
-            /* Handed to the writer thread rather than written here: this runs
-             * between the prefill and the first decode step, and a synchronous
-             * write of a large snapshot used to add seconds to the request and
-             * displace the resident weights (see pfx_submit). The snapshot is
-             * already captured, so nothing the request needs is at stake. */
-            pfx_submit(pc->srv, s, pc->ids, P, pc->tag);
-            s = NULL;   /* ownership moved */
-
-            /* And one boundary shorter, keyed on the tokens up to the point
-             * where the next turn will actually agree with this one.
+            /* Where does the next turn of this session stop agreeing with this
+             * one? One boundary earlier, keyed on the tokens up to the point
+             * where the next turn will actually agree with this prompt.
              *
              * A prompt that opens a thinking block ends with the block itself:
              * the open marker on its own when thinking is on, or a pre-closed
@@ -4390,9 +4394,20 @@ static void pfx_save_now(void *user, cwick_prefix_state *s) {
              *
              * So: search the tail for the open marker and key the twin there.
              * Falls back to P - 1 when there is none, which is the
-             * thinking-on case. */
+             * thinking-on case.
+             *
+             * The twin is also the only one of this turn's snapshots worth
+             * writing. Measured on a live 50K agent session, every turn stored
+             * three of them -- P, the twin, and the conversation -- and the
+             * next turn replayed the twin every single time while the copy at
+             * P, which ends inside a block the client never resends, matched
+             * nothing on any turn. It cost a 1.63 GiB store and an eviction
+             * per turn to store it. So when a twin exists, P is not written at
+             * all: a client that repeats the exact prompt hits the twin and
+             * prefills its last two tokens. */
+            int64_t twin = 0;
             if (pc->eng && P == pc->nids && P >= 2) {
-                int64_t twin = P - 1;
+                twin = P - 1;
                 if (pc->srv && pc->srv->think_open_id >= 0) {
                     int64_t from = P - 1 - 8;
                     if (from < 0) from = 0;
@@ -4403,20 +4418,45 @@ static void pfx_save_now(void *user, cwick_prefix_state *s) {
                         }
                 }
                 if (twin < 2) twin = P - 1;
+                /* Only a boundary twin is worth dropping P for. A marker far
+                 * from the end means this prompt did not end in a block, and
+                 * the full-prompt snapshot is the better bet. */
+                if (P - twin > 8) twin = 0;
+            }
+
+            bool twin_stored = false;
+            if (twin > 0) {
                 cwick_error e;
                 cwick_error_clear(&e);
                 cwick_prefix_state *sh = calloc(1, sizeof(*sh));
                 if (sh) {
                     if (cwick_engine_capture_prefix(pc->eng, twin, sh, &e) ==
-                        CWICK_OK)
+                        CWICK_OK) {
+                        /* Handed to the writer thread rather than written
+                         * here: this runs between the prefill and the first
+                         * decode step, and a synchronous write of a large
+                         * snapshot used to add seconds to the request and
+                         * displace the resident weights (see pfx_submit). The
+                         * snapshot is already captured, so nothing the request
+                         * needs is at stake. */
                         pfx_submit(pc->srv, sh, pc->ids, twin, pc->tag);
-                    else
+                        twin_stored = true;
+                    } else {
                         CWICK_VERB(pc->tag, "prefix capture at %lld tokens "
                                   "failed: %s", (long long)twin,
                                   cwick_error_message(&e));
+                    }
                     cwick_prefix_state_free(sh);
                     free(sh);
                 }
+            }
+            if (twin_stored) {
+                CWICK_VERB(pc->tag, "prompt snapshot at %lld tokens not stored: "
+                          "the boundary twin at %lld covers it and is the one "
+                          "the next turn replays", (long long)P, (long long)twin);
+            } else {
+                pfx_submit(pc->srv, s, pc->ids, P, pc->tag);
+                s = NULL;   /* ownership moved */
             }
         }
     }
@@ -5104,6 +5144,57 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
                         pfx_closed_at_start, &reasoning, &answer);
     else answer = cwick_strdup(text);
 
+    /* ---- a tool call the model wrote *inside* its thinking block ----
+     * Observed on a 50K-token agent turn: the model decided to run a command,
+     * wrote the call while still thinking, then stopped — no `</think>` ever.
+     * split_reasoning() therefore filed all 25 generated tokens under
+     * `reasoning_content`, `content` came back empty and `finish_reason` was
+     * "stop": the client saw HTTP 200 with nothing to do.
+     *
+     * The split is only wrong when the block is genuinely unterminated, so
+     * every condition below is that shape and nothing else. When they hold,
+     * the trailing call is moved out of the reasoning text and handed to the
+     * ordinary extractor — it then becomes `finish_reason: "tool_calls"` like
+     * any call the model wrote after closing the block.
+     *
+     * Streaming is safe here because the arguments were already forwarded as
+     * reasoning deltas and no `tool_calls` delta was sent: stream_finish()
+     * announces the parsed call in its closing chunk (tool_std_settle() is
+     * false when nothing was streamed), and resp_stream_finish() emits the
+     * function_call item the same way. */
+    bool promoted = false;
+    size_t promoted_n = 0;
+    if (gr->is_chat && gr->tools.present && gr->tools.advertise &&
+        !pfx_closed_at_start && answer && !*answer &&
+        !(srv->think_close_mk && strstr(text, srv->think_close_mk))) {
+        size_t cut = 0, n = 0;
+        if (cwick_tools_trailing_calls(reasoning, reasoning ? strlen(reasoning) : 0,
+                                       &gr->tools, &cut, &n)) {
+            /* Keep the thought that preceded the call; drop only the framing
+             * the client is about to execute. */
+            size_t head = cut;
+            while (head > 0 && (reasoning[head - 1] == '\n' ||
+                                reasoning[head - 1] == '\r' ||
+                                reasoning[head - 1] == ' ' ||
+                                reasoning[head - 1] == '\t'))
+                head--;
+            char *block = cwick_strdup(reasoning + cut);
+            char *kept = cwick_xmalloc(head + 1);
+            memcpy(kept, reasoning, head);
+            kept[head] = '\0';
+            free(answer);
+            free(reasoning);
+            reasoning = kept;
+            answer = block;
+            promoted = true;
+            promoted_n = n;
+            CWICK_INFO(req_tag(gr->rid),
+                       "tool call recovered from an unterminated thinking "
+                       "block: %zu call(s), no `</think>` in the output",
+                       n);
+        }
+    }
+
     /* ---- did the model call anything? ------------------------------
      * Tools are advertised in the checkpoint's own XML protocol, so any
      * answer is read back out of raw text. A malformed tool call is a
@@ -5202,6 +5293,14 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
         snprintf(tnote, sizeof(tnote), " think_cap=%lld%s", (long long)applied,
                  res.think_budget_hit ? "(hit)" : "");
     }
+    /* The phase counter reads markers out of the token stream, so a call that
+     * was promoted out of an unterminated thinking block is still counted as
+     * thinking there. Say so on the line, or it reads `tools=0` next to
+     * `finish=tool_calls` and looks like a contradiction. */
+    char pnote[40];
+    pnote[0] = '\0';
+    if (promoted)
+        snprintf(pnote, sizeof(pnote), " promoted=%zu", promoted_n);
     if (ncalls) {
         char names[192];
         names[0] = '\0';
@@ -5212,24 +5311,40 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
             strncat(names, calls[i].name, room);
         }
         snprintf(detail, detail_cap, "prompt=%lld completion=%lld "
-                 "finish=tool_calls calls=%s think=%zu tools=%zu content=%zu%s",
+                 "finish=tool_calls calls=%s think=%zu tools=%zu content=%zu%s%s",
                  (long long)nids, (long long)res.n_tokens, names,
-                 ph_counts[0], ph_counts[2], ph_counts[1], tnote);
+                 ph_counts[0], ph_counts[2], ph_counts[1], tnote, pnote);
     } else {
         /* `loop` is the access-log spelling of the loop guard's early stop;
          * on the wire it is a plain "stop" (OpenAI has no loop finish reason),
          * and the engine prints the period and the run next to its summary. */
         snprintf(detail, detail_cap, "prompt=%lld completion=%lld finish=%s "
-                 "think=%zu tools=%zu content=%zu%s",
+                 "think=%zu tools=%zu content=%zu%s%s",
                  (long long)nids, (long long)res.n_tokens,
                  res.loop_stopped ? "loop"
                                   : (res.stop_reason_length ? "length" : "stop"),
-                 ph_counts[0], ph_counts[2], ph_counts[1], tnote);
+                 ph_counts[0], ph_counts[2], ph_counts[1], tnote, pnote);
     }
 
     /* build the OpenAI response */
     const char *finish = ncalls ? "tool_calls"
                                 : (res.stop_reason_length ? "length" : "stop");
+
+    /* ---- the turn that answers with nothing --------------------------
+     * Everything above treats this as a healthy success: 200, "stop",
+     * request_success_total +1. The only signal is an empty `content`, which
+     * nobody watches, so a model that keeps stopping inside its thinking block
+     * can waste an agent's turns indefinitely without a single alert. Count it
+     * and say it once per occurrence — this is the metric an operator should
+     * graph next to the failure rate. */
+    if (!ncalls && ph_counts[1] == 0 && res.n_tokens > 0) {
+        cwick_metrics_empty_answer();
+        CWICK_INFO(req_tag(gr->rid),
+                   "empty answer: %lld tokens generated, none of them content "
+                   "or a tool call (think=%zu, finish=%s)",
+                   (long long)res.n_tokens, ph_counts[0], finish);
+    }
+
     int64_t prompt_tokens = nids;
     int64_t completion_tokens = res.n_tokens;
 
@@ -5620,6 +5735,27 @@ static const char *resident_served_name(server_ctx *srv) {
     return spec ? spec->model_type : "";
 }
 
+/* The image checkpoint is a separate pipeline, not a resident text engine:
+ * it never owns a generation slot, and it is advertised only when an image
+ * directory was configured. `kind:image` lets the settings UI tell it apart
+ * from a text checkpoint without parsing the model id. */
+static char *image_model_entry_json(server_ctx *srv) {
+    if (!srv->image_dir[0]) return NULL;
+    char *jid = json_str_alloc(H3_SERVED_ID);
+    char *jroot = json_str_alloc(srv->image_dir);
+    srv_buf b = {0};
+    if (jid && jroot)
+        sbuf_putf(&b,
+                  "{\"id\":%s,\"object\":\"model\",\"created\":%lld,"
+                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,"
+                  "\"loaded\":%s,\"supported\":true,\"kind\":\"image\"}}",
+                  jid, (long long)now_unix(), jroot,
+                  srv->h3 ? "true" : "false");
+    free(jid);
+    free(jroot);
+    return b.p;
+}
+
 static char *models_json(server_ctx *srv) {
     pthread_mutex_lock(&srv->gen_lock);
     const cwick_model_entry *cur = resident_entry(srv);
@@ -5650,6 +5786,12 @@ static char *models_json(server_ctx *srv) {
         free(jid);
         free(jroot);
     }
+    char *img = image_model_entry_json(srv);
+    if (img) {
+        if (srv->catalog.n) sbuf_puts(&b, ",");
+        sbuf_puts(&b, img);
+        free(img);
+    }
     pthread_mutex_unlock(&srv->gen_lock);
     sbuf_puts(&b, "]}");
     return b.p;
@@ -5663,6 +5805,11 @@ static char *models_json(server_ctx *srv) {
  * catalog" and the caller answers 404. */
 static char *model_json_one(server_ctx *srv, const char *id) {
     pthread_mutex_lock(&srv->gen_lock);
+    if (strcmp(id, H3_SERVED_ID) == 0 && srv->image_dir[0]) {
+        char *img = image_model_entry_json(srv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return img;
+    }
     const cwick_model_entry *cur = resident_entry(srv);
     const cwick_model_entry *hit = NULL;
     for (size_t i = 0; i < srv->catalog.n; i++) {
@@ -5721,6 +5868,7 @@ static char *config_json(server_ctx *srv) {
     char *jhost = json_str_alloc(srv->host);
     char *jlib = json_str_alloc(srv->hub ? cwick_hub_root(srv->hub) : "");
     char *jcat = json_str_alloc(srv->hub ? cwick_hub_endpoint(srv->hub) : "");
+    char *jimg = json_str_alloc(srv->image_dir);
     srv_buf b = {0};
     sbuf_putf(&b,
               "{\"model\":%s,\"model_root\":%s,\"host\":%s,\"port\":%d,"
@@ -5729,6 +5877,7 @@ static char *config_json(server_ctx *srv) {
               "\"context_window\":%lld,\"catalog_size\":%zu,"
               "\"web\":%s,\"verbose\":%s,\"trace\":%s,\"systemone\":%s,"
               "\"prefix_cache\":{\"enabled\":%s,\"block_tokens\":%lld},"
+              "\"image_model\":{\"dir\":%s,\"loaded\":%s},"
               "\"log_capture\":%s,\"log_retained\":%zu,"
               "\"model_library\":%s,\"model_catalog\":%s,"
               "\"models_dirs\":[",
@@ -5740,9 +5889,10 @@ static char *config_json(server_ctx *srv) {
               srv->verbose ? "true" : "false", srv->trace ? "true" : "false",
               srv->jev ? "true" : "false",
               srv->pfx ? "true" : "false", (long long)srv->pfx_block,
+              jimg ? jimg : "\"\"", srv->h3 ? "true" : "false",
               cwick_logcap_active() ? "true" : "false", cwick_logcap_lines(),
               jlib ? jlib : "\"\"", jcat ? jcat : "\"\"");
-    free(jid); free(jroot); free(jhost); free(jlib); free(jcat);
+    free(jid); free(jroot); free(jhost); free(jlib); free(jcat); free(jimg);
     for (int i = 0; i < srv->models_dirs_n; i++) {
         char *jd = json_str_alloc(srv->models_dirs[i]);
         sbuf_putf(&b, "%s%s", i ? "," : "", jd ? jd : "\"\"");
@@ -5922,7 +6072,8 @@ static int hub_route(server_ctx *srv, int fd, const char *method,
 /* Nothing may be using the engine or the tokenizer while they are freed and
  * rebuilt. Both conditions are checked under gen_lock in the same critical
  * section that flips `swapping`, so a request cannot sneak through between
- * the check and the teardown. */
+ * the check and the teardown. An in-flight image render is a third user: the
+ * two pipelines are mutually exclusive, so it has to drain too. */
 static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
     int busy = 0;
     for (int i = 0; i < CWICK_GEN_SLOTS; i++) if (srv->slot_busy[i]) busy++;
@@ -5939,7 +6090,52 @@ static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
                  srv->tok_users);
         return false;
     }
+    if (srv->img_busy > 0) {
+        snprintf(why, cap, "%d image generation(s) are in progress",
+                 srv->img_busy);
+        return false;
+    }
     return true;
+}
+
+/* Tear down the resident text side so the image pipeline can own the one
+ * model slot. Called with `swapping` already true and the gate already open,
+ * so no generation or tokenizer user can be holding these objects. The order
+ * matters: borrowers before the owner, then the Metal arena and the free
+ * pages, because the incoming checkpoint plans its budget against what is
+ * actually resident (see the same sequence in srv_switch_model). */
+static void srv_release_text_model(server_ctx *srv) {
+    for (int i = CWICK_GEN_SLOTS - 1; i >= 1; i--) {
+        if (srv->eng[i]) { cwick_engine_free(srv->eng[i]); srv->eng[i] = NULL; }
+    }
+    pthread_mutex_lock(&srv->gen_lock);
+    cwick_tokenizer *old_tok = srv->tok;
+    srv->tok = NULL;
+    srv->nslots = 0;
+    pthread_mutex_unlock(&srv->gen_lock);
+    if (old_tok) cwick_tokenizer_free(old_tok);
+    if (srv->eng[0]) { cwick_engine_free(srv->eng[0]); srv->eng[0] = NULL; }
+    if (srv->live_engine) *srv->live_engine = NULL;
+    cwick_metal_arena_release();
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
+    if (srv->pfx) {
+        pthread_mutex_lock(&srv->pfx_mtx);
+        cwick_pfx_clear(srv->pfx);
+        pthread_mutex_unlock(&srv->pfx_mtx);
+    }
+    cwick_metrics_set_model_loaded(false);
+}
+
+/* Symmetric teardown on the way back to a text model. The GPU's adopted
+ * buffers are no-copy views over the image shards: drop them before unmapping
+ * the weights, otherwise a later kernel call would read a freed mapping. */
+static void srv_release_image_model(server_ctx *srv) {
+    if (!srv->h3) return;
+    h3_gpu_shutdown();
+    h3_model_close(srv->h3);
+    srv->h3 = NULL;
 }
 
 /* Replace the resident engine with another root. Returns an HTTP status and
@@ -6021,6 +6217,16 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
                        "resident spine is most of the memory budget, so the "
                        "old weights have to go before the new ones are mapped",
               served_name(target), target->root, old_copy);
+
+    /* One model at a time: a text switch has to give the image pipeline back
+     * first. Its GPU views are no-copy over the shards, so they go before the
+     * mappings are unmapped. No image request can be in flight here — the
+     * gate above checked img_busy under gen_lock. */
+    if (srv->h3) {
+        CWICK_INFO("model", "releasing image model %s before loading %s",
+                   H3_SERVED_ID, served_name(target));
+        srv_release_image_model(srv);
+    }
 
     /* Borrowers before the owner: they borrow the owner's mmaps. */
     for (int i = CWICK_GEN_SLOTS - 1; i >= 1; i--) {
@@ -6190,6 +6396,97 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
     CWICK_INFO("model", "switched to %s — %zu model(s) in the catalog, %d "
                        "generation slot(s) live",
               served_name(target), srv->catalog.n, live);
+    return 200;
+}
+
+/* Hot-load the image pipeline without disturbing the resident text engine.
+ * The two are independent: an image request never touches a generation slot,
+ * so there is nothing to drain and no spine to release. A second switch while
+ * one is already loaded is the cheap "already_resident" answer. Failure to
+ * open leaves the text model and the rest of the server untouched. */
+static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
+                            bool *already) {
+    if (already) *already = false;
+    /* The model library can discover a downloaded image pipeline even when
+     * the process was not started with --img. Resolve it through the same
+     * completeness gate the library UI uses so a half-downloaded directory
+     * cannot become a request target. */
+    if (!srv->image_dir[0] && srv->hub) {
+        char *found = cwick_hub_local_path(srv->hub, H3_SERVED_ID);
+        if (found) {
+            int n = snprintf(srv->image_dir, sizeof(srv->image_dir), "%s", found);
+            free(found);
+            if (n < 0 || (size_t)n >= sizeof(srv->image_dir)) {
+                snprintf(msg, msgcap, "image model directory is too long");
+                srv->image_dir[0] = '\0';
+                return 400;
+            }
+            CWICK_INFO("model", "discovered image model at %s", srv->image_dir);
+        }
+    }
+    if (!srv->image_dir[0]) {
+        snprintf(msg, msgcap, "no image directory configured: pass --img DIR, "
+                              "set CWICK_IMAGE_MODEL, or download "
+                              H3_SERVED_ID " into the model library");
+        return 400;
+    }
+    if (srv->h3) {
+        if (already) *already = true;
+        snprintf(msg, msgcap, "image model already loaded from %s", srv->image_dir);
+        return 200;
+    }
+    char why[256];
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->swapping) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "a model swap is already in progress");
+        return 409;
+    }
+    if (!swap_gate_open(srv, why, sizeof(why))) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "cannot switch to the image model now: %s", why);
+        return 409;
+    }
+    if (srv->stop_owner && *srv->stop_owner) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "server is shutting down");
+        return 503;
+    }
+    srv->swapping = true;
+    pthread_mutex_unlock(&srv->gen_lock);
+
+    /* One model at a time. Only after the gate is closed do we drop the text
+     * engine — the image checkpoint itself is verified below, and a failed
+     * open leaves this instance with no resident model (the generation paths
+     * already answer 503 in that state), which is preferable to keeping two
+     * 60 GiB weight banks mapped at once. */
+    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0]) : "(none)";
+    CWICK_INFO("model", "switching to image model %s (%s) — releasing text "
+                        "model %s first", H3_SERVED_ID, srv->image_dir, old);
+    srv_release_text_model(srv);
+
+    cwick_error ie;
+    cwick_error_clear(&ie);
+    h3_model *m = h3_model_open(srv->image_dir, &ie);
+    pthread_mutex_lock(&srv->gen_lock);
+    if (!m) {
+        snprintf(msg, msgcap, "cannot load image model from %s: %s",
+                 srv->image_dir, cwick_error_message(&ie));
+        CWICK_INFO("model", "%s", msg);
+        srv->swapping = false;
+        pthread_cond_broadcast(&srv->gen_cv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return 500;
+    }
+    srv->h3 = m;
+    srv->swapping = false;
+    pthread_cond_broadcast(&srv->gen_cv);
+    pthread_mutex_unlock(&srv->gen_lock);
+    snprintf(msg, msgcap, "image model loaded from %s (%s) — both image "
+                          "endpoints are ready; text endpoints need a switch "
+                          "back", srv->image_dir, H3_SERVED_ID);
+    CWICK_INFO("model", "switched to image model %s (%s)", H3_SERVED_ID,
+               srv->image_dir);
     return 200;
 }
 
@@ -7114,6 +7411,330 @@ static bool client_register(server_ctx *srv) {
     return ok;
 }
 
+/* ---- image routes ---------------------------------------------------
+ * /v1/images/generations and /v1/images/edits speak the OpenAI image shape:
+ * a JSON or multipart request in, {"created":...,"data":[{"b64_json":...}]}
+ * out. The extra `cwick` object carries the phase breakdown the engine
+ * measured, so a slow request can be attributed without reading the log.
+ * Both routes are gated by the same auth as the text routes (the caller is
+ * already past the auth check when this runs).
+ */
+static char *h3_b64_encode(const unsigned char *p, size_t n) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t out_n = ((n + 2) / 3) * 4;
+    char *out = cwick_xmalloc(out_n + 1);
+    size_t i = 0, j = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)p[i] << 16) | ((uint32_t)p[i + 1] << 8) | p[i + 2];
+        out[j++] = tab[(v >> 18) & 63]; out[j++] = tab[(v >> 12) & 63];
+        out[j++] = tab[(v >> 6) & 63];  out[j++] = tab[v & 63];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t v = (uint32_t)p[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)p[i + 1] << 8;
+        out[j++] = tab[(v >> 18) & 63]; out[j++] = tab[(v >> 12) & 63];
+        out[j++] = (i + 1 < n) ? tab[(v >> 6) & 63] : '=';
+        out[j++] = '=';
+    }
+    out[j] = '\0';
+    return out;
+}
+
+static int h3_img_error(int fd, int code, const char *msg) {
+    char *e = cwick_json_stringify(msg);
+    char body[1024];
+    snprintf(body, sizeof(body),
+             "{\"error\":{\"message\":%s,\"type\":\"invalid_request_error\","
+             "\"param\":null,\"code\":null}}", e ? e : "null");
+    free(e);
+    http_response(fd, code, code == 501 ? "Not Implemented" :
+                  (code == 400 ? "Bad Request" : "Internal Server Error"),
+                  "application/json; charset=utf-8", body, false);
+    return code;
+}
+
+/* Pull a named form field out of a multipart body. `image` parts are counted
+ * but not decoded here: the engine owns the reference-image path.
+ *
+ * Every part is walked, not just the ones before the match: a client that puts
+ * `image` after `prompt` (curl does, in the order the flags are written) would
+ * otherwise leave `n_images` at zero and turn an edit into a plain generation
+ * that silently ignores the reference. */
+static char *h3_multipart_field(const http_req *req, const char *boundary,
+                                const char *name, int *n_images) {
+    if (!boundary || !*boundary) return NULL;
+    char delim[512];
+    snprintf(delim, sizeof(delim), "--%s", boundary);
+    const char *p = req->body, *end = req->body + req->body_len;
+    char *found = NULL;
+    while (p < end) {
+        const char *d = find_bytes(p, (size_t)(end - p), delim, strlen(delim));
+        if (!d) break;
+        const char *hs = d + strlen(delim);
+        if (end - hs >= 2 && hs[0] == '-' && hs[1] == '-') break;
+        while (hs < end && (hs[0] == '\r' || hs[0] == '\n')) hs++;
+        const char *he = find_bytes(hs, (size_t)(end - hs), "\r\n\r\n", 4);
+        if (!he) break;
+        char head[1024];
+        size_t hl = (size_t)(he - hs);
+        if (hl >= sizeof(head)) break;
+        memcpy(head, hs, hl); head[hl] = 0;
+        const char *vs = he + 4;
+        const char *vn = find_bytes(vs, (size_t)(end - vs), delim, strlen(delim));
+        if (!vn) break;
+        if (strstr(head, "name=\"image\"") || strstr(head, "name=image")) {
+            if (n_images) (*n_images)++;
+        } else if (!found) {
+            char key[128];
+            const char *q = strstr(head, "name=\"");
+            if (q) {
+                q += 6;
+                size_t k = 0;
+                while (*q && *q != '"' && k + 1 < sizeof(key)) key[k++] = *q++;
+                key[k] = 0;
+                if (strcmp(key, name) == 0 && vn > vs) {
+                    size_t len = (size_t)(vn - vs);
+                    while (len && (vs[len - 1] == '\r' || vs[len - 1] == '\n')) len--;
+                    found = cwick_xmalloc(len + 1);
+                    memcpy(found, vs, len); found[len] = 0;
+                }
+            }
+        }
+        p = vn;
+    }
+    return found;
+}
+
+/* Collects the `image` parts of a multipart body in order. The bytes are
+ * pointed at inside the request body rather than copied, which keeps a 4 MP
+ * reference from being memcpy'd twice; only the CRLF that precedes the next
+ * boundary is trimmed, and only when it is exactly CRLF so a binary tail that
+ * happens to end in a newline byte is left alone. */
+int h3_multipart_refs(const char *body, size_t body_len, const char *boundary,
+                      const unsigned char **ptr, size_t *len, int max) {
+    if (!boundary || !*boundary) return 0;
+    char delim[512];
+    snprintf(delim, sizeof(delim), "--%s", boundary);
+    const char *p = body, *end = body + body_len;
+    int n = 0;
+    while (p < end && n < max) {
+        const char *d = find_bytes(p, (size_t)(end - p), delim, strlen(delim));
+        if (!d) break;
+        const char *hs = d + strlen(delim);
+        if (end - hs >= 2 && hs[0] == '-' && hs[1] == '-') break;
+        while (hs < end && (hs[0] == '\r' || hs[0] == '\n')) hs++;
+        const char *he = find_bytes(hs, (size_t)(end - hs), "\r\n\r\n", 4);
+        if (!he) break;
+        char head[1024];
+        size_t hl = (size_t)(he - hs);
+        if (hl >= sizeof(head)) break;
+        memcpy(head, hs, hl); head[hl] = 0;
+        const char *vs = he + 4;
+        const char *vn = find_bytes(vs, (size_t)(end - vs), delim, strlen(delim));
+        if (!vn) break;
+        if (strstr(head, "name=\"image\"") || strstr(head, "name=image")) {
+            size_t l = (size_t)(vn - vs);
+            if (l >= 2 && vs[l - 1] == '\n' && vs[l - 2] == '\r') l -= 2;
+            ptr[n] = (const unsigned char *)vs;
+            len[n] = l;
+            n++;
+        }
+        p = vn;
+    }
+    return n;
+}
+
+static int srv_image_route(server_ctx *srv, int fd, const http_req *req,
+                           const char *ponly) {    bool gen = strcmp(ponly, "/v1/images/generations") == 0 ||
+               strcmp(ponly, "/images/generations") == 0;
+    bool edit = strcmp(ponly, "/v1/images/edits") == 0 ||
+                strcmp(ponly, "/images/edits") == 0;
+    if (strcmp(req->method, "POST") != 0 || (!gen && !edit)) return -1;
+
+    /* A switch frees the image pipeline out from under a running render, so
+     * admission and the in-flight count share gen_lock with the swap gate.
+     * Refuse rather than queue: an image takes ~40 minutes, and a queued one
+     * would be answered with a model that is no longer resident. */
+    pthread_mutex_lock(&srv->gen_lock);
+    bool image_swap_busy = srv->swapping;
+    if (!image_swap_busy && srv->h3) srv->img_busy++;
+    pthread_mutex_unlock(&srv->gen_lock);
+    if (image_swap_busy)
+        return h3_img_error(fd, 503, "a model switch is in progress; retry shortly");
+    if (!srv->h3)
+        return h3_img_error(fd, 503, "no image model loaded: pass --img DIR to cwick serve "
+                                     "(or set CWICK_IMAGE_MODEL), then POST /v1/models/switch "
+                                     "with model " H3_SERVED_ID);
+
+    json_value *root = NULL;
+    char *prompt_owned = NULL;
+    const char *prompt = NULL;
+    int64_t w = 1024, h = 1024, seed = 0;
+    int n_ref = 0;
+    const unsigned char *ref_ptr[H3_MAX_REFERENCES];
+    size_t ref_sz[H3_MAX_REFERENCES];
+    int rc = 500;
+
+    bool multipart = strncmp(req->body, "--", 2) == 0;
+    if (edit && multipart) {
+        char boundary[256];
+        boundary[0] = 0;
+        /* The boundary lives in Content-Type, which is not retained in the
+         * request struct; the first body line is "--<boundary>" and is. */
+        {
+            const char *b = req->body + 2;
+            size_t k = 0;
+            while (k + 1 < sizeof(boundary) && *b && *b != '\r' && *b != '\n' &&
+                   req->body + k + 2 < req->body + req->body_len)
+                boundary[k++] = *b++;
+            boundary[k] = 0;
+        }
+        prompt_owned = h3_multipart_field(req, boundary, "prompt", NULL);
+        prompt = prompt_owned;
+        n_ref = h3_multipart_refs(req->body, req->body_len, boundary,
+                                  ref_ptr, ref_sz, H3_MAX_REFERENCES);
+        char *sz = h3_multipart_field(req, boundary, "size", NULL);
+        char *sd = h3_multipart_field(req, boundary, "seed", NULL);
+        if (sz && sscanf(sz, "%lldx%lld", (long long *)&w, (long long *)&h) != 2)
+            w = h = 1024;
+        if (sd) seed = atoll(sd);
+        free(sz); free(sd);
+    } else {
+        cwick_error pe;
+        cwick_error_clear(&pe);
+        root = cwick_json_parse(req->body, req->body_len, &pe);
+        if (!root) {
+            rc = h3_img_error(fd, 400, "invalid JSON body");
+            goto img_done;
+        }
+        json_value *mo = cwick_json_get(root, "model");
+        if (mo && mo->kind == JSON_STRING && strcmp(mo->string, H3_SERVED_ID) != 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "unknown image model '%s' (expected %s)",
+                     mo->string, H3_SERVED_ID);
+            rc = h3_img_error(fd, 400, msg);
+            goto img_done;
+        }
+        json_value *pr = cwick_json_get(root, "prompt");
+        if (!pr || pr->kind != JSON_STRING || !pr->string || !*pr->string) {
+            rc = h3_img_error(fd, 400, "prompt is required");
+            goto img_done;
+        }
+        prompt = pr->string;
+        json_value *sz = cwick_json_get(root, "size");
+        if (sz) {
+            if (sz->kind != JSON_STRING ||
+                sscanf(sz->string, "%lldx%lld", (long long *)&w, (long long *)&h) != 2) {
+                rc = h3_img_error(fd, 400, "size must be WIDTHxHEIGHT");
+                goto img_done;
+            }
+        }
+        json_value *sd = cwick_json_get(root, "seed");
+        if (sd && sd->kind == JSON_NUMBER) seed = cwick_json_int(sd, 0);
+        json_value *neg = cwick_json_get(root, "negative_prompt");
+        if (neg && neg->kind == JSON_STRING && *neg->string) {
+            rc = h3_img_error(fd, 400, "negative_prompt is not supported by this model");
+            goto img_done;
+        }
+        json_value *st = cwick_json_get(root, "num_inference_steps");
+        if (st && cwick_json_int(st, H3_STEPS) != H3_STEPS) {
+            rc = h3_img_error(fd, 400, "num_inference_steps must be omitted or 6");
+            goto img_done;
+        }
+        json_value *gs = cwick_json_get(root, "guidance_scale");
+        if (gs && cwick_json_num(gs, 1.0) != 1.0) {
+            rc = h3_img_error(fd, 400, "guidance_scale must be omitted or 1");
+            goto img_done;
+        }
+        json_value *rf = cwick_json_get(root, "response_format");
+        if (rf && rf->kind == JSON_STRING && strcmp(rf->string, "b64_json") != 0) {
+            rc = h3_img_error(fd, 400, "response_format must be b64_json");
+            goto img_done;
+        }
+    }
+    if (!prompt || !*prompt) {
+        rc = h3_img_error(fd, 400, "prompt is required");
+        goto img_done;
+    }
+    if (edit && n_ref == 0) {
+        /* An edit with no reference is a generation that silently drops the
+         * image the caller meant to condition on, so it is refused instead. */
+        rc = h3_img_error(fd, 400,
+                          "an edit needs a multipart body with at least one `image` part");
+        goto img_done;
+    }
+
+    {
+        unsigned char *png = NULL;
+        size_t png_len = 0;
+        cwick_error ge;
+        cwick_error_clear(&ge);
+        h3_timing tim;
+        /* One arrival line before the render (which can take tens of minutes
+         * with no other output at info level): mode, canvas request, seed and
+         * reference count. Phase progress inside h3_generate() carries the
+         * same [req N] because the logger reads the thread-local set by the
+         * client thread before handle_client() called this route. */
+        CWICK_INFO("image", "%s request: %lldx%lld, seed %lld, %d reference(s)",
+                   edit ? "edit" : "generate", (long long)w, (long long)h,
+                   (long long)seed, n_ref);
+        if (!h3_generate(srv->h3, prompt, (int)w, (int)h, (uint64_t)seed,
+                         n_ref > 0 ? ref_ptr : NULL, n_ref > 0 ? ref_sz : NULL,
+                         n_ref, &png, &png_len, &tim, &ge)) {
+            int code = ge.status == CWICK_ERR_UNSUPPORTED ? 501 :
+                       (ge.status == CWICK_ERR_ARGUMENT ? 400 : 500);
+            char msg[512];
+            snprintf(msg, sizeof(msg), "image generation failed: %s", cwick_error_message(&ge));
+            rc = h3_img_error(fd, code, msg);
+            CWICK_INFO("image", "generation failed: %s", cwick_error_message(&ge));
+            goto img_done;
+        }
+        char *b64 = h3_b64_encode(png, png_len);
+        char *body = cwick_xmalloc(png_len * 2 + 4096);
+        snprintf(body, png_len * 2 + 4096,
+                 "{\"created\":%lld,\"data\":[{\"b64_json\":\"%s\","
+                 "\"revised_prompt\":null}],\"cwick\":{"
+                 "\"total_ms\":%.2f,\"tokenize_ms\":%.2f,\"text_encode_ms\":%.2f,"
+                 "\"pack_ms\":%.2f,\"dit_ms\":%.2f,\"vae_ms\":%.2f,"
+                 "\"png_ms\":%.2f,\"text_tokens\":%lld,\"image_tokens\":%lld,"
+                 "\"canvas_w\":%lld,\"canvas_h\":%lld,"
+                 "\"output_w\":%lld,\"output_h\":%lld}}",
+                 (long long)time(NULL), b64,
+                 tim.total_ms, tim.tokenize_ms, tim.text_encode_ms,
+                 tim.pack_ms, tim.dit_ms, tim.vae_ms, tim.png_ms,
+                 (long long)tim.text_tokens, (long long)tim.image_tokens,
+                 (long long)tim.canvas_w, (long long)tim.canvas_h,
+                 (long long)tim.output_w, (long long)tim.output_h);
+        http_response(fd, 200, "OK", "application/json; charset=utf-8", body, false);
+        CWICK_INFO("image", "%s complete: %lldx%lld -> %lldx%lld, %.0f ms "
+                   "(tokenize %.0f, text-encode %.0f, pack %.0f, dit %.0f, "
+                   "vae %.0f, png %.0f)",
+                   edit ? "edit" : "generate",
+                   (long long)tim.canvas_w, (long long)tim.canvas_h,
+                   (long long)tim.output_w, (long long)tim.output_h,
+                   tim.total_ms, tim.tokenize_ms, tim.text_encode_ms,
+                   tim.pack_ms, tim.dit_ms, tim.vae_ms, tim.png_ms);
+        free(body); free(b64);
+        h3_png_free(png);
+        rc = 200;
+    }
+
+img_done:
+    if (root) cwick_json_free(root);
+    free(prompt_owned);
+    /* Release the render slot. A switch that was refused while this ran can
+     * now proceed; wake it through the same condition variable as text. */
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->img_busy > 0) {
+        srv->img_busy--;
+        pthread_cond_broadcast(&srv->gen_cv);
+    }
+    pthread_mutex_unlock(&srv->gen_lock);
+    return rc;
+}
+
 static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
     cwick_error err;
     cwick_error_clear(&err);
@@ -7260,6 +7881,17 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         }
     }
 
+    /* OpenAI image routes. They are independent of the resident text model:
+     * an image request must not be told "no model loaded" because the text
+     * engine is mid-swap. */
+    {
+        int code = srv_image_route(srv, fd, &req, ponly);
+        if (code >= 0) {
+            snprintf(detail, sizeof(detail), "image route -> %d", code);
+            DONE(code);
+        }
+    }
+
     /* Every local model this instance knows about. The resident one is first
      * (what an OpenAI client reading data[0] expects); each entry carries the
      * cwick extras — where its weights are and whether it is the one loaded —
@@ -7370,6 +8002,27 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         char wanted[CWICK_MODEL_ID_MAX];
         snprintf(wanted, sizeof(wanted), "%s", cwick_json_str(m));
         cwick_json_free(root);
+
+        /* The image model is a sibling pipeline, not a replacement for the
+         * resident text engine. Switching to it loads it on demand; switching
+         * to any other id below keeps the text swap semantics unchanged. */
+        if (strcmp(wanted, H3_SERVED_ID) == 0) {
+            char msg[512];
+            bool already = false;
+            int ist = srv_switch_image(srv, msg, sizeof(msg), &already);
+            char *jmsg = json_str_alloc(msg);
+            char body[1024];
+            snprintf(body, sizeof(body),
+                     "{\"status\":%s,\"model\":\"%s\",\"detail\":%s}",
+                     ist != 200 ? "\"error\"" :
+                       (already ? "\"already_resident\"" : "\"switched\""),
+                     H3_SERVED_ID, jmsg ? jmsg : "\"\"");
+            free(jmsg);
+            http_response(fd, ist, status_text_for(ist),
+                          "application/json; charset=utf-8", body, false);
+            snprintf(detail, sizeof(detail), "image model switch -> %d", ist);
+            DONE(ist);
+        }
 
         const cwick_model_entry *target = NULL;
         for (size_t i = 0; i < srv->catalog.n; i++) {
@@ -8162,6 +8815,27 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     srv.max_request_bytes = opt->max_request_bytes > 0 ? opt->max_request_bytes
                                                        : CWICK_SERVER_MAX_BODY;
     {
+        /* --img wins; the environment variable stays as the fallback for
+         * launchers that have not been switched over yet. The resolved path
+         * is copied so POST /v1/models/switch can (re)open the pipeline later
+         * even after the option string is gone. */
+        const char *dir = (opt && opt->image_dir && *opt->image_dir)
+                        ? opt->image_dir : getenv("CWICK_IMAGE_MODEL");
+        if (dir && *dir) {
+            snprintf(srv.image_dir, sizeof(srv.image_dir), "%s", dir);
+            cwick_error ie;
+            cwick_error_clear(&ie);
+            srv.h3 = h3_model_open(dir, &ie);
+            if (srv.h3)
+                CWICK_INFO("init", "image model ready: %s "
+                                  "(POST /v1/models/switch with %s to reload)",
+                           dir, H3_SERVED_ID);
+            else
+                CWICK_INFO("init", "image model unavailable: %s",
+                           cwick_error_message(&ie));
+        }
+    }
+    {
         const char *aod = getenv("CWICK_ABORT_ON_DISCONNECT");
         srv.abort_on_disconnect = (aod && *aod &&
                                    strcmp(aod, "0") != 0 &&
@@ -8328,6 +9002,20 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
          * reallocated, so pointers taken earlier are not necessarily valid.
          * Index 0 is the resident model — that is the order we built it in. */
         if (listed_resident) srv.resident = &srv.catalog.v[0];
+    }
+
+    /* One model at a time: when --img brought the image pipeline up at
+     * startup, the text engine created by main is no longer needed. Everything
+     * that reads it — metrics, tokenizer, catalog — has run above and copied
+     * what it needs. Release it now so only the image model is resident;
+     * a later POST /v1/models/switch back to a text id rebuilds the engine.
+     * The catalog keeps the startup root as a switch-back target. */
+    if (srv.h3 && srv.eng[0]) {
+        CWICK_INFO("model", "image model is active at startup: releasing text "
+                            "model %s so only one model is resident",
+                   cwick_engine_model_root(srv.eng[0]));
+        srv_release_text_model(&srv);
+        tok = NULL;   /* failure paths below own this local; it was just freed */
     }
 
     /* listen */
@@ -8683,6 +9371,7 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * local here is a double free — it segfaults on every Ctrl+C that follows
      * a switch, which is exactly how long it took to find this. Free whatever
      * is resident, once. */
+    if (srv.h3) { h3_model_close(srv.h3); srv.h3 = NULL; }
     if (srv.tok) { cwick_tokenizer_free(srv.tok); srv.tok = NULL; }
     pthread_mutex_destroy(&srv.gen_lock); pthread_mutex_destroy(&srv.pfx_mtx);
     pthread_cond_destroy(&srv.gen_cv);

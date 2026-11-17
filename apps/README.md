@@ -21,10 +21,17 @@ apps/
     index.html
     app.css
     app.js
+  imagegen/              # H5 图像生成
+    app.json
+    index.html
+    app.css
+    app.js
 ```
 
-Every app asks the model through `POST /v1/systemone`; the chat tab keeps
-using `/v1/chat/completions`. Every request an app makes is same-origin —
+The decision apps (tictactoe, kart) ask the model through `POST /v1/systemone`;
+`imagegen` calls the image endpoints `/v1/images/edits` and
+`/v1/images/generations` instead. The chat tab keeps using
+`/v1/chat/completions`. Every request an app makes is same-origin —
 there is no configurable external endpoint. The resident model is discovered
 from `GET /v1/models` and re-discovered after a server-side switch, so the
 decision adapter always follows the checkpoint that is actually loaded.

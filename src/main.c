@@ -32,6 +32,7 @@
 #include "logcap.h"
 #include "mem.h"
 #include "util.h"
+#include "h3.h"
 
 static volatile int g_stop = 0;
 static volatile int g_signals = 0;
@@ -372,6 +373,7 @@ static void serve_warmup(cwick_engine *eng, int64_t warmup_tokens) {
 static int run_serve(const char *root, const char *host, int port,
                      int64_t max_tokens, int64_t max_context,
                      const char *prefix_cache_dir, int64_t prefix_cache_gib,
+                     const char *image_dir,
                      const char *spine, int verbose, int trace, int web,
                      int jev, const char *password,
                      const char *const *models_dirs, int models_dirs_n,
@@ -425,6 +427,7 @@ static int run_serve(const char *root, const char *host, int port,
     sopts.max_tokens = max_tokens;
     sopts.prefix_cache_dir = prefix_cache_dir;
     sopts.prefix_cache_gib = prefix_cache_gib;
+    sopts.image_dir = image_dir;
     sopts.verbose = verbose;
     sopts.trace = trace;
     sopts.web = web != 0;
@@ -1173,7 +1176,9 @@ static void usage(void) {
            "                  from <file>.incomplete with a Range request. Partial\n"
            "                  files survive a restart; sizes are 64-bit, so\n"
            "                  shards above 100 GiB need no special handling.\n"
-           "                  These endpoints never take the generation slot.\n"
+           "                  A dropped transfer retries with backoff (default 5;\n"
+           "                  CWICK_HUB_RETRIES overrides, 0 disables). These\n"
+           "                  endpoints never take the generation slot.\n"
            "                  CWICK_HUB_ENDPOINT overrides the catalog host,\n"
            "                  then HF_ENDPOINT; the default is hf-mirror.\n"
            "\n"
@@ -1193,6 +1198,12 @@ static void usage(void) {
            "  --no-jev        turn it back off (or CWICK_JEV=1 to default on)\n"
            "                  With --lan and no password, one is generated and\n"
            "                  printed once on stdout.\n"
+           "  --img DIR       load the image model under DIR and expose\n"
+           "                  POST /v1/images/generations and /v1/images/edits.\n"
+           "                  DIR is the MiniMax-H3-Image checkpoint directory.\n"
+           "                  CWICK_IMAGE_MODEL sets the same value for launchers.\n"
+           "                  The image model can also be switched to at runtime\n"
+           "                  from POST /v1/models/switch (id MiniMax-H3-Image).\n"
            "  --api-key NAME  mint an API key for third-party agents and print\n"
            "                  it once on stdout (only its hash is stored, in the\n"
            "                  sqlite file, so it survives a restart). Sending one\n"
@@ -1366,6 +1377,85 @@ int main(int argc, char **argv) {
                                   spine, chat, verbose, trace);
     }
 
+    if (strcmp(cmd, "image") == 0) {
+        /* Text-to-image straight from the CLI: the same three stages the
+         * /v1/images/generations route runs, without the HTTP layer. Useful
+         * for a single image, and for diffing the forward pass against a
+         * reference implementation without a server in the way. */
+        const char *root = NULL, *prompt = NULL, *outp = "image.png";
+        int w = 1024, h = 1024, backend = -1;
+        uint64_t seed = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--root") == 0) root = need_arg(&i, argc, argv, "--root");
+            else if (strcmp(argv[i], "--prompt") == 0) prompt = need_arg(&i, argc, argv, "--prompt");
+            else if (strcmp(argv[i], "--out") == 0) outp = need_arg(&i, argc, argv, "--out");
+            else if (strcmp(argv[i], "--seed") == 0) seed = (uint64_t)strtoull(
+                need_arg(&i, argc, argv, "--seed"), NULL, 10);
+            else if (strcmp(argv[i], "--size") == 0) {
+                const char *v = need_arg(&i, argc, argv, "--size");
+                char *end = NULL;
+                long vw = strtol(v, &end, 10);
+                long vh = 0;
+                if (end && (*end == 'x' || *end == 'X')) vh = strtol(end + 1, NULL, 10);
+                if (vw < H3_MIN_SIZE || vh < H3_MIN_SIZE ||
+                    vw > H3_MAX_SIZE || vh > H3_MAX_SIZE) {
+                    fprintf(stderr, "cwick image: --size must be WxH in %d..%d\n",
+                            H3_MIN_SIZE, H3_MAX_SIZE);
+                    return 2;
+                }
+                w = (int)vw; h = (int)vh;
+            }
+            else if (strcmp(argv[i], "--backend") == 0) {
+                const char *v = need_arg(&i, argc, argv, "--backend");
+                if (strcmp(v, "metal") == 0) backend = 1;
+                else if (strcmp(v, "cpu") == 0) backend = 0;
+                else { fprintf(stderr, "cwick image: --backend must be 'metal' or 'cpu'\n"); return 2; }
+            }
+            else { fprintf(stderr, "cwick image: unknown option `%s`\n", argv[i]); return 2; }
+        }
+        if (!root || !prompt) {
+            fprintf(stderr, "cwick image: --root and --prompt required\n");
+            return 2;
+        }
+        select_backend(backend);
+        if (!instance_claim(root)) return 1;
+        cwick_error e;
+        cwick_error_clear(&e);
+        h3_model *im = h3_model_open(root, &e);
+        if (!im) {
+            fprintf(stderr, "cwick image: %s\n", cwick_error_message(&e));
+            return 1;
+        }
+        unsigned char *png = NULL;
+        size_t len = 0;
+        h3_timing tim;
+        cwick_error_clear(&e);
+        if (!h3_generate(im, prompt, w, h, seed, NULL, NULL, 0, &png, &len, &tim, &e)) {
+            fprintf(stderr, "cwick image: %s\n", cwick_error_message(&e));
+            h3_model_close(im);
+            return 1;
+        }
+        FILE *f = fopen(outp, "wb");
+        if (!f || fwrite(png, 1, len, f) != len) {
+            fprintf(stderr, "cwick image: cannot write %s\n", outp);
+            if (f) fclose(f);
+            h3_png_free(png);
+            h3_model_close(im);
+            return 1;
+        }
+        fclose(f);
+        fprintf(stderr,
+                "cwick image: %llux%llu canvas %lldx%lld, %lld text + %lld image rows, "
+                "text %.0f ms, dit %.0f ms, vae %.0f ms, total %.0f ms -> %s\n",
+                (unsigned long long)tim.output_w, (unsigned long long)tim.output_h,
+                (long long)tim.canvas_w, (long long)tim.canvas_h,
+                (long long)tim.text_tokens, (long long)tim.image_tokens,
+                tim.text_encode_ms, tim.dit_ms, tim.vae_ms, tim.total_ms, outp);
+        h3_png_free(png);
+        h3_model_close(im);
+        return 0;
+    }
+
     if (strcmp(cmd, "serve") == 0) {
         const char *root = NULL, *host = "127.0.0.1";
         int port = 8000;
@@ -1391,6 +1481,9 @@ int main(int argc, char **argv) {
             }
         }
         const char *prefix_cache_dir = getenv("CWICK_PREFIX_CACHE_DIR");
+        /* --img wins over the environment variable so one launcher can serve
+         * several checkpoints without editing its environment per model. */
+        const char *image_dir = getenv("CWICK_IMAGE_MODEL");
         bool verbose = false, trace = false;
         bool allow_swap = false;
         /* CWICK_WEB=1 turns the UI on for everyone who starts the same
@@ -1452,6 +1545,8 @@ int main(int argc, char **argv) {
             }
             else if (strcmp(argv[i], "--prefix-cache-dir") == 0)
                 prefix_cache_dir = need_arg(&i, argc, argv, "--prefix-cache-dir");
+            else if (strcmp(argv[i], "--img") == 0)
+                image_dir = need_arg(&i, argc, argv, "--img");
             else if (strcmp(argv[i], "--prefix-cache-gib") == 0) {
                 if (!parse_i64(need_arg(&i, argc, argv, "--prefix-cache-gib"),
                                1, 4096, &prefix_cache_gib)) {
@@ -1567,7 +1662,7 @@ int main(int argc, char **argv) {
         int ran = 0;
         int rc;
         rc = run_serve(root, host, port, max_tokens, max_context,
-                       prefix_cache_dir, prefix_cache_gib,
+                       prefix_cache_dir, prefix_cache_gib, image_dir,
                        spine, verbose, trace, web, jev, password,
                        models_dirs, models_dirs_n, store_path,
                        api_key, api_key_secret, warmup, &ran);

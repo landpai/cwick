@@ -741,6 +741,11 @@ int cwick_pool_for(int64_t n, void *arg, cwick_pool_range_fn fn);
  * (W is row-major [k, j] = torch linear layout). */
 void cwick_gemm_bf16(float *out, int64_t rows, int64_t k, int64_t cols,
                     const float *in, const void *w_bf16);
+/* Same, with the number of W rows dequantised per tile chosen by the caller.
+ * A tall activation stack amortises the fp32 arena better with a wider tile;
+ * GEMV (rows == 1) ignores it. */
+void cwick_gemm_bf16_tile(float *out, int64_t rows, int64_t k, int64_t cols,
+                          const float *in, const void *w_bf16, int64_t tile);
 void cwick_gemm_int8(float *out, int64_t rows, int64_t k, int64_t cols,
                     const float *in, const int8_t *w, const uint16_t *scales);
 void cwick_gemm_f32(float *out, int64_t rows, int64_t k, int64_t cols,
@@ -1483,6 +1488,12 @@ typedef struct cwick_server_options {
      * `prefix_cache_gib` bounds the directory (0 = default 8 GiB). */
     const char *prefix_cache_dir;
     int64_t prefix_cache_gib;
+    /* Directory holding the image model checkpoint (--img). NULL/empty leaves
+     * the two image endpoints unconfigured; CWICK_IMAGE_MODEL is the fallback
+     * for launchers that still set the environment variable. The path is copied
+     * into the server at startup, so a later hot switch can reopen the image
+     * pipeline from the same directory. */
+    const char *image_dir;
     /* Extra local models to advertise and to allow switching to. Each entry
      * is a directory that is itself a checkpoint root, or one whose immediate
      * children are; discovered entries join the running model in GET

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>H5 图像生成 · cwick app</title>
+<link rel="stylesheet" href="/apps/imagegen/app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="head">
+    <a class="back" href="/#apps" target="_top">← cwick</a>
+    <div class="title">
+      <h1>H5 图像生成 <span>STUDIO</span></h1>
+      <p id="status">调用本机两个图像接口 · 单模型运行 · 进度/预览/下载</p>
+    </div>
+    <div class="head-actions">
+      <button id="share" class="btn" type="button">分享 / 二维码</button>
+    </div>
+  </header>
+
+  <main class="grid">
+
+    <!-- left: compose -->
+    <section class="compose panel">
+      <div class="panel-head">
+        <h2>创作台</h2>
+        <span class="pill" id="modelPill">图像模型检测中…</span>
+      </div>
+
+      <div class="mode-switch" role="tablist" aria-label="接口模式">
+        <button class="mode on" data-mode="edit" role="tab" aria-selected="true">参考图编辑 · /v1/images/edits</button>
+        <button class="mode" data-mode="gen" role="tab" aria-selected="false">纯文生图 · /v1/images/generations</button>
+      </div>
+
+      <label class="field">
+        <span class="lbl">提示词 <b>prompt</b></span>
+        <textarea id="prompt" rows="5" placeholder="例：全身人像，3:4 竖构图，干净背景，柔和影棚光，写实摄影质感…">全身人像，3:4 竖构图，全身入镜，干净简洁的背景，柔和影棚光，写实摄影质感。人物的脸部以第一张参考图为唯一依据，五官、脸型、骨相、发型保持一致，是同一个人。整套服装参考第二张图，保留单品、配色、材质与配饰细节。姿态参考第三张图的机位与自然站姿，四肢自然、手指正常、不穿模。画面中不要出现任何文字、水印或多余人物。</textarea>
+      </label>
+
+      <div class="refs" id="refs">
+        <div class="ref" data-slot="face">
+          <label class="drop">
+            <input type="file" accept="image/*" data-input="face">
+            <span class="thumb" data-thumb="face"><i>脸</i></span>
+            <span class="ref-meta"><b>脸 / 头像</b><small data-name="face">未选择</small></span>
+            <span class="ref-tag">identity</span>
+          </label>
+        </div>
+        <div class="ref" data-slot="outfit">
+          <label class="drop">
+            <input type="file" accept="image/*" data-input="outfit">
+            <span class="thumb" data-thumb="outfit"><i>装</i></span>
+            <span class="ref-meta"><b>服装</b><small data-name="outfit">未选择</small></span>
+            <span class="ref-tag">outfit</span>
+          </label>
+        </div>
+        <div class="ref" data-slot="pose">
+          <label class="drop">
+            <input type="file" accept="image/*" data-input="pose">
+            <span class="thumb" data-thumb="pose"><i>姿</i></span>
+            <span class="ref-meta"><b>姿势</b><small data-name="pose">未选择</small></span>
+            <span class="ref-tag">pose</span>
+          </label>
+        </div>
+      </div>
+      <p class="hint" id="refHint">编辑模式至少上传一张参考图（脸/服装/姿势任意组合）；三者都传效果最佳。</p>
+
+      <div class="opts">
+        <label class="field small">
+          <span class="lbl">尺寸 <b>size</b></span>
+          <select id="size">
+            <option value="1536x2048" selected>1536 × 2048（3:4 竖版）</option>
+            <option value="1024x1024">1024 × 1024（方形）</option>
+            <option value="2048x1536">2048 × 1536（4:3 横版）</option>
+            <option value="1024x1536">1024 × 1536（2:3 竖版）</option>
+          </select>
+        </label>
+        <label class="field small">
+          <span class="lbl">随机种子 <b>seed</b></span>
+          <input type="number" id="seed" value="42" min="0" step="1">
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="generate" class="btn primary" type="button">生成图像</button>
+        <button id="cancel" class="btn" type="button" disabled>取消等待</button>
+        <span class="cost mono" id="cost">单模型约 40 分钟 / 张</span>
+      </div>
+    </section>
+
+    <!-- right: result + progress -->
+    <section class="result panel">
+      <div class="panel-head">
+        <h2>结果</h2>
+        <div class="result-actions">
+          <button id="download" class="btn" type="button" disabled>下载 PNG</button>
+          <button id="clear" class="btn" type="button">清空</button>
+        </div>
+      </div>
+
+      <div class="preview" id="preview">
+        <div class="empty" id="emptyState">
+          <div class="empty-icon">◇</div>
+          <p>生成后在这里在线查看</p>
+          <small>支持下载为 PNG · 历史记录见下方</small>
+        </div>
+        <img id="resultImg" alt="生成结果" hidden>
+      </div>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-head">
+          <span class="spin" id="spin"></span>
+          <b id="progressPhase">准备中…</b>
+          <span class="mono" id="elapsed">0:00</span>
+        </div>
+        <div class="bar"><div class="bar-in" id="barIn"></div></div>
+        <ul class="timeline" id="timeline"></ul>
+        <p class="progress-note" id="progressNote">图像生成约需 40 分钟，请求以流式无关的同步方式返回；关闭页面不会中断服务端计算，但本页不再显示结果。</p>
+      </div>
+
+      <div class="history">
+        <div class="panel-head small-head">
+          <h3>本次会话记录</h3>
+          <button id="clearHistory" class="link" type="button">清除</button>
+        </div>
+        <div id="historyList" class="history-list"><p class="muted small">还没有生成记录。</p></div>
+      </div>
+    </section>
+
+  </main>
+
+  <dialog id="shareDialog" class="share-dlg">
+    <div class="share-box">
+      <h2>分享到手机</h2>
+      <p class="share-url mono" id="shareUrl">—</p>
+      <img id="qrImg" alt="二维码" hidden>
+      <p class="share-note" id="shareNote"></p>
+      <div class="share-actions">
+        <button id="closeShare" class="btn" type="button">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+</div>
+<script src="/apps/imagegen/app.js"></script>
+</body>
+</html>

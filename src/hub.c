@@ -16,6 +16,7 @@
 #include "hub.h"
 
 #include "cwick.h"
+#include "h3.h"
 #include "json.h"
 #include "log.h"
 #include "models.h"
@@ -39,6 +40,12 @@
 #define HUB_MAX_FILES  2048
 #define HUB_PATH_MAX   CWICK_HUB_PATH_MAX
 #define HUB_DEFAULT_ENDPOINT "https://hf-mirror.com"
+#define HUB_DEFAULT_RETRIES 5
+/* Upper bound on one backoff, and the tick used to make it interruptible.
+ * A 30 s ceiling keeps a long outage from looking like a hung job, while a
+ * 100 ms tick means pause/cancel never waits on a whole sleep interval. */
+#define HUB_RETRY_CAP_S   30
+#define HUB_RETRY_TICK_US 100000
 
 typedef struct { char *p; size_t len, cap; } hbuf;
 
@@ -173,6 +180,13 @@ typedef struct {
     double speed_bps;
     int64_t eta_s;
     time_t started, updated;
+    /* Automatic retry of a failed transfer. `attempts` counts failures already
+     * seen for the current file (0 = none); `retry_at` is the monotonic deadline
+     * of an in-flight backoff, or 0 when a transfer is active. Both are read by
+     * the UI on every poll. */
+    int attempts;
+    int max_attempts;
+    int64_t retry_at_ms;
     bool cancel_req, pause_req;
     bool thread_running;
     pthread_t thread;
@@ -185,9 +199,16 @@ struct cwick_hub {
     hub_job jobs[HUB_MAX_JOBS];
     int njobs;
     uint32_t next_id;
+    int max_attempts;          /* CWICK_HUB_RETRIES, default HUB_DEFAULT_RETRIES */
     bool stopping;
     bool curl_ready;
 };
+
+static int64_t hub_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* ------------------------------------------------------------------ */
 /* one HTTP GET                                                        */
@@ -319,6 +340,66 @@ char *cwick_hub_search(cwick_hub *h, const char *query, int limit,
 /* ------------------------------------------------------------------ */
 /* local library                                                      */
 /* ------------------------------------------------------------------ */
+
+/* The image checkpoint is a pipeline directory, not a text checkpoint: it
+ * has model_index.json instead of config.json. Reading the manifest is the
+ * only reliable way to tell an image pipeline from an ordinary half-empty
+ * owner directory, and it keeps the library from calling finished weights
+ * "not downloaded" just because their layout is different. */
+static bool h3_pipeline_manifest(const char *dir) {
+    char path[HUB_PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/model_index.json", dir) >=
+        (int)sizeof(path)) return false;
+    char *text = NULL;
+    size_t n = 0;
+    if (cwick_read_file(path, &text, &n) != 0 || !text || !n) {
+        free(text);
+        return false;
+    }
+    cwick_error err;
+    cwick_error_clear(&err);
+    json_value *j = cwick_json_parse(text, n, &err);
+    free(text);
+    if (!j) return false;
+    const char *cls = cwick_json_str(cwick_json_get(j, "_class_name"));
+    json_value *h3 = cwick_json_get(j, "_minimax_h3");
+    const char *part = NULL;
+    if (h3 && h3->kind == JSON_OBJECT)
+        part = cwick_json_str(cwick_json_get(h3, "partition"));
+    bool ok = (cls && strcmp(cls, "MiniMaxH3ImagePipeline") == 0) ||
+              (part && strcmp(part, "image") == 0);
+    cwick_json_free(j);
+    return ok;
+}
+
+/* Manifest alone is not enough: a download that has only written the small
+ * index file must still be reported as unfinished. The four submodule
+ * directories and the fused-head shard are what the image loader actually
+ * opens. */
+static bool h3_pipeline_complete(const char *dir) {
+    if (!h3_pipeline_manifest(dir)) return false;
+    static const char *const subs[] = {
+        "transformer", "vae", "text_encoder", "tokenizer"
+    };
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        char p[HUB_PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, subs[i]) >= (int)sizeof(p) ||
+            !cwick_dir_exists(p)) return false;
+    }
+    char p[HUB_PATH_MAX];
+    if (snprintf(p, sizeof(p), "%s/pdd_fused_heads.safetensors", dir) >=
+        (int)sizeof(p)) return false;
+    return cwick_file_exists(p);
+}
+
+static bool checkpoint_ready(const char *dir, int files, int partials) {
+    if (partials > 0 || files == 0) return false;
+    char cfg[HUB_PATH_MAX];
+    if (snprintf(cfg, sizeof(cfg), "%s/config.json", dir) < (int)sizeof(cfg) &&
+        cwick_file_exists(cfg)) return true;
+    return h3_pipeline_complete(dir);
+}
+
 static void dir_stats(const char *dir, int64_t *bytes, int *files,
                       int64_t *partial_bytes, int *partials, int depth) {
     DIR *d = opendir(dir);
@@ -361,7 +442,8 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     char cfg[HUB_PATH_MAX];
     snprintf(cfg, sizeof(cfg), "%s/config.json", dir);
     bool has_config = cwick_file_exists(cfg);
-    bool complete = has_config && partials == 0 && files > 0;
+    bool image = !has_config && h3_pipeline_manifest(dir);
+    bool complete = checkpoint_ready(dir, files, partials);
     /* "Downloaded" and "loadable" are different facts: the library happily
      * fetches any repository, but only architectures with kernels can become
      * resident. Say so in the inventory instead of leaving the switch button
@@ -369,6 +451,7 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     char why[192] = "";
     bool supported = false;
     if (has_config) supported = cwick_model_root_supported(dir, why, sizeof(why));
+    else if (image) supported = true;
     else snprintf(why, sizeof(why), "config.json is not present yet");
 
     if (!*first) hb_puts(out, ",");
@@ -378,10 +461,15 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     hb_puts(out, ",\"path\":");          hb_json_str(out, dir);
     hb_putf(out, ",\"bytes\":%lld,\"files\":%d,\"partial_bytes\":%lld,"
                  "\"partial_files\":%d,\"complete\":%s,\"resumable\":%s,"
-                 "\"supported\":%s",
+                 "\"supported\":%s,\"kind\":",
             (long long)bytes, files, (long long)partial_bytes, partials,
             complete ? "true" : "false", partials > 0 ? "true" : "false",
             supported ? "true" : "false");
+    hb_json_str(out, image ? "image" : "text");
+    if (image) {
+        hb_puts(out, ",\"served_id\":");
+        hb_json_str(out, H3_SERVED_ID);
+    }
     if (!supported) {
         hb_puts(out, ",\"unsupported_reason\":");
         hb_json_str(out, why);
@@ -396,6 +484,7 @@ static bool looks_like_checkpoint(const char *dir) {
     char p[HUB_PATH_MAX];
     snprintf(p, sizeof(p), "%s/config.json", dir);
     if (cwick_file_exists(p)) return true;
+    if (h3_pipeline_manifest(dir)) return true;
     snprintf(p, sizeof(p), "%s/.cwick-repo", dir);
     return cwick_file_exists(p) ? true : false;
 }
@@ -463,7 +552,8 @@ char *cwick_hub_models(cwick_hub *h, char *err, size_t errcap) {
 static char *checked_path(const char *dir) {
     char cfg[HUB_PATH_MAX];
     snprintf(cfg, sizeof(cfg), "%s/config.json", dir);
-    if (!cwick_file_exists(cfg)) return NULL;
+    bool config = cwick_file_exists(cfg);
+    if (!config && !h3_pipeline_complete(dir)) return NULL;
     int64_t bytes = 0, partial = 0;
     int files = 0, partials = 0;
     dir_stats(dir, &bytes, &files, &partial, &partials, 0);
@@ -661,6 +751,7 @@ char *cwick_hub_delete(cwick_hub *h, const char *wanted, int *status,
 
 const char *cwick_hub_root(const cwick_hub *h) { return h ? h->root : ""; }
 const char *cwick_hub_endpoint(const cwick_hub *h) { return h ? h->endpoint : ""; }
+int cwick_hub_max_attempts(const cwick_hub *h) { return h ? h->max_attempts : 0; }
 
 /* ------------------------------------------------------------------ */
 /* job table                                                          */
@@ -677,16 +768,23 @@ static void job_json(hbuf *out, const hub_job *j, bool comma) {
     hb_puts(out, ",\"state\":");     hb_json_str(out, job_state_name(j->state));
     hb_puts(out, ",\"current\":");   hb_json_str(out, j->current);
     hb_puts(out, ",\"error\":");     hb_json_str(out, j->error);
+    /* `retry_in_seconds` is what the UI counts down during backoff; it is 0
+     * whenever no retry is pending. Clamped at 0 so a deadline that just passed
+     * never renders as a negative number for one poll. */
+    int64_t retry_ms = j->retry_at_ms > 0 ? j->retry_at_ms - hub_now_ms() : 0;
+    if (retry_ms < 0) retry_ms = 0;
     hb_putf(out, ",\"progress\":%.6f,\"bytes_done\":%lld,\"bytes_total\":%lld,"
                  "\"files_done\":%d,\"files_total\":%d,"
                  "\"partial_bytes\":%lld,\"speed_bps\":%.0f,\"eta_seconds\":%lld,"
                  "\"started_at\":%lld,\"updated_at\":%lld,"
-                 "\"range_resume\":%s}",
+                 "\"range_resume\":%s,\"attempts\":%d,\"max_attempts\":%d,"
+                 "\"retry_in_seconds\":%lld}",
             progress, (long long)j->done_bytes, (long long)j->total_bytes,
             j->files_done, j->nfiles, (long long)j->partial_bytes,
             j->speed_bps, (long long)j->eta_s,
             (long long)j->started, (long long)j->updated,
-            j->partial_bytes > 0 ? "true" : "false");
+            j->partial_bytes > 0 ? "true" : "false",
+            j->attempts, j->max_attempts, (long long)((retry_ms + 999) / 1000));
 }
 
 char *cwick_hub_downloads(cwick_hub *h, char *err, size_t errcap) {
@@ -983,9 +1081,63 @@ static void job_finish(cwick_hub *h, hub_job *j, job_state state,
     if (why) snprintf(j->error, sizeof(j->error), "%s", why);
     j->speed_bps = 0;
     j->eta_s = -1;
+    j->retry_at_ms = 0;              /* no pending backoff once the job is done */
     j->updated = time(NULL);
     j->thread_running = false;
     pthread_mutex_unlock(&h->mtx);
+}
+
+/* Register one failed attempt and wait out the backoff if another is allowed.
+ * Returns 0 when the caller should retry, 1 when pause/cancel/shutdown was
+ * requested during the wait, -1 when the retry budget is exhausted. On -1 the
+ * job is already finished as an error with `cause` plus a give-up summary.
+ * `cause` is the last real transport/catalog error, kept verbatim. */
+static int hub_retry_wait(cwick_hub *h, hub_job *j, const char *cause,
+                          char *why, size_t whycap) {
+    pthread_mutex_lock(&h->mtx);
+    j->attempts++;
+    int used = j->attempts;
+    int limit = j->max_attempts;
+    pthread_mutex_unlock(&h->mtx);
+
+    if (used > limit) {
+        snprintf(why, whycap, "%s (gave up after %d attempt%s)", cause,
+                 used - 1, used - 1 == 1 ? "" : "s");
+        job_finish(h, j, JOB_ERROR, why);
+        return -1;
+    }
+
+    int delay = 1;
+    for (int k = 1; k < used && delay < HUB_RETRY_CAP_S; k++) delay *= 2;
+    if (delay > HUB_RETRY_CAP_S) delay = HUB_RETRY_CAP_S;
+    CWICK_INFO("hub", "download %s: %s — retry %d/%d in %d s",
+               j->repo, cause, used, limit, delay);
+    pthread_mutex_lock(&h->mtx);
+    j->retry_at_ms = hub_now_ms() + (int64_t)delay * 1000;
+    snprintf(j->error, sizeof(j->error), "%s — retry %d/%d in %d s",
+             cause, used, limit, delay);
+    j->state = JOB_RUNNING;              /* a retry is not an error state */
+    pthread_mutex_unlock(&h->mtx);
+
+    bool aborted = false;
+    int ticks = delay * 1000000 / HUB_RETRY_TICK_US;
+    for (int waited = 0; waited < ticks; waited++) {
+        usleep(HUB_RETRY_TICK_US);
+        pthread_mutex_lock(&h->mtx);
+        aborted = h->stopping || j->cancel_req || j->pause_req;
+        pthread_mutex_unlock(&h->mtx);
+        if (aborted) break;
+    }
+    pthread_mutex_lock(&h->mtx);
+    j->retry_at_ms = 0;              /* countdown is over, retrying or stopping */
+    if (aborted) {
+        j->error[0] = '\0';          /* a paused job has no error to show */
+        pthread_mutex_unlock(&h->mtx);
+        return 1;
+    }
+    j->error[0] = '\0';
+    pthread_mutex_unlock(&h->mtx);
+    return 0;
 }
 
 static void *hub_worker(void *arg) {
@@ -1001,11 +1153,19 @@ static void *hub_worker(void *arg) {
 
     char why[256] = "";
     if (j->nfiles == 0) {
-        if (!fetch_tree(h, j, why, sizeof(why))) {
-            job_finish(h, j, JOB_ERROR, why);
-            return NULL;
+        /* A cold catalog lookup is as exposed to a dropped connection as a
+         * shard is. Retry it with the same budget and backoff. */
+        for (;;) {
+            why[0] = '\0';
+            if (fetch_tree(h, j, why, sizeof(why))) break;
+            char cause[256];
+            snprintf(cause, sizeof(cause), "%s", why[0] ? why : "file listing failed");
+            int rr = hub_retry_wait(h, j, cause, why, sizeof(why));
+            if (rr != 0) return NULL;       /* exhausted (finished) or stopped */
         }
         pthread_mutex_lock(&h->mtx);
+        j->attempts = 0;                   /* a good listing resets the streak */
+        j->retry_at_ms = 0;
         j->state = JOB_RUNNING;
         j->updated = time(NULL);
         pthread_mutex_unlock(&h->mtx);
@@ -1021,13 +1181,30 @@ static void *hub_worker(void *arg) {
         pthread_mutex_unlock(&h->mtx);
         if (stop) break;
 
-        why[0] = '\0';
-        int rc = download_file(h, j, i, why, sizeof(why));
-        if (rc == 1) break;                 /* pause / cancel / shutdown */
-        if (rc != 0) {
-            job_finish(h, j, JOB_ERROR, why[0] ? why : "transfer failed");
-            return NULL;
+        int rc;
+        char last_why[256] = "";
+        /* A dropped connection on a shard is routine, not a reason to hand the
+         * job back to the user. Retry in place with a short exponential backoff;
+         * each attempt restarts download_file(), which sees the `.incomplete`
+         * left by the previous one and asks only for the remaining range. */
+        for (;;) {
+            why[0] = '\0';
+            rc = download_file(h, j, i, why, sizeof(why));
+            if (rc == 1) break;              /* pause / cancel / shutdown */
+            if (rc == 0) {
+                pthread_mutex_lock(&h->mtx);
+                j->attempts = 0;             /* a good file resets the streak */
+                j->retry_at_ms = 0;
+                pthread_mutex_unlock(&h->mtx);
+                break;
+            }
+            snprintf(last_why, sizeof(last_why), "%s", why[0] ? why : "transfer failed");
+            int rr = hub_retry_wait(h, j, last_why, why, sizeof(why));
+            if (rr < 0) return NULL;         /* budget exhausted, job finished */
+            if (rr > 0) { rc = 1; break; }   /* paused / canceled / shutting down */
         }
+        if (rc == 1) break;                  /* pause / cancel / shutdown */
+        if (rc != 0) { job_finish(h, j, JOB_ERROR, why); return NULL; }
 
         pthread_mutex_lock(&h->mtx);
         j->files_done = i + 1;
@@ -1169,6 +1346,9 @@ char *cwick_hub_download_start(cwick_hub *h, const char *repo,
         snprintf(j->dir, sizeof(j->dir), "%s", dir);
         j->eta_s = -1;
     }
+    j->max_attempts = h->max_attempts;
+    j->attempts = 0;
+    j->retry_at_ms = 0;
     j->pause_req = false;
     j->cancel_req = false;
     j->state = JOB_QUEUED;
@@ -1216,6 +1396,9 @@ char *cwick_hub_download_action(cwick_hub *h, const char *id,
         j->error[0] = '\0';
         j->speed_bps = 0;
         j->eta_s = -1;
+        j->attempts = 0;             /* a manual retry is a fresh budget */
+        j->retry_at_ms = 0;
+        j->max_attempts = h->max_attempts;
         if (j->state == JOB_DONE) j->state = JOB_QUEUED;   /* verify again */
         if (!j->thread_running) {
             j->state = JOB_QUEUED;
@@ -1248,6 +1431,11 @@ cwick_hub *cwick_hub_open(const char *root, const char *endpoint) {
     /* A trailing slash would produce a double slash in every catalog URL. */
     size_t n = strlen(h->endpoint);
     while (n && h->endpoint[n - 1] == '/') h->endpoint[--n] = '\0';
+    h->max_attempts = HUB_DEFAULT_RETRIES;
+    if (getenv("CWICK_HUB_RETRIES")) {
+        long v = strtol(getenv("CWICK_HUB_RETRIES"), NULL, 10);
+        if (v >= 0 && v <= 20) h->max_attempts = (int)v;
+    }
     h->curl_ready = true;
     (void)cwick_mkdir_p(h->root);
     CWICK_INFO("hub", "model library %s, catalog %s", h->root, h->endpoint);

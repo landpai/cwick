@@ -159,7 +159,7 @@ client (curl / coding agent / desktop chat app / web console)
         │        └── answered while the slot is busy — this is how a 30-minute
         │            prefill stays watchable
         └── /  ├── web/     single-page console, embedded at build time
-                ├── apps/   two H5 apps, one sqlite file each (store.c)
+                ├── apps/   three H5 apps, one sqlite file each (store.c)
                 └── models/ downloaded checkpoints, scanned at startup
 
 state on this machine
@@ -325,7 +325,12 @@ and current value and can plot any four of them on private axes (raw value or
 per-second delta), every label from `cwick:model_info`, the live
 `cwick:model_loaded` bit, generation preferences, read-only runtime config and
 switching the resident local model (entries this build cannot load are shown
-as unsupported and cannot be selected). Every request is same-origin;
+as unsupported and cannot be selected), and an image-model panel that reports
+`image_model.dir` / `loaded` and hot-loads `MiniMax-H3-Image`. The top bar has
+a **中 / EN** switch: labels repaint in place, the content area fades in, focus
+moves to the view title, and cards, the background gradient and the active
+language button animate — unless `prefers-reduced-motion` is set. Every
+request is same-origin;
 there is no option to point the console at an external OpenAI-compatible
 service. Named API keys can still be minted for other clients to call *this*
 cwick instance (see authentication below).
@@ -338,7 +343,7 @@ Range request. Repositories of a few hundred GiB and shards above 100 GiB are
 handled with 64-bit sizes throughout. `docs/SERVER.md` has the five endpoints
 and the on-disk layout.
 
-The market ships two H5 apps in `apps/`, each with its own sqlite database and
+The market ships three H5 apps in `apps/`, each with its own sqlite database and
 its own manifest. In **tic-tac-toe** the human plays X first; every machine
 move is a `/v1/systemone` decision asking which empty cell gives O the greatest
 probability of winning, with per-cell tactical facts in the state and the full
@@ -346,7 +351,10 @@ probability readout in the right-hand column. In the **3D kart** the model
 places every obstacle on the Mobius strip in real time: each decision shuffles
 its twelve option letters, draws a variation seed and a pressure point, and
 asks for the hardest possible obstacle, while the sidebar shows obstacle and
-kart statistics. Both call `POST /v1/systemone`; the chat tab goes to whichever
+kart statistics. **H5 image studio** takes a prompt plus optional face, outfit
+and pose uploads and calls `/v1/images/edits` (or `/v1/images/generations` for
+plain text), showing progress, an inline preview and a PNG download. The two game
+apps call `POST /v1/systemone`; the chat tab goes to whichever
 endpoint its selector names. Each app lays itself out for a phone screen as well as
 a desktop one; the console only hosts them. With `--lan` each app has a QR code,
 so a phone on the same Wi-Fi can open it without knowing the address.
@@ -394,20 +402,24 @@ serve also have an environment twin:
 | `--jev` / `--no-jev` | off | enable `POST|GET /v1/systemone`; `start.sh` turns it on |
 | `--password P` / `--api-key NAME` | — | single-user login / named key for agent platforms |
 | `--models-dir DIR` | — | extra checkpoints to list (up to 8); switching loads one at a time |
+| `--img DIR` | `CWICK_IMAGE_MODEL` | image checkpoint directory; exposes `POST /v1/images/generations` and `/v1/images/edits` and allows an on-demand switch to `MiniMax-H3-Image` |
 | `--store DIR` | `~/.cwick/apps` | one sqlite file per app plus `auth.db` |
 
 Environment twins: `CWICK_MEM_PCT`, `CWICK_MEM_MAX_GIB`, `CWICK_STORE`,
 `CWICK_PASSWORD`, `CWICK_API_KEY`, `CWICK_WARMUP`, `CWICK_WEB`, `CWICK_METAL`,
-`CWICK_SEED` (sampling seed, so a run is repeatable), `CWICK_HUB_ENDPOINT` /
-`HF_ENDPOINT` (model catalog host for the **模型** tab). The library always
-writes to `./models`; it is in `.gitignore`.
+`CWICK_IMAGE_MODEL`, `CWICK_SEED` (sampling seed, so a run is repeatable),
+`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` (model catalog host for the **模型** tab).
+`--img` wins when both it and the environment variable are set. The library
+always writes to `./models`; it is in `.gitignore`.
 
 ## API
 
 | method | path | notes |
 |---|---|---|
 | GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir`; each entry carries `supported` / `unsupported_reason` |
-| POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued |
+| POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` instead hot-loads the image pipeline without touching the text model |
+| POST | `/v1/images/generations` | `b64_json` image from a JSON prompt; requires `--img` / `CWICK_IMAGE_MODEL` or an on-demand image switch |
+| POST | `/v1/images/edits` | `multipart/form-data` with repeatable `image` parts; same image response shape |
 | POST | `/v1/completions` | raw text completion, streaming or not |
 | POST | `/v1/chat/completions` | messages, `stream`, `tools`, `reasoning_effort` |
 | POST | `/v1/responses` | Responses dialect: `input` items in, a `response` object / `response.*` events out |
@@ -752,7 +764,7 @@ cwick/
 │   ├── store.c        one sqlite file per app
 │   └── webui*.c       the console, embedded at build time
 ├── web/               console source: index.html, app.js, app.css, login.html
-├── apps/              two H5 apps plus manifest.json
+├── apps/              three H5 apps plus manifest.json
 ├── docs/              architecture, storage, performance, decisions, server, precision
 ├── tests/             test_cwick.c — 651 checks
 ├── tools/             standalone C probes: kernels, layer tests, model runners
