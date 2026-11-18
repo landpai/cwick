@@ -39,6 +39,12 @@ OpenAI API.
   repeatable `image` parts; same response shape. Both require a configured
   image model (`--img DIR` or `CWICK_IMAGE_MODEL`, or an on-demand switch);
   see `docs/IMAGE.md`.
+- `GET /v1/realtime?model=Sophon-Realtime-32B-Tag` — WebSocket upgrade for
+  full-duplex speech; requires `--rt DIR` and an active switch to that id.
+  Audio goes in as base64 PCM16 `input_audio_buffer.append` events and comes
+  back as `response.audio.delta`; `GET /v1/realtime/stats` reports the aggregate
+  full-chain counters. The event list, timing fields and the H5 TeachMe app are
+  described in `docs/REALTIME.md`.
 - `GET /v1/metrics` (and `/metrics`) — Prometheus text, vLLM naming.
   `cwick:model_loaded` (1/0) is the live residency bit; `cwick:model_info`
   keeps the labels of the last successfully loaded checkpoint.

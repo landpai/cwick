@@ -93,6 +93,15 @@ static id<MTLComputePipelineState>  g_pso_bf16; // resident BF16 linear GEMV
  * whole GEMV on the CPU pool. */
 static id<MTLComputePipelineState>  g_pso_ds_fp4;
 static id<MTLComputePipelineState>  g_pso_ds_bf16;
+static id<MTLComputePipelineState>  g_pso_row_gemv; // FP8 with per-row scale
+static id<MTLComputePipelineState>  g_pso_row_gemm; // same, m activation rows
+/* Eight output rows per simdgroup, sixteen activation rows per tile: 128
+ * accumulators, which is the most this GPU keeps in registers. Wider tiles
+ * spill and lose several times over. CWICK_FP8ROW_GEMM=0 falls back to the
+ * one-row kernel for A/B. */
+static id<MTLComputePipelineState> g_pso_row_gemm8;
+static int g_row_wide = 1;
+static id<MTLComputePipelineState>  g_pso_f32_gemm; // plain f32, speech stages
 static id<MTLComputePipelineState>  g_pso_ka;   // keepalive
 static int                          g_fp8_kernel = 3;  /* CWICK_FP8_KERNEL */
 
@@ -383,6 +392,26 @@ static int cwick_metal_compile(void) {
         if (dsbf16_fn)
             g_pso_ds_bf16 = [g_dev newComputePipelineStateWithFunction:dsbf16_fn
                                                                  error:&err];
+        id<MTLFunction> rowg_fn = [lib newFunctionWithName:@"kernel_cwick_fp8row_gemv"];
+        if (rowg_fn)
+            g_pso_row_gemv = [g_dev newComputePipelineStateWithFunction:rowg_fn
+                                                                  error:&err];
+        id<MTLFunction> rowm_fn = [lib newFunctionWithName:@"kernel_cwick_fp8row_gemm"];
+        if (rowm_fn)
+            g_pso_row_gemm = [g_dev newComputePipelineStateWithFunction:rowm_fn
+                                                                  error:&err];
+        id<MTLFunction> rowm8_fn = [lib newFunctionWithName:@"kernel_cwick_fp8row_gemm8x16"];
+        if (rowm8_fn)
+            g_pso_row_gemm8 = [g_dev newComputePipelineStateWithFunction:rowm8_fn
+                                                                   error:&err];
+        {
+            const char *e = getenv("CWICK_FP8ROW_GEMM");
+            if (e && atoi(e) == 0) g_row_wide = 0;
+        }
+        id<MTLFunction> f32m_fn = [lib newFunctionWithName:@"kernel_cwick_f32_gemm"];
+        if (f32m_fn)
+            g_pso_f32_gemm = [g_dev newComputePipelineStateWithFunction:f32m_fn
+                                                                  error:&err];
         id<MTLFunction> ka_fn = [lib newFunctionWithName:@"kernel_cwick_keepalive"];
         if (ka_fn) {
             g_pso_ka = [g_dev newComputePipelineStateWithFunction:ka_fn error:&err];
@@ -715,21 +744,6 @@ static int view_of(const void *p, size_t len, id<MTLBuffer> __strong *buf,
      * end of what was adopted). */
     size_t need = ((len + lead + page - 1u) / page) * page;
 
-    /* Prefault the region before handing it to the GPU. A no-copy buffer
-     * requires its backing pages to be resident; a weight that only the GPU
-     * ever reads (the per-layer shared expert, since its GEMVs moved into
-     * the batch) may never have been touched by the CPU, and the GPU page
-     * table then lacks the mapping -- which shows up as a rare, timing
-     * dependent SIGSEGV inside the kernel rather than a clean error. One
-     * volatile read per page, once per wrapped region, costs microseconds
-     * against the matrix load and is the documented no-copy requirement. */
-    {
-        volatile const unsigned char *vp = (volatile const unsigned char *)base;
-        unsigned char sink = 0;
-        for (size_t o = 0; o < need; o += (size_t)page) sink |= vp[o];
-        (void)sink;
-    }
-
     if (g_view_hint >= 0 && g_view_hint < g_view_n) {
         cwick_view *v = &g_views[g_view_hint];
         if (raw >= v->addr && raw + len <= v->addr + v->len) {
@@ -746,6 +760,19 @@ static int view_of(const void *p, size_t len, id<MTLBuffer> __strong *buf,
         }
     }
     /* Not wrapped yet: do it once and keep it. */
+    /* Prefault before handing the region to the GPU. A no-copy buffer requires
+     * its backing pages to be resident; a weight only the GPU ever reads may
+     * never have been touched by the CPU, and the GPU page table then lacks the
+     * mapping -- a rare, timing dependent SIGSEGV inside the kernel rather than
+     * a clean error. This belongs to the wrap, not to the call: one volatile
+     * read per 4 KiB page is a TLB miss each, which over a 131 MB projection is
+     * milliseconds paid again on every token. */
+    {
+        volatile const unsigned char *vp = (volatile const unsigned char *)base;
+        unsigned char sink = 0;
+        for (size_t o = 0; o < need; o += (size_t)page) sink |= vp[o];
+        (void)sink;
+    }
     id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:(void *)base
                                               length:need
                                              options:MTLResourceStorageModeShared
@@ -1218,6 +1245,142 @@ int cwick_metal_gemv_bf16(const void *w_bf16, const float *x, float *out,
                     (_t1-_t0)*1e6, (_t2-_t1)*1e6,
                     (_t2-_t1)*1e6 - (cb.GPUEndTime - cb.GPUStartTime)*1e6,
                     (cb.GPUEndTime - cb.GPUStartTime)*1e6, k, cols);
+    }
+    return 1;
+}
+
+/* ---- FP8 linear with a per-output-row scale -------------------------
+ * A checkpoint can quantise channel-wise (one scale per output row, shape
+ * [n, 1]) instead of block-wise. The row factor is constant across the dot
+ * product, so the kernel needs no per-block bookkeeping at all: one E4M3 dot
+ * per output row, one multiply at the end. `scale` here is f32 [n].
+ *
+ * Both entry points are zero-copy over the mapped weights, which is what
+ * makes them usable for a 32 GiB checkpoint: the GPU reads the same pages
+ * the loader mapped. */
+static int row_gemm_run(const void *w, const float *scale, const float *x,
+                        float *out, uint32_t k, uint32_t n, uint32_t m,
+                        uint32_t stride, id<MTLComputePipelineState> pso,
+                        uint32_t rps) {
+    if (!pso || !w || !scale || !x || !out || !k || !n || !m) return 0;
+    if ((k % 128u) != 0u) return 0;
+    const size_t wbytes = (size_t)n * k;
+    const size_t sbytes = (size_t)n * sizeof(float);
+    const size_t xbytes = (size_t)m * stride * sizeof(float);
+    const size_t obytes = (size_t)m * n * sizeof(float);
+
+    @autoreleasepool {
+        /* nil first: the view helpers release the out-param's old value. */
+        id<MTLBuffer> bw = nil, bs = nil;
+        size_t woff = 0, soff = 0;
+        if (!arena_view(w, wbytes, &bw, &woff) &&
+            !view_of(w, wbytes, &bw, &woff)) {
+            bw = scratch(&g_scratch_w, &g_scratch_w_cap, wbytes);
+            if (!bw) return 0;
+            memcpy(bw.contents, w, wbytes);
+        }
+        if (!arena_view(scale, sbytes, &bs, &soff) &&
+            !view_of(scale, sbytes, &bs, &soff)) {
+            bs = scratch(&g_scratch_s, &g_scratch_s_cap, sbytes);
+            if (!bs) return 0;
+            memcpy(bs.contents, scale, sbytes);
+        }
+        id<MTLBuffer> bx = scratch(&g_bx, &g_bx_cap, xbytes);
+        id<MTLBuffer> bo = scratch(&g_bo, &g_bo_cap, obytes);
+        if (!bx || !bo) return 0;
+        memcpy(bx.contents, x, xbytes);
+
+        struct { uint32_t k, n, m, stride; } args = { k, n, m, stride };
+        NSUInteger tpt = g_tpt ? g_tpt : 256;
+        if (tpt < 32) tpt = 32;
+        if (tpt > 1024) tpt = 1024;
+        NSUInteger nsg = tpt / 32;
+        NSUInteger rows = (NSUInteger)n * rps;
+        if (nsg > rows) nsg = rows;
+        tpt = nsg * 32;
+
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:bw offset:woff atIndex:1];
+        [enc setBuffer:bs offset:soff atIndex:2];
+        [enc setBuffer:bx offset:0 atIndex:3];
+        [enc setBuffer:bo offset:0 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + nsg * rps - 1) / (nsg * rps)), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted || cb.error) return 0;
+        memcpy(out, bo.contents, obytes);
+    }
+    return 1;
+}
+
+int cwick_metal_gemv_fp8_row(const void *w, const float *scale, const float *x,
+                             float *out, uint32_t k, uint32_t n) {
+    return row_gemm_run(w, scale, x, out, k, n, 1, k, g_pso_row_gemv, 1);
+}
+
+int cwick_metal_gemm_fp8_row(const void *w, const float *scale, const float *x,
+                             float *out, uint32_t k, uint32_t n, uint32_t m) {
+    if (m == 1) return cwick_metal_gemv_fp8_row(w, scale, x, out, k, n);
+    if (g_row_wide && g_pso_row_gemm8)
+        return row_gemm_run(w, scale, x, out, k, n, m, k, g_pso_row_gemm8, 8);
+    return row_gemm_run(w, scale, x, out, k, n, m, k, g_pso_row_gemm, 1);
+}
+
+/* ---- plain f32 linear for the speech stages -------------------------
+ * w is [n][k] row-major and stays exactly as the checkpoint mapped it;
+ * x is [m][k], out is [m][n]. Returns 0 whenever the shape or alignment
+ * does not suit the kernel, so the caller can fall back to Accelerate. */
+static id<MTLBuffer> g_f32_x, g_f32_o;
+static size_t        g_f32_x_cap, g_f32_o_cap;
+
+int cwick_metal_gemm_f32_bridge(const float *w, const float *x, float *out,
+                                uint32_t k, uint32_t n, uint32_t m) {
+    if (!g_pso_f32_gemm || !w || !x || !out || !k || !n || !m) return 0;
+    if ((k % 4u) != 0u) return 0;
+    if (((uintptr_t)w & 15u) != 0u || ((uintptr_t)x & 15u) != 0u) return 0;
+    const size_t wbytes = (size_t)n * k * sizeof(float);
+    const size_t xbytes = (size_t)m * k * sizeof(float);
+    const size_t obytes = (size_t)m * n * sizeof(float);
+
+    @autoreleasepool {
+        id<MTLBuffer> bw = nil;
+        size_t woff = 0;
+        if (!arena_view(w, wbytes, &bw, &woff) &&
+            !view_of(w, wbytes, &bw, &woff)) {
+            /* Copying a whole projection every call would cost more than the
+             * GEMM saves, so an unmappable weight is a fall-back, not a path. */
+            return 0;
+        }
+        id<MTLBuffer> bx = scratch(&g_f32_x, &g_f32_x_cap, xbytes);
+        id<MTLBuffer> bo = scratch(&g_f32_o, &g_f32_o_cap, obytes);
+        if (!bx || !bo) return 0;
+        memcpy(bx.contents, x, xbytes);
+
+        NSUInteger nsg = 8;
+        if (nsg > n) nsg = n;
+        NSUInteger tpt = nsg * 32;
+        struct { uint32_t k, n, m, stride; } args = { k, n, m, k };
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_pso_f32_gemm];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:bw offset:woff atIndex:1];
+        [enc setBuffer:bx offset:0 atIndex:2];
+        [enc setBuffer:bo offset:0 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((n + nsg - 1) / nsg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted || cb.error) return 0;
+        memcpy(out, bo.contents, obytes);
     }
     return 1;
 }
@@ -1719,8 +1882,11 @@ void cwick_metal_bridge_cleanup(void) {
     pthread_mutex_unlock(&g_arena_mtx);
     g_scratch_w = g_scratch_s = g_bx = g_bo = nil;
     g_scratch_w_cap = g_scratch_s_cap = g_bx_cap = g_bo_cap = 0;
+    g_f32_x = g_f32_o = nil;
+    g_f32_x_cap = g_f32_o_cap = 0;
     g_pso = nil;
     g_pso_bf16 = nil;
+    g_pso_f32_gemm = nil;
     g_pso_ds_fp4 = nil;
     g_pso_ds_bf16 = nil;
     for (int i = 0; i < CWICK_DS_BATCH_SLOTS; i++) {

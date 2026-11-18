@@ -118,6 +118,17 @@ const char *cwick_metal_shader_source(void) {
     "    const float sub = as_type<float>(m | sign) * 0x1p120f;\n"
     "    return (e != 0u) ? nrm : sub;\n"
     "}\n"
+    "/* Same value, fewer instructions: the exponent bias is added straight into\n"
+    " * the assembled word (e <= 15, so e+120 never carries into the sign bit),\n"
+    " * and the sign is OR-ed onto the finished float instead of being carried\n"
+    " * through both branches. Bit-identical to cwick_fp8_v2 for all 256 patterns. */\n"
+    "static float cwick_fp8_v3(uint b) {\n"
+    "    const uint mag = (b & 0x7Fu) << 20u;\n"
+    "    const float nrm = as_type<float>(mag + 0x3C000000u);\n"
+    "    const float sub = as_type<float>(mag) * 0x1p120f;\n"
+    "    const float v = ((b & 0x78u) != 0u) ? nrm : sub;\n"
+    "    return as_type<float>(as_type<uint>(v) | ((b & 0x80u) << 24u));\n"
+    "}\n"
     "static float fp8_acc16(float acc, uint4 p, float s,\n"
     "                       float4 x0, float4 x1, float4 x2, float4 x3) {\n"
     "    acc = fma(cwick_fp8_v2(p.x & 0xFFu) * s, x0[0], acc);\n"
@@ -773,6 +784,187 @@ const char *cwick_metal_shader_source(void) {
     "        float acc = 0.0f;\n"
     "        for (uint b = 0; b < nb; b++) acc += mine[b];\n"
     "        out[row - args.row0] = acc;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* ---- per-output-channel scaled FP8 linear ----------------------------\n"
+    " * A different quantisation shape from the kernels above: one scale per\n"
+    " * *output row* instead of per 128x128 block. Because every element of a\n"
+    " * row shares the factor, it comes out of the dot product, so the row is\n"
+    " * one plain E4M3 dot with x and a single multiply at the end. */\n"
+    "typedef struct {\n"
+    "    uint k; uint n; uint m; uint stride;\n"
+    "} cwick_fp8row_args;\n"
+    "/* One output row per simdgroup; x has one row (decode). */\n"
+    "kernel void kernel_cwick_fp8row_gemv(\n"
+    "        constant cwick_fp8row_args &args,\n"
+    "        device const uchar *w,\n"
+    "        device const float *scale,\n"
+    "        device const float *x,\n"
+    "        device float *out,\n"
+    "        uint2 gid [[threadgroup_position_in_grid]],\n"
+    "        ushort lane [[thread_index_in_simdgroup]],\n"
+    "        ushort sg [[simdgroup_index_in_threadgroup]],\n"
+    "        ushort nsg [[simdgroups_per_threadgroup]]) {\n"
+    "    const uint row = gid.x * (uint)nsg + (uint)sg;\n"
+    "    if (row >= args.n) return;\n"
+    "    const uint k = args.k;\n"
+    "    device const uchar *wr = w + (ulong)row * k;\n"
+    "    const uint steps = k / 128u;\n"
+    "    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;\n"
+    "    for (uint i = 0; i < steps; i++) {\n"
+    "        const uint j = lane * 4u + i * 128u;\n"
+    "        const uchar4 p = *((device const uchar4 *)(wr + j));\n"
+    "        const float4 xv = *((device const float4 *)(x + j));\n"
+    "        a0 = fma(cwick_fp8_v2(p.x), xv.x, a0);\n"
+    "        a1 = fma(cwick_fp8_v2(p.y), xv.y, a1);\n"
+    "        a2 = fma(cwick_fp8_v2(p.z), xv.z, a2);\n"
+    "        a3 = fma(cwick_fp8_v2(p.w), xv.w, a3);\n"
+    "    }\n"
+    "    const float part = simd_sum((a0 + a1) + (a2 + a3));\n"
+    "    if (lane == 0u) out[row] = part * scale[row];\n"
+    "}\n"
+    "/* Same, for m activation rows (prefill). Each simdgroup keeps 16 row\n"
+    " * accumulators in registers, so one weight byte feeds 16 FMAs and the\n"
+    " * matrix is read once per 16-token group instead of once per token.\n"
+    " * out is [m][n] row-major. k must be a multiple of 128. */\n"
+    "kernel void kernel_cwick_fp8row_gemm(\n"
+    "        constant cwick_fp8row_args &args,\n"
+    "        device const uchar *w,\n"
+    "        device const float *scale,\n"
+    "        device const float *x,\n"
+    "        device float *out,\n"
+    "        uint2 gid [[threadgroup_position_in_grid]],\n"
+    "        ushort lane [[thread_index_in_simdgroup]],\n"
+    "        ushort sg [[simdgroup_index_in_threadgroup]],\n"
+    "        ushort nsg [[simdgroups_per_threadgroup]]) {\n"
+    "    const uint row = gid.x * (uint)nsg + (uint)sg;\n"
+    "    if (row >= args.n) return;\n"
+    "    const uint k = args.k;\n"
+    "    const uint m = args.m;\n"
+    "    device const uchar *wr = w + (ulong)row * k;\n"
+    "    const uint steps = k / 128u;\n"
+    "    const float s = scale[row];\n"
+    "    for (uint m0 = 0; m0 < m; m0 += 16u) {\n"
+    "        const uint mm = min(16u, m - m0);\n"
+    "        float acc[16];\n"
+    "        for (uint t = 0; t < 16u; t++) acc[t] = 0.f;\n"
+    "        for (uint i = 0; i < steps; i++) {\n"
+    "            const uint j = lane * 4u + i * 128u;\n"
+    "            const uchar4 p = *((device const uchar4 *)(wr + j));\n"
+    "            const float w0 = cwick_fp8_v2(p.x), w1 = cwick_fp8_v2(p.y);\n"
+    "            const float w2 = cwick_fp8_v2(p.z), w3 = cwick_fp8_v2(p.w);\n"
+    "            for (uint t = 0; t < mm; t++) {\n"
+    "                const float4 xv = *((device const float4 *)(x + (ulong)(m0 + t) * args.stride + j));\n"
+    "                acc[t] = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, acc[t]))));\n"
+    "            }\n"
+    "        }\n"
+    "        for (uint t = 0; t < mm; t++) {\n"
+    "            const float r = simd_sum(acc[t]) * s;\n"
+    "            if (lane == 0u) out[(ulong)(m0 + t) * args.n + row] = r;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "/* R output rows per simdgroup, MT activation rows per tile. The single-row\n"
+    " * kernel above is bound by load instructions, not by weight bandwidth: every\n"
+    " * uchar4 of weight needs sixteen float4 loads of x, so the load unit retires\n"
+    " * 4 weight bytes per 17 loads and the matrix crawls at ~24 GB/s. Sharing each\n"
+    " * x load across R rows and each weight load across MT tokens raises the bytes\n"
+    " * per load without touching a single dot product. Both tile bounds are\n"
+    " * compile-time constants so the accumulators stay in registers; a ragged tail\n"
+    " * re-reads the last activation row and drops the extra stores. */\n"
+#define FP8ROW_GEMM(NAME, R, MT)                                               \
+    "kernel void " NAME "(\n"                                                  \
+    "        constant cwick_fp8row_args &args,\n"                              \
+    "        device const uchar *w,\n"                                         \
+    "        device const float *scale,\n"                                     \
+    "        device const float *x,\n"                                         \
+    "        device float *out,\n"                                             \
+    "        uint2 gid [[threadgroup_position_in_grid]],\n"                    \
+    "        ushort lane [[thread_index_in_simdgroup]],\n"                     \
+    "        ushort sg [[simdgroup_index_in_threadgroup]],\n"                  \
+    "        ushort nsg [[simdgroups_per_threadgroup]]) {\n"                   \
+    "    const uint row = (gid.x * (uint)nsg + (uint)sg) * " #R "u;\n"         \
+    "    if (row >= args.n) return;\n"                                         \
+    "    const uint k = args.k, m = args.m, n = args.n;\n"                     \
+    "    device const uchar *wp[" #R "];\n"                                    \
+    "    float sc[" #R "];\n"                                                  \
+    "    for (uint r = 0; r < " #R "u; r++) {\n"                               \
+    "        const uint rr = min(row + r, n - 1u);\n"                          \
+    "        wp[r] = w + (ulong)rr * k;\n"                                     \
+    "        sc[r] = scale[rr];\n"                                             \
+    "    }\n"                                                                  \
+    "    const uint steps = k / 128u;\n"                                      \
+    "    for (uint m0 = 0; m0 < m; m0 += " #MT "u) {\n"                        \
+    "        const uint mm = min(" #MT "u, m - m0);\n"                         \
+    "        float acc[" #R "][" #MT "];\n"                                    \
+    "        for (uint r = 0; r < " #R "u; r++)\n"                             \
+    "            for (uint t = 0; t < " #MT "u; t++) acc[r][t] = 0.f;\n"       \
+    "        for (uint i = 0; i < steps; i++) {\n"                             \
+    "            const uint j = lane * 4u + i * 128u;\n"                       \
+    "            float4 q[" #R "];\n"                                          \
+    "            for (uint r = 0; r < " #R "u; r++) {\n"                       \
+    "                const uchar4 p = *((device const uchar4 *)(wp[r] + j));\n"\
+    "                q[r] = float4(cwick_fp8_v3(p.x), cwick_fp8_v3(p.y),\n"    \
+    "                             cwick_fp8_v3(p.z), cwick_fp8_v3(p.w));\n"    \
+    "            }\n"                                                          \
+    "            for (uint t = 0; t < " #MT "u; t++) {\n"                      \
+    "                const uint rr = min(m0 + t, m - 1u);\n"                   \
+    "                const float4 xv = *((device const float4 *)(x + (ulong)rr * args.stride + j));\n" \
+    "                for (uint r = 0; r < " #R "u; r++)\n"                     \
+    "                    acc[r][t] = fma(q[r].x, xv.x, fma(q[r].y, xv.y, fma(q[r].z, xv.z, fma(q[r].w, xv.w, acc[r][t]))));\n" \
+    "            }\n"                                                          \
+    "        }\n"                                                              \
+    "        for (uint t = 0; t < " #MT "u; t++) {\n"                          \
+    "            if (t >= mm) break;\n"                                        \
+    "            for (uint r = 0; r < " #R "u; r++) {\n"                       \
+    "                const float v = simd_sum(acc[r][t]) * sc[r];\n"           \
+    "                if (lane == 0u && row + r < n)\n"                         \
+    "                    out[(ulong)(m0 + t) * n + row + r] = v;\n"            \
+    "            }\n"                                                          \
+    "        }\n"                                                              \
+    "    }\n"                                                                  \
+    "}\n"
+    FP8ROW_GEMM("kernel_cwick_fp8row_gemm8x16", 8, 16)
+#undef FP8ROW_GEMM
+    "/* Plain f32 linear for the speech stages, whose checkpoints are f32 and\n"
+    " * must stay that way. One output row per simdgroup, m activation rows\n"
+    " * tiled by 16 so a weight element feeds 16 FMAs. At m=1 this is a\n"
+    " * bandwidth-bound GEMV, which is the whole point: a single CPU core\n"
+    " * reads the 0.5B talker's 1.4 GB of weights at ~28 GB/s, while the GPU\n"
+    " * sees the same unified-memory pages an order of magnitude faster.\n"
+    " * k must be a multiple of 4 and w/x 16-byte aligned; the caller checks. */\n"
+    "kernel void kernel_cwick_f32_gemm(\n"
+    "        constant cwick_fp8row_args &args,\n"
+    "        device const float *w,\n"
+    "        device const float *x,\n"
+    "        device float *out,\n"
+    "        uint2 gid [[threadgroup_position_in_grid]],\n"
+    "        ushort lane [[thread_index_in_simdgroup]],\n"
+    "        ushort sg [[simdgroup_index_in_threadgroup]],\n"
+    "        ushort nsg [[simdgroups_per_threadgroup]]) {\n"
+    "    const uint row = gid.x * (uint)nsg + (uint)sg;\n"
+    "    if (row >= args.n) return;\n"
+    "    const uint k = args.k;\n"
+    "    const uint m = args.m;\n"
+    "    device const float *wr = w + (ulong)row * k;\n"
+    "    for (uint m0 = 0; m0 < m; m0 += 16u) {\n"
+    "        const uint mm = min(16u, m - m0);\n"
+    "        float acc[16];\n"
+    "        for (uint t = 0; t < 16u; t++) acc[t] = 0.f;\n"
+    "        for (uint i = 0; i < k; i += 128u) {\n"
+    "            const uint j = i + lane * 4u;\n"
+    "            if (j + 4u > k) break;\n"
+    "            const float4 wv = *((device const float4 *)(wr + j));\n"
+    "            for (uint t = 0; t < mm; t++) {\n"
+    "                const float4 xv = *((device const float4 *)(x + (ulong)(m0 + t) * args.stride + j));\n"
+    "                acc[t] = fma(wv.x, xv.x, fma(wv.y, xv.y, fma(wv.z, xv.z, fma(wv.w, xv.w, acc[t]))));\n"
+    "            }\n"
+    "        }\n"
+    "        for (uint t = 0; t < mm; t++) {\n"
+    "            const float r = simd_sum(acc[t]);\n"
+    "            if (lane == 0u) out[(ulong)(m0 + t) * args.n + row] = r;\n"
+    "        }\n"
     "    }\n"
     "}\n";
 }

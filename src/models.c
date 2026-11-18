@@ -26,8 +26,24 @@ void cwick_models_list_free(cwick_model_list *l) {
 
 bool cwick_models_list_add(cwick_model_list *l, const char *id, const char *root) {
     if (!id || !*id || !root || !*root) return false;
+    /* One directory is one model, however it is spelled: the --root the
+     * operator typed ("models/owner/name"), the library scan
+     * ("./models/owner/name") and an absolute path all resolve to the same
+     * checkpoint. Compare resolved paths so the second spelling is rejected
+     * here, instead of surviving as a duplicate that dedupe_ids renames to
+     * "id@2" in the settings model list. The first spelling is kept: it is the
+     * one the resident engine/pipeline was opened with, so resident matching
+     * by root string still lines up. */
+    char canon[MAX_PATH];
+    bool have_canon = realpath(root, canon) != NULL;
     for (size_t i = 0; i < l->n; i++) {
         if (strcmp(l->v[i].root, root) == 0) return false;   /* same weights */
+        if (have_canon) {
+            char existing[MAX_PATH];
+            if (realpath(l->v[i].root, existing) &&
+                strcmp(existing, canon) == 0)
+                return false;   /* same weights, different spelling */
+        }
     }
     if (l->n == l->cap) {
         size_t cap = l->cap ? l->cap * 2 : 8;
@@ -66,14 +82,22 @@ bool cwick_model_served_alias(const char *root, char *out, size_t cap) {
         {"GLM-5.3-Flash", "glm-5.3-flash"},
         {"DeepSeek-V4.1-Flash-1017", "deepSeek-v4.1-flash-1017"},
         {"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash"},
+        {"Sophon-Realtime-32B-Tag", "Sophon-Realtime-32B-Tag"},
     };
     if (!root || !*root || !out || cap == 0) return false;
     out[0] = '\0';
-    const char *slash = strrchr(root, '/');
-    const char *base = slash ? slash + 1 : root;
-    if (*base == '\0') base = root;
+    /* Trim trailing slashes so "…/Sophon-Realtime-32B-Tag/" matches the same
+     * basename as the slash-free spelling, then compare by length: the basename
+     * still sits inside `root`, possibly followed by those trailing slashes. */
+    size_t len = strlen(root);
+    while (len > 1 && root[len - 1] == '/') len--;
+    const char *base = root;
+    for (size_t i = len; i > 0; i--)
+        if (root[i - 1] == '/') { base = root + i; break; }
+    size_t blen = len - (size_t)(base - root);
     for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strcmp(base, known[i].base) == 0) {
+        if (blen == strlen(known[i].base) &&
+            strncmp(base, known[i].base, blen) == 0) {
             snprintf(out, cap, "%s", known[i].served);
             return true;
         }
@@ -210,6 +234,18 @@ bool cwick_model_dir_probe(const char *dir, char *id_out, size_t id_cap) {
             (int)sizeof(probe) &&
         file_readable(probe))
         has_weights = true;
+    /* A full-duplex speech checkpoint keeps its weights one level down: the
+     * listening decoder in thinker/, the speaking stack in talker/. Both have
+     * to be there — half a voice is not a model this build can serve. */
+    if (!has_weights &&
+        snprintf(probe, sizeof(probe), "%s/thinker/config.json", dir) <
+            (int)sizeof(probe) &&
+        file_readable(probe)) {
+        char tk[MAX_PATH];
+        if (snprintf(tk, sizeof(tk), "%s/talker", dir) < (int)sizeof(tk) &&
+            dir_readable(tk))
+            has_weights = true;
+    }
     if (!has_weights) return false;
 
     if (id_out && id_cap) {
@@ -252,6 +288,9 @@ bool cwick_model_type_supported(const char *mt) {
     if (TYPE_HAS_PREFIX(mt, "qwen3_5")) return true;
     if (strcmp(mt, "glm5_next") == 0 ||
         strcmp(mt, "glm-5.3-flash") == 0) return true;
+    /* Full-duplex speech: a listening decoder plus a speaking stack, driven by
+     * /v1/realtime rather than by the text completion paths. */
+    if (strcmp(mt, "sophon_realtime") == 0) return true;
     /* `cwick setup` writes tiny checkpoints that use the same kernels. */
     if (TYPE_HAS_PREFIX(mt, "glm_5_3_flash_synthetic") ||
         TYPE_HAS_PREFIX(mt, "glm-5.3-flash-synthetic")) return true;
@@ -295,8 +334,8 @@ bool cwick_model_root_supported(const char *root, char *why, size_t whycap) {
     if (!ok && why && whycap)
         snprintf(why, whycap,
                  "unsupported model_type \"%s\": this build implements the "
-                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 kernels "
-                 "only",
+                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 kernels and "
+                 "the Sophon-Realtime speech pipeline only",
                  mt ? mt : "(missing)");
     cwick_json_free(j);
     return ok;

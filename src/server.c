@@ -35,6 +35,8 @@
 #include "h3.h"
 #include "h3_gpu.h"
 #include "hub.h"
+#include "rt_realtime.h"
+#include "ws.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -115,6 +117,11 @@ typedef struct {
     /* Copy of --img / CWICK_IMAGE_MODEL. Kept so a settings switch can load
      * the image pipeline on demand without restarting the process. */
     char image_dir[CWICK_MODEL_ROOT_MAX];
+    /* The full-duplex speech pipeline, NULL unless a sophon_realtime checkpoint
+     * is resident. It is the third occupant of the one-model slot: thinker,
+     * ear and talker are one model and are loaded and freed together. */
+    rt_realtime *rt;
+    char realtime_dir[CWICK_MODEL_ROOT_MAX];
     /* Token ids of the two think markers, probed once per loaded tokenizer
      * (startup and every model switch). -1 means the tokenizer does not hand
      * the marker over as a single token, which turns the thinking budget off
@@ -294,6 +301,12 @@ typedef struct {
      * addition to) an Authorization header, and it is the one credential a
      * non-browser client can set without touching cookies. */
     char api_key[512];
+    /* The RFC 6455 handshake. /v1/realtime is the only upgrade this server
+     * accepts, and it needs all four of these to answer 101 honestly. */
+    char ws_key[128];
+    char ws_version[16];
+    bool ws_upgrade;
+    bool ws_connection;
     int64_t content_length;
     const char *body;
     size_t body_len;
@@ -381,6 +394,23 @@ static int read_http_request(int fd, char *buf, size_t cap, http_req *req,
                 snprintf(req->authorization, sizeof(req->authorization), "%s", value);
             } else if (strcasecmp(name, "X-API-Key") == 0) {
                 snprintf(req->api_key, sizeof(req->api_key), "%s", value);
+            } else if (strcasecmp(name, "Sec-WebSocket-Key") == 0) {
+                snprintf(req->ws_key, sizeof(req->ws_key), "%s", value);
+            } else if (strcasecmp(name, "Sec-WebSocket-Version") == 0) {
+                snprintf(req->ws_version, sizeof(req->ws_version), "%s", value);
+            } else if (strcasecmp(name, "Upgrade") == 0) {
+                req->ws_upgrade = strcasecmp(value, "websocket") == 0;
+            } else if (strcasecmp(name, "Connection") == 0) {
+                /* A proxy may send "keep-alive, Upgrade"; the token is what
+                 * matters, not the whole field. */
+                for (const char *p = value; *p; p++) {
+                    if (strncasecmp(p, "upgrade", 7) == 0 &&
+                        (p == value || p[-1] == ' ' || p[-1] == ',') &&
+                        (p[7] == '\0' || p[7] == ' ' || p[7] == ',')) {
+                        req->ws_connection = true;
+                        break;
+                    }
+                }
             }
         }
         h = he + 2;
@@ -5708,7 +5738,8 @@ static const char *status_text_for(int code) {
 /* Which entry is resident, resolved live from the engine: comparing roots is
  * the only question that matters (an id can repeat, a root cannot). */
 static const cwick_model_entry *resident_entry(server_ctx *srv) {
-    const char *root = srv->eng[0] ? cwick_engine_model_root(srv->eng[0]) : NULL;
+    const char *root = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
+                                   : (srv->rt ? srv->realtime_dir : NULL);
     if (!root) return NULL;
     for (size_t i = 0; i < srv->catalog.n; i++) {
         if (strcmp(srv->catalog.v[i].root, root) == 0) return &srv->catalog.v[i];
@@ -5730,9 +5761,34 @@ static const char *served_name(const cwick_model_entry *e) {
 static const char *resident_served_name(server_ctx *srv) {
     const cwick_model_entry *cur = resident_entry(srv);
     if (cur) return served_name(cur);
+    if (srv->rt) return rt_realtime_model(srv->rt);
+    if (srv->h3) return H3_SERVED_ID;
     const cwick_model_spec *spec =
         srv->eng[0] ? cwick_engine_spec(srv->eng[0]) : NULL;
     return spec ? spec->model_type : "";
+}
+
+/* The text switch republishes the metrics registry from the engine spec. The
+ * realtime and image pipelines own no engine, so without this their gauges keep
+ * the previous text model's name, context window and loaded flag after a switch
+ * (or after startup, when the text engine was released for them). */
+static void srv_publish_nontext_gauges(server_ctx *srv) {
+    cwick_metrics_info mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.backend = cwick_metal_backend_active() ? "metal" : "cpu";
+    if (srv->rt) {
+        mi.model = rt_realtime_model(srv->rt);
+        mi.spine = "fp8";
+        mi.max_context = rt_realtime_context(srv->rt);
+        mi.num_layers = rt_realtime_layers(srv->rt);
+    } else if (srv->h3) {
+        mi.model = H3_SERVED_ID;
+        mi.spine = "bf16";
+    } else {
+        return;
+    }
+    cwick_metrics_set_model_info(&mi);
+    cwick_metrics_set_context_window(mi.max_context);
 }
 
 /* The image checkpoint is a separate pipeline, not a resident text engine:
@@ -6095,6 +6151,10 @@ static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
                  srv->img_busy);
         return false;
     }
+    if (rt_realtime_busy(srv->rt)) {
+        snprintf(why, cap, "a realtime voice session is connected");
+        return false;
+    }
     return true;
 }
 
@@ -6136,6 +6196,20 @@ static void srv_release_image_model(server_ctx *srv) {
     h3_gpu_shutdown();
     h3_model_close(srv->h3);
     srv->h3 = NULL;
+}
+
+/* The speech pipeline is the third occupant of the one-model slot. Its decoder
+ * holds no-copy Metal views over the thinker shards, so it goes before the
+ * mappings do, exactly like the image side. The swap gate already refused while
+ * a session was connected, so nothing is mid-turn here. */
+static void srv_release_realtime_model(server_ctx *srv) {
+    if (!srv->rt) return;
+    rt_realtime_close(srv->rt);
+    srv->rt = NULL;
+    cwick_metal_arena_release();
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
 }
 
 /* Replace the resident engine with another root. Returns an HTTP status and
@@ -6226,6 +6300,11 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
         CWICK_INFO("model", "releasing image model %s before loading %s",
                    H3_SERVED_ID, served_name(target));
         srv_release_image_model(srv);
+    }
+    if (srv->rt) {
+        CWICK_INFO("model", "releasing realtime model %s before loading %s",
+                   rt_realtime_model(srv->rt), served_name(target));
+        srv_release_realtime_model(srv);
     }
 
     /* Borrowers before the owner: they borrow the owner's mmaps. */
@@ -6460,10 +6539,19 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
      * open leaves this instance with no resident model (the generation paths
      * already answer 503 in that state), which is preferable to keeping two
      * 60 GiB weight banks mapped at once. */
-    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0]) : "(none)";
-    CWICK_INFO("model", "switching to image model %s (%s) — releasing text "
-                        "model %s first", H3_SERVED_ID, srv->image_dir, old);
+    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
+                                  : (srv->rt ? rt_realtime_model(srv->rt) : "(none)");
+    CWICK_INFO("model", "switching to image model %s (%s) — releasing %s first "
+                        "(one model at a time)", H3_SERVED_ID, srv->image_dir, old);
     srv_release_text_model(srv);
+    /* The speech pipeline shares the one-model slot: give it back too, or a
+     * realtime -> image switch would leave both weight banks resident. The gate
+     * above already refused while a voice session was connected. */
+    if (srv->rt) {
+        CWICK_INFO("model", "releasing realtime model %s before loading %s",
+                   rt_realtime_model(srv->rt), H3_SERVED_ID);
+        srv_release_realtime_model(srv);
+    }
 
     cwick_error ie;
     cwick_error_clear(&ie);
@@ -6482,11 +6570,89 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
     srv->swapping = false;
     pthread_cond_broadcast(&srv->gen_cv);
     pthread_mutex_unlock(&srv->gen_lock);
+    srv_publish_nontext_gauges(srv);
     snprintf(msg, msgcap, "image model loaded from %s (%s) — both image "
                           "endpoints are ready; text endpoints need a switch "
                           "back", srv->image_dir, H3_SERVED_ID);
     CWICK_INFO("model", "switched to image model %s (%s)", H3_SERVED_ID,
                srv->image_dir);
+    return 200;
+}
+
+/* Load the full-duplex speech pipeline into the one-model slot. Same shape as
+ * the image switch: close the gate, give the resident weights back, then open
+ * the checkpoint. A failed open leaves no resident model, which the generation
+ * paths already answer 503 for — better than two weight banks mapped at once. */
+static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
+                               size_t msgcap, bool *already) {
+    if (already) *already = false;
+    if (!dir || !*dir) {
+        snprintf(msg, msgcap, "no realtime model directory configured");
+        return 400;
+    }
+    if (srv->rt) {
+        if (already) *already = true;
+        snprintf(msg, msgcap, "realtime model already loaded from %s",
+                 srv->realtime_dir);
+        return 200;
+    }
+    char why[256];
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->swapping) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "a model swap is already in progress");
+        return 409;
+    }
+    if (!swap_gate_open(srv, why, sizeof(why))) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "cannot switch to the realtime model now: %s", why);
+        return 409;
+    }
+    if (srv->stop_owner && *srv->stop_owner) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "server is shutting down");
+        return 503;
+    }
+    srv->swapping = true;
+    pthread_mutex_unlock(&srv->gen_lock);
+
+    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
+                                  : (srv->h3 ? H3_SERVED_ID : "(none)");
+    CWICK_INFO("model", "switching to realtime model %s — releasing %s first "
+                        "(one model at a time)", dir, old);
+    srv_release_text_model(srv);
+    if (srv->h3) {
+        CWICK_INFO("model", "releasing image model %s before loading the "
+                            "realtime model", H3_SERVED_ID);
+        srv_release_image_model(srv);
+    }
+
+    cwick_error re;
+    cwick_error_clear(&re);
+    rt_backend backend = cwick_metal_backend_active() ? RT_BACKEND_METAL
+                                                      : RT_BACKEND_CPU;
+    rt_realtime *m = rt_realtime_open(dir, backend, &re);
+    pthread_mutex_lock(&srv->gen_lock);
+    if (!m) {
+        snprintf(msg, msgcap, "cannot load realtime model from %s: %s", dir,
+                 cwick_error_message(&re));
+        CWICK_INFO("model", "%s", msg);
+        srv->swapping = false;
+        pthread_cond_broadcast(&srv->gen_cv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return 500;
+    }
+    srv->rt = m;
+    snprintf(srv->realtime_dir, sizeof(srv->realtime_dir), "%s", dir);
+    srv->swapping = false;
+    pthread_cond_broadcast(&srv->gen_cv);
+    pthread_mutex_unlock(&srv->gen_lock);
+    srv_publish_nontext_gauges(srv);
+    snprintf(msg, msgcap, "realtime model loaded from %s (%s) — /v1/realtime is "
+                          "ready; text endpoints need a switch back", dir,
+             rt_realtime_model(m));
+    CWICK_INFO("model", "switched to realtime model %s (%s)",
+               rt_realtime_model(m), dir);
     return 200;
 }
 
@@ -7881,6 +8047,94 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         }
     }
 
+    /* ---- /v1/realtime -------------------------------------------------
+     * The full-duplex speech session. It is a WebSocket, so it is answered
+     * before the normal routes: once the 101 goes out the socket is no longer
+     * HTTP and DONE()'s close(fd) must wait until the conversation ends.
+     * Placed after the auth gate so a voice session carries the same
+     * credential as every other model endpoint. */
+    if (strcmp(ponly, "/v1/realtime") == 0 || strcmp(ponly, "/realtime") == 0) {
+        if (strcmp(req.method, "GET") == 0 && req.ws_upgrade && req.ws_connection) {
+            if (strcmp(req.ws_version, "13") != 0 || !req.ws_key[0]) {
+                http_response(fd, 400, "Bad Request", "application/json; charset=utf-8",
+                              "{\"error\":{\"message\":\"WebSocket handshake needs "
+                              "Sec-WebSocket-Version: 13 and a Sec-WebSocket-Key\","
+                              "\"type\":\"invalid_request_error\"}}", false);
+                snprintf(detail, sizeof(detail), "realtime handshake rejected");
+                DONE(400);
+            }
+            if (!srv->rt) {
+                http_response(fd, 503, "Service Unavailable",
+                              "application/json; charset=utf-8",
+                              "{\"error\":{\"message\":\"no realtime model is resident: "
+                              "switch to a sophon_realtime checkpoint first\","
+                              "\"type\":\"invalid_request_error\"}}", false);
+                snprintf(detail, sizeof(detail), "realtime: no model");
+                DONE(503);
+            }
+            if (!cwick_ws_handshake(fd, req.ws_key)) {
+                snprintf(detail, sizeof(detail), "realtime handshake write failed");
+                DONE(500);
+            }
+            const char *q = strchr(req.path, '?');
+            CWICK_INFO(req_tag(rid), "realtime session upgraded (%s)",
+                       rt_realtime_model(srv->rt));
+            int rc = rt_realtime_serve(srv->rt, fd, rid, q ? q + 1 : NULL,
+                                       srv->stop_owner);
+            snprintf(detail, sizeof(detail), "realtime session %s",
+                     rc == 0 ? "closed" : "failed");
+            /* DONE closes the socket and writes the access line: the session
+             * duration is the request duration here. */
+            DONE(101);
+        }
+        /* A plain GET is a probe, not an upgrade. Answer with what the endpoint
+         * needs rather than a bare 404, so a misconfigured client can see why. */
+        srv_buf rb;
+        memset(&rb, 0, sizeof(rb));
+        sbuf_putf(&rb, "{\"object\":\"realtime.endpoint\",\"transport\":\"websocket\","
+                       "\"url\":\"ws://%s:%d/v1/realtime\",\"model\":",
+                  srv->host ? srv->host : "127.0.0.1", srv->port);
+        char *jm = cwick_json_stringify(srv->rt ? rt_realtime_model(srv->rt) : "");
+        sbuf_puts(&rb, jm);
+        free(jm);
+        if (srv->rt) {
+            rt_realtime_stats st;
+            rt_realtime_stats_get(srv->rt, &st);
+            sbuf_putf(&rb, ",\"resident\":true,\"sessions\":%llu,\"turns\":%llu"
+                           ",\"voices\":[",
+                      (unsigned long long)st.sessions, (unsigned long long)st.turns);
+            for (int i = 0; i < rt_realtime_voice_count(srv->rt); i++) {
+                if (i) sbuf_puts(&rb, ",");
+                char *jv = cwick_json_stringify(rt_realtime_voice_name(srv->rt, i));
+                sbuf_puts(&rb, jv);
+                free(jv);
+            }
+            sbuf_puts(&rb, "]");
+        } else {
+            sbuf_puts(&rb, ",\"resident\":false");
+        }
+        sbuf_puts(&rb, ",\"input_audio_format\":\"pcm16\",\"input_sample_rate\":24000"
+                       ",\"output_audio_format\":\"pcm16\",\"output_sample_rate\":24000}");
+        http_response(fd, 200, "OK", "application/json; charset=utf-8", rb.p, false);
+        snprintf(detail, sizeof(detail), "realtime endpoint description");
+        free(rb.p);
+        DONE(200);
+    }
+    if (strcmp(ponly, "/v1/realtime/stats") == 0 && strcmp(req.method, "GET") == 0) {
+        if (!srv->rt) {
+            http_response(fd, 503, "Service Unavailable",
+                          "application/json; charset=utf-8",
+                          "{\"error\":{\"message\":\"no realtime model is resident\"}}",
+                          false);
+            DONE(503);
+        }
+        char *body = rt_realtime_stats_json(srv->rt);
+        http_response(fd, 200, "OK", "application/json; charset=utf-8", body, false);
+        snprintf(detail, sizeof(detail), "realtime full-chain stats");
+        free(body);
+        DONE(200);
+    }
+
     /* OpenAI image routes. They are independent of the resident text model:
      * an image request must not be told "no model loaded" because the text
      * engine is mid-swap. */
@@ -8062,6 +8316,29 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
                           body, false);
             snprintf(detail, sizeof(detail), "unknown model %s", wanted);
             DONE(404);
+        }
+        /* A speech checkpoint replaces the resident model rather than sitting
+         * beside it, so it goes through its own loader (which releases the text
+         * engine first) instead of srv_switch_model. */
+        if (strcmp(target->id, "sophon_realtime") == 0) {
+            char msg[512];
+            bool already = false;
+            int rst = srv_switch_realtime(srv, target->root, msg, sizeof(msg),
+                                          &already);
+            char *jmsg = json_str_alloc(msg);
+            char *jid = json_str_alloc(served_name(target));
+            char body[1024];
+            snprintf(body, sizeof(body),
+                     "{\"status\":%s,\"model\":%s,\"detail\":%s}",
+                     rst != 200 ? "\"error\"" :
+                       (already ? "\"already_resident\"" : "\"switched\""),
+                     jid ? jid : "\"\"", jmsg ? jmsg : "\"\"");
+            free(jid);
+            free(jmsg);
+            http_response(fd, rst, status_text_for(rst),
+                          "application/json; charset=utf-8", body, false);
+            snprintf(detail, sizeof(detail), "realtime model switch -> %d", rst);
+            DONE(rst);
         }
         /* No-op switch: say so instead of paying a reload. */
         pthread_mutex_lock(&srv->gen_lock);
@@ -8754,14 +9031,14 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     srv.stop_owner = stop;
     pthread_cond_init(&srv.gen_cv, NULL);
     for (int i = 0; i < CWICK_GEN_SLOTS; i++) srv.slot_fd[i] = -1;
-    cwick_engine_set_stop(eng, stop);
+    if (eng) cwick_engine_set_stop(eng, stop);
     /* Build the extra generation slots. Each borrows slot 0's weight spine,
      * so the 15.46 GiB mlocked spine is paid for once and only the
      * per-sequence state (KV, KDA recurrence, DSA indexer) is duplicated --
      * about 2.4 GiB per extra slot. A slot that fails to come up is simply
      * left NULL and never handed out: the server runs with fewer slots
      * rather than refusing to start. */
-    {
+    if (eng) {
         /* Opt in with CWICK_GEN_SLOTS=2|3.
          *
          * The pieces are in place -- per-slot Metal batches, a shared spine,
@@ -8823,16 +9100,59 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
                         ? opt->image_dir : getenv("CWICK_IMAGE_MODEL");
         if (dir && *dir) {
             snprintf(srv.image_dir, sizeof(srv.image_dir), "%s", dir);
-            cwick_error ie;
-            cwick_error_clear(&ie);
-            srv.h3 = h3_model_open(dir, &ie);
-            if (srv.h3)
-                CWICK_INFO("init", "image model ready: %s "
-                                  "(POST /v1/models/switch with %s to reload)",
-                           dir, H3_SERVED_ID);
-            else
-                CWICK_INFO("init", "image model unavailable: %s",
-                           cwick_error_message(&ie));
+            /* One model at a time: the image pipeline is resident only when no
+             * text engine and no realtime pipeline owns the slot. Otherwise the
+             * directory is registered for hot-switch and its weights are not
+             * mapped at startup — root decides the resident model. */
+            bool rt_resident = opt && opt->realtime_dir && *opt->realtime_dir;
+            if (eng || rt_resident) {
+                CWICK_INFO("init", "image %s registered for hot-switch (one model "
+                                   "at a time): reload via POST /v1/models/switch "
+                                   "with %s", dir, H3_SERVED_ID);
+            } else {
+                cwick_error ie;
+                cwick_error_clear(&ie);
+                srv.h3 = h3_model_open(dir, &ie);
+                if (srv.h3)
+                    CWICK_INFO("init", "image model ready: %s "
+                                      "(POST /v1/models/switch with %s to reload)",
+                               dir, H3_SERVED_ID);
+                else
+                    CWICK_INFO("init", "image model unavailable: %s",
+                               cwick_error_message(&ie));
+            }
+        }
+    }
+    {
+        /* A speech checkpoint is a resident model of its own: thinker + ear +
+         * talker, no text engine. Opened here so the metrics registry and the
+         * catalog below can name it. */
+        const char *dir = (opt && opt->realtime_dir && *opt->realtime_dir)
+                        ? opt->realtime_dir : NULL;
+        if (dir && *dir) {
+            snprintf(srv.realtime_dir, sizeof(srv.realtime_dir), "%s", dir);
+            /* One model at a time: the realtime pipeline is resident only when
+             * root is a speech checkpoint (no text engine). With a text root the
+             * directory is registered for hot-switch, not opened at startup. */
+            if (eng) {
+                CWICK_INFO("init", "realtime %s registered for hot-switch (one "
+                                   "model at a time): root text model is resident; "
+                                   "reload via POST /v1/models/switch", dir);
+            } else {
+                rt_backend backend = cwick_metal_backend_active() ? RT_BACKEND_METAL
+                                                                  : RT_BACKEND_CPU;
+                cwick_error re;
+                cwick_error_clear(&re);
+                srv.rt = rt_realtime_open(dir, backend, &re);
+                if (srv.rt)
+                    CWICK_INFO("init", "realtime model ready: %s "
+                                      "(ws://%s:%d/v1/realtime?model=%s)",
+                               rt_realtime_model(srv.rt), srv.host, srv.port,
+                               rt_realtime_model(srv.rt));
+                else
+                    CWICK_INFO("init", "realtime model unavailable: %s",
+                               cwick_error_message(&re));
+            }
         }
     }
     {
@@ -8887,28 +9207,40 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * the memory ceiling are sampled live, so they are handed over as pointers
      * the registry can read at scrape time. */
     {
-        const cwick_model_spec *mspec = cwick_engine_spec(eng);
-        const cwick_spine *spine = cwick_engine_spine(eng);
+        const cwick_model_spec *mspec = eng ? cwick_engine_spec(eng) : NULL;
+        const cwick_spine *spine = eng ? cwick_engine_spine(eng) : NULL;
         cwick_metrics_info mi;
         memset(&mi, 0, sizeof(mi));
         /* The catalog is built further down, so the served alias is derived
          * from the root directly — same answer, no entry to look up yet. */
         char served[CWICK_MODEL_ID_MAX];
-        mi.model = mspec->model_type;
-        if (cwick_model_served_alias(cwick_engine_model_root(eng), served,
-                                     sizeof(served)) &&
-            served[0] && strcmp(served, mspec->model_type) != 0)
-            mi.model = served;
+        if (mspec) {
+            mi.model = mspec->model_type;
+            if (cwick_model_served_alias(cwick_engine_model_root(eng), served,
+                                         sizeof(served)) &&
+                served[0] && strcmp(served, mspec->model_type) != 0)
+                mi.model = served;
+            mi.max_context = cwick_engine_context_window(eng);
+            mi.num_layers = mspec->num_hidden_layers;
+            mi.num_experts = mspec->num_experts;
+            mi.experts_per_token = mspec->num_experts_per_token;
+        } else if (srv.rt) {
+            /* Speech-only residency: the metrics registry still has to name
+             * what is answering, and /v1/metrics is scraped alongside the
+             * realtime session. */
+            mi.model = rt_realtime_model(srv.rt);
+            mi.spine = "fp8";
+            mi.max_context = rt_realtime_context(srv.rt);
+            mi.num_layers = rt_realtime_layers(srv.rt);
+        } else if (srv.h3) {
+            mi.model = H3_SERVED_ID;
+        }
         mi.backend = cwick_metal_backend_active() ? "metal" : "cpu";
-        mi.spine = spine && spine->have_int8 ? "int8" : "bf16";
-        mi.max_context = cwick_engine_context_window(eng);
-        mi.num_layers = mspec->num_hidden_layers;
-        mi.num_experts = mspec->num_experts;
-        mi.experts_per_token = mspec->num_experts_per_token;
+        if (!mi.spine) mi.spine = spine && spine->have_int8 ? "int8" : "bf16";
         cwick_metrics_init(&mi);
         cwick_metrics_set_context_window(mi.max_context);
         if (spine && spine->stream) cwick_metrics_set_stream(spine->stream);
-        else {
+        else if (eng) {
             cwick_stream *es = cwick_engine_expert_stream(eng);
             if (es) cwick_metrics_set_stream(es);
         }
@@ -8922,17 +9254,21 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
         bool verbose = srv.verbose || srv_log_verbose_env();
         bool quiet = !srv_log_enabled();
         cwick_log_config(verbose, srv.trace, quiet);
-        cwick_engine_set_verbose(eng, verbose);
+        if (eng) cwick_engine_set_verbose(eng, verbose);
     }
 
-    /* tokenizer (model root: legacy tokenizer/ or HF tokenizer.json) */
+    /* tokenizer (model root: legacy tokenizer/ or HF tokenizer.json). A
+     * speech-only residency has no text tokenizer here: the realtime pipeline
+     * owns its own, and the text endpoints answer 503 until a switch back. */
     cwick_tokenizer *tok = NULL;
-    cwick_status st = cwick_tokenizer_load(cwick_engine_model_root(eng),
-                                        cwick_engine_spec(eng), &tok, err);
-    if (st != CWICK_OK) { pthread_mutex_destroy(&srv.gen_lock); pthread_mutex_destroy(&srv.pfx_mtx);
-    pthread_cond_destroy(&srv.gen_cv); return st; }
-    srv.tok = tok;
-    srv_probe_think_ids(&srv);
+    if (eng) {
+        cwick_status st = cwick_tokenizer_load(cwick_engine_model_root(eng),
+                                            cwick_engine_spec(eng), &tok, err);
+        if (st != CWICK_OK) { pthread_mutex_destroy(&srv.gen_lock); pthread_mutex_destroy(&srv.pfx_mtx);
+        pthread_cond_destroy(&srv.gen_cv); return st; }
+        srv.tok = tok;
+        srv_probe_think_ids(&srv);
+    }
 
     /* ---- model catalog ----------------------------------------------
      * The resident model comes first: an OpenAI client that ignores
@@ -8941,10 +9277,30 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * couple of stat() calls, never weights; an unreadable directory is
      * reported and skipped rather than failing startup. */
     {
-        const char *root = cwick_engine_model_root(eng);
-        const char *id = cwick_engine_spec(eng)->model_type;
+        const char *root = eng ? cwick_engine_model_root(eng)
+                               : (srv.rt ? srv.realtime_dir : NULL);
+        const char *id = eng ? cwick_engine_spec(eng)->model_type
+                             : (srv.rt ? "sophon_realtime" : NULL);
         cwick_models_list_init(&srv.catalog);
         bool listed_resident = root && cwick_models_list_add(&srv.catalog, id, root);
+        /* No text engine was built (a speech/image pipeline is resident from
+         * startup), but --root may still name a text checkpoint the operator
+         * wants to switch back to. List it after the resident model so data[0]
+         * stays whatever is actually answering. The image pipeline is appended
+         * separately at serialization, so it is not added to the catalog here. */
+        if (!eng && opt->startup_root && *opt->startup_root &&
+            (!root || strcmp(opt->startup_root, root) != 0)) {
+            char pid[CWICK_MODEL_ID_MAX];
+            if (cwick_model_dir_probe(opt->startup_root, pid, sizeof(pid)) &&
+                strcmp(pid, "sophon_realtime") != 0)
+                cwick_models_list_add(&srv.catalog, pid, opt->startup_root);
+        }
+        /* A text root is resident and --rt registered a speech pipeline for
+         * hot-switch (not opened at startup): list it as a switch target. The
+         * directory scan below may also find it; list_add dedupes by canonical
+         * root, so this only matters when --rt points outside the scanned dirs. */
+        if (eng && srv.realtime_dir[0] && !srv.rt)
+            cwick_models_list_add(&srv.catalog, "sophon_realtime", srv.realtime_dir);
         if (opt->models_dirs_n > 0) {
             int limit = opt->models_dirs_n < 8 ? opt->models_dirs_n : 8;
             for (int i = 0; i < limit; i++) {
@@ -9010,13 +9366,18 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * what it needs. Release it now so only the image model is resident;
      * a later POST /v1/models/switch back to a text id rebuilds the engine.
      * The catalog keeps the startup root as a switch-back target. */
-    if (srv.h3 && srv.eng[0]) {
-        CWICK_INFO("model", "image model is active at startup: releasing text "
+    if ((srv.h3 || srv.rt) && srv.eng[0]) {
+        CWICK_INFO("model", "%s model is active at startup: releasing text "
                             "model %s so only one model is resident",
+                   srv.rt ? "realtime" : "image",
                    cwick_engine_model_root(srv.eng[0]));
         srv_release_text_model(&srv);
         tok = NULL;   /* failure paths below own this local; it was just freed */
     }
+    /* The first metrics publish above described the text engine when one was
+     * built at startup. Now that only the realtime/image pipeline is resident,
+     * republish its identity so /v1/metrics never advertises a released model. */
+    srv_publish_nontext_gauges(&srv);
 
     /* listen */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -9372,6 +9733,7 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * a switch, which is exactly how long it took to find this. Free whatever
      * is resident, once. */
     if (srv.h3) { h3_model_close(srv.h3); srv.h3 = NULL; }
+    if (srv.rt) { rt_realtime_close(srv.rt); srv.rt = NULL; }
     if (srv.tok) { cwick_tokenizer_free(srv.tok); srv.tok = NULL; }
     pthread_mutex_destroy(&srv.gen_lock); pthread_mutex_destroy(&srv.pfx_mtx);
     pthread_cond_destroy(&srv.gen_cv);

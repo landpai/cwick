@@ -26,13 +26,17 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
        src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
        src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
+       src/rt_torch.c src/rt_thinker.c src/rt_audio.c src/rt_dsp.c src/rt_hift.c src/rt_flow.c \
+       src/rt_talker.c src/rt_vad.c src/rt_realtime.c src/ws.c \
        src/models.c src/store.c src/server.c src/jev.c src/hub.c src/main.c
 HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/mem.h \
        src/metrics.h src/models.h src/store.h src/hub.h \
        src/tools.h src/pfx.h src/webui.h src/qr.h src/jev.h \
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
        src/mm.h src/mm_engine.h src/mm_prompt.h \
-       src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h src/h3.h src/h3_gpu.h
+       src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h src/h3.h src/h3_gpu.h \
+       src/rt_torch.h src/rt_thinker.h src/rt_audio.h src/rt_dsp.h src/rt_hift.h src/rt_flow.h \
+       src/rt_talker.h src/rt_vad.h src/rt_realtime.h src/ws.h
 
 # The chat UI and apps are compiled into the binary (see src/webui.h).
 # web/ and apps/ are the source of truth; src/webui_embed.c is generated and
@@ -61,6 +65,8 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
             src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
             src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
             src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
+            src/rt_torch.c src/rt_thinker.c src/rt_audio.c src/rt_dsp.c src/rt_hift.c src/rt_flow.c \
+       src/rt_talker.c src/rt_vad.c src/rt_realtime.c src/ws.c \
             src/models.c src/store.c src/server.c src/jev.c src/hub.c tests/test_cwick.c
 
 test: $(TEST_SRCS) $(HDRS)
@@ -73,6 +79,52 @@ test: $(TEST_SRCS) $(HDRS)
 probe: tools/pf8probe.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o tools/pf8probe tools/pf8probe.c \
 		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Text-only smoke test for the realtime decoder (see tools/rtthink.c).
+rtthink: tools/rtthink.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtthink tools/rtthink.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Ear smoke test: log-mel + audio tower + projector (see tools/rtear.c).
+rtear: tools/rtear.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtear tools/rtear.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# WAV in, answer out: the audio rows really replace the <|audio|> embeddings
+# in front of the 64-layer decoder (see tools/rtlisten.c).
+rtlisten: tools/rtlisten.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtlisten tools/rtlisten.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Flow smoke test: speech tokens to mel, scored against a voice prompt
+# (see tools/rtflow.c).
+rtflow: tools/rtflow.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtflow tools/rtflow.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Vocoder smoke test: a voice prompt's mel back to 24 kHz audio
+# (see tools/rthift.c).
+rthift: tools/rthift.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rthift tools/rthift.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Whole talker: text to 24 kHz audio, with the per-stage timings
+# (see tools/rtsay.c).
+rtsay: tools/rtsay.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtsay tools/rtsay.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# WebSocket client for /v1/realtime: streams a WAV in, prints every server
+# event with a client-side timestamp, writes the reply audio out.
+rtws: tools/rtws.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/rtws tools/rtws.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# VAD A/B harness: same synthetic signal through both decision rules
+# (see tools/rtvad.c). Links only the state machine, no model or server.
+rtvad: tools/rtvad.c src/rt_vad.c src/rt_vad.h
+	$(CC) -O2 -Wall -Wextra -I src -o tools/rtvad \
+		tools/rtvad.c src/rt_vad.c -lm
 
 # The GPU-vs-CPU decode-step prototype for the dense checkpoint: same shape
 # mix, same number of commit+waits a real layer would make (see DECISIONS §61).

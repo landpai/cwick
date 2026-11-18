@@ -61,6 +61,24 @@ static void specials_sort(cwick_tokenizer *tok) {
     }
 }
 
+cwick_status cwick_tokenizer_add_special(cwick_tokenizer *tok, const char *text,
+                                       int64_t id) {
+    if (!tok || !text || !*text || id < 0) return CWICK_ERR_ARGUMENT;
+    for (size_t i = 0; i < tok->special_count; i++) {
+        if (tok->special[i].id != id) continue;
+        return strcmp(tok->special[i].key, text) == 0 ? CWICK_OK : CWICK_ERR_ARGUMENT;
+    }
+    tok->special = cwick_xrealloc(tok->special,
+                                  (tok->special_count + 1) * sizeof(cwick_vocab_entry));
+    tok->special[tok->special_count].key = cwick_strdup(text);
+    tok->special[tok->special_count].id = id;
+    tok->special[tok->special_count].is_byte = false;
+    tok->special_count++;
+    specials_sort(tok);
+    tok->special_first[(unsigned char)text[0]] = true;
+    return CWICK_OK;
+}
+
 /* vocab id -> vocab slot, so decode does not scan 154k entries per token. */
 static void id_index_build(cwick_tokenizer *tok) {
     int64_t maxid = -1;
@@ -79,24 +97,6 @@ static void vocab_index_build(cwick_tokenizer *tok);
 static void id_index_build(cwick_tokenizer *tok);
 static void pair_index_build(cwick_tokenizer *tok);
 static void specials_sort(cwick_tokenizer *tok);
-
-/* Build a byte -> vocab id map from single-byte tokens. */
-static void build_byte_map(cwick_tokenizer *tok) {
-    tok->byte_to_id = cwick_xmalloc(256 * sizeof(int64_t));
-    for (int i = 0; i < 256; i++) tok->byte_to_id[i] = -1;
-    for (size_t i = 0; i < tok->vocab_size; i++) {
-        const char *key = tok->vocab[i].key;
-        size_t len = strlen(key);
-        if (len == 1) {
-            unsigned char b = (unsigned char)key[0];
-            if (tok->byte_to_id[b] < 0) tok->byte_to_id[b] = tok->vocab[i].id;
-        }
-    }
-    /* A model with ids 0..255 over raw bytes is byte-fallback capable. */
-    int present = 1;
-    for (int i = 0; i < 256; i++) if (tok->byte_to_id[i] < 0) { present = 0; break; }
-    tok->byte_fallback = present && tok->vocab_size >= 256;
-}
 
 /* ------------------------------------------------------------------ */
 /* GPT-2 byte-level BPE tables (used by the real GLM tokenizer.json)   */
@@ -250,6 +250,90 @@ cwick_status cwick_tokenizer_load(const char *dir, const cwick_model_spec *spec,
     return CWICK_OK;
 }
 
+/* vocab.json + merges.txt, the layout that predates tokenizer.json. `text`
+ * holds the vocab file and is consumed here. The alphabet is GPT-2 byte-level
+ * (a Qwen2 vocab.json is full of "Ġ"-style pieces), so the raw-byte map would
+ * leave every non-ASCII byte unmapped and the merge rules would never fire. */
+static cwick_status load_legacy_pair(cwick_tokenizer *tok, const char *dir,
+                                     char *text, size_t len, const char *mpath,
+                                     cwick_error *err) {
+    json_value *root = cwick_json_parse(text, len, err);
+    free(text);
+    if (!root || root->kind != JSON_OBJECT) {
+        if (root) cwick_json_free(root);
+        cwick_error_set(err, CWICK_ERR_PARSE, "tokenizer vocab is not a JSON object");
+        cwick_tokenizer_free(tok);
+        return CWICK_ERR_PARSE;
+    }
+    tok->vocab_size = root->count;
+    tok->vocab = cwick_xmalloc(tok->vocab_size * sizeof(cwick_vocab_entry));
+    for (size_t i = 0; i < root->count; i++) {
+        const char *key = root->members[i].key;
+        tok->vocab[i].key = cwick_strdup(key);
+        tok->vocab[i].id = cwick_json_int(root->members[i].value, -1);
+        tok->vocab[i].is_byte = strlen(key) == 1;
+    }
+    cwick_json_free(root);
+    build_byte_map_gpt2(tok);
+
+    /* merges.txt: lines "a b" */
+    if (cwick_read_file(mpath, &text, &len) == 0) {
+        const char *p = text;
+        size_t cap = 16, n = 0;
+        tok->merges = cwick_xmalloc(cap * sizeof(cwick_merge_entry));
+        while (p < text + len) {
+            const char *line = p;
+            while (p < text + len && *p != '\n') p++;
+            size_t llen = (size_t)(p - line);
+            if (llen > 0 && line[0] != '#') {
+                if (n == cap) { cap *= 2; tok->merges = cwick_xrealloc(tok->merges, cap * sizeof(cwick_merge_entry)); }
+                char *pair = cwick_xmalloc(llen + 1);
+                memcpy(pair, line, llen);
+                pair[llen] = '\0';
+                while (llen > 0 && (pair[llen - 1] == ' ' || pair[llen - 1] == '\r')) pair[--llen] = '\0';
+                tok->merges[n++].pair = pair;
+            }
+            if (p < text + len) p++; /* skip newline */
+        }
+        tok->merge_count = n;
+        free(text);
+    }
+
+    /* added_tokens_decoder: the control tokens that live outside vocab.json,
+     * keyed by their id as a string. Without them "<|im_end|>" is encoded as
+     * six byte-pieces and the model reads a different conversation. */
+    char cpath[1152];
+    cwick_path_join(cpath, sizeof(cpath), dir, "tokenizer_config.json");
+    if (cwick_read_file(cpath, &text, &len) == 0) {
+        json_value *cfg = cwick_json_parse(text, len, NULL);
+        free(text);
+        json_value *added = cfg ? cwick_json_get(cfg, "added_tokens_decoder") : NULL;
+        if (added && added->kind == JSON_OBJECT && added->count) {
+            tok->special = cwick_xmalloc(added->count * sizeof(cwick_vocab_entry));
+            for (size_t i = 0; i < added->count; i++) {
+                json_value *e = added->members[i].value;
+                if (!e || e->kind != JSON_OBJECT) continue;
+                const char *content = cwick_json_str(cwick_json_get(e, "content"));
+                int64_t id = strtoll(added->members[i].key, NULL, 10);
+                if (!content || !*content || id < 0) continue;
+                tok->special[tok->special_count].key = cwick_strdup(content);
+                tok->special[tok->special_count].id = id;
+                tok->special[tok->special_count].is_byte = false;
+                tok->special_count++;
+            }
+            specials_sort(tok);
+            for (size_t i = 0; i < tok->special_count; i++)
+                tok->special_first[(unsigned char)tok->special[i].key[0]] = true;
+        }
+        if (cfg) cwick_json_free(cfg);
+    }
+
+    vocab_index_build(tok);
+    id_index_build(tok);
+    pair_index_build(tok);
+    return CWICK_OK;
+}
+
 static cwick_status tokenizer_load_impl(const char *dir,
                                        const cwick_model_spec *spec,
                                        cwick_tokenizer *tok, cwick_error *err) {
@@ -259,52 +343,8 @@ static cwick_status tokenizer_load_impl(const char *dir,
 
     char *text = NULL;
     size_t len = 0;
-    if (cwick_read_file(vpath, &text, &len) == 0) {
-        /* ---- legacy layout: vocab.json + merges.txt ---- */
-        json_value *root = cwick_json_parse(text, len, err);
-        free(text);
-        if (!root || root->kind != JSON_OBJECT) {
-            if (root) cwick_json_free(root);
-            cwick_error_set(err, CWICK_ERR_PARSE, "tokenizer vocab is not a JSON object");
-            cwick_tokenizer_free(tok);
-            return CWICK_ERR_PARSE;
-        }
-        tok->vocab_size = root->count;
-        tok->vocab = cwick_xmalloc(tok->vocab_size * sizeof(cwick_vocab_entry));
-        for (size_t i = 0; i < root->count; i++) {
-            const char *key = root->members[i].key;
-            tok->vocab[i].key = cwick_strdup(key);
-            tok->vocab[i].id = cwick_json_int(root->members[i].value, -1);
-            tok->vocab[i].is_byte = strlen(key) == 1;
-        }
-        cwick_json_free(root);
-        build_byte_map(tok);
-
-        /* merges.txt: lines "a b" */
-        if (cwick_read_file(mpath, &text, &len) == 0) {
-            const char *p = text;
-            size_t cap = 16, n = 0;
-            tok->merges = cwick_xmalloc(cap * sizeof(cwick_merge_entry));
-            while (p < text + len) {
-                const char *line = p;
-                while (p < text + len && *p != '\n') p++;
-                size_t llen = (size_t)(p - line);
-                if (llen > 0 && line[0] != '#') {
-                    if (n == cap) { cap *= 2; tok->merges = cwick_xrealloc(tok->merges, cap * sizeof(cwick_merge_entry)); }
-                    char *pair = cwick_xmalloc(llen + 1);
-                    memcpy(pair, line, llen);
-                    pair[llen] = '\0';
-                    while (llen > 0 && (pair[llen - 1] == ' ' || pair[llen - 1] == '\r')) pair[--llen] = '\0';
-                    tok->merges[n++].pair = pair;
-                }
-                if (p < text + len) p++; /* skip newline */
-            }
-            tok->merge_count = n;
-            free(text);
-        }
-        vocab_index_build(tok);
-        return CWICK_OK;
-    }
+    if (cwick_read_file(vpath, &text, &len) == 0)
+        return load_legacy_pair(tok, dir, text, len, mpath, err);
 
     /* ---- real HF layout: tokenizer.json at the model root ---- */
     char tpath[1152];
@@ -401,6 +441,12 @@ static cwick_status tokenizer_load_impl(const char *dir,
         pair_index_build(tok);
         return CWICK_OK;
     }
+
+    /* ---- legacy pair at the model root (no tokenizer.json shipped) ---- */
+    cwick_path_join(vpath, sizeof(vpath), dir, "vocab.json");
+    cwick_path_join(mpath, sizeof(mpath), dir, "merges.txt");
+    if (cwick_read_file(vpath, &text, &len) == 0)
+        return load_legacy_pair(tok, dir, text, len, mpath, err);
 
     /* ---- no vocab: byte fallback (synthetic / tiny models) ---- */
     if (spec->vocab_size >= 256) {

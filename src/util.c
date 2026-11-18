@@ -89,6 +89,14 @@ int cwick_read_file(const char *path, char **out, size_t *out_len) {
 
 /* Memory-map a file read-only; returns base or NULL. */
 const void *cwick_mmap_file(const char *path, size_t *out_len) {
+    return cwick_mmap_file_advice(path, out_len, MADV_SEQUENTIAL);
+}
+
+/* Same, with the access pattern stated by the caller. MADV_SEQUENTIAL suits a
+ * spine that is streamed once and lets the kernel drop pages behind the
+ * cursor; a model whose whole weight set is re-read on every decode step needs
+ * MADV_NORMAL instead, or every step re-faults the same gigabytes off the SSD. */
+const void *cwick_mmap_file_advice(const char *path, size_t *out_len, int advice) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     struct stat st;
@@ -98,8 +106,7 @@ const void *cwick_mmap_file(const char *path, size_t *out_len) {
     void *p = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (p == MAP_FAILED) return NULL;
-    /* Advise sequential for the big weight spines. */
-    madvise(p, n, MADV_SEQUENTIAL);
+    madvise(p, n, advice);
     *out_len = n;
     return p;
 }
@@ -255,4 +262,59 @@ bool cwick_lan_ipv4(char *out, size_t cap) {
     }
     freeifaddrs(ifs);
     return found;
+}
+
+/* ------------------------------------------------------------------ base64 --- */
+
+static const char b64_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+char *cwick_b64_encode(const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    size_t n = 4 * ((len + 2) / 3);
+    char *out = (char *)cwick_xmalloc(n + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)p[i + 1] << 8;
+        if (i + 2 < len) v |= p[i + 2];
+        out[o++] = b64_enc[(v >> 18) & 63];
+        out[o++] = b64_enc[(v >> 12) & 63];
+        out[o++] = i + 1 < len ? b64_enc[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < len ? b64_enc[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return out;
+}
+
+void *cwick_b64_decode(const char *s, size_t len, size_t *out_len) {
+    /* Reverse table built once: -1 for every byte that is not in the alphabet.
+     * Whitespace is skipped, everything else is a hard error -- a silent skip
+     * would turn a truncated audio payload into plausible-looking noise. */
+    static signed char rev[256];
+    static int ready = 0;
+    if (!ready) {
+        for (int i = 0; i < 256; i++) rev[i] = -1;
+        for (int i = 0; i < 64; i++) rev[(unsigned char)b64_enc[i]] = (signed char)i;
+        ready = 1;
+    }
+    unsigned char *out = (unsigned char *)cwick_xmalloc(len / 4 * 3 + 4);
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '=' ) break;
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        signed char v = rev[c];
+        if (v < 0) { free(out); return NULL; }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (unsigned char)((acc >> bits) & 0xff);
+        }
+    }
+    *out_len = o;
+    return out;
 }

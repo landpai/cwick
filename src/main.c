@@ -33,6 +33,7 @@
 #include "mem.h"
 #include "util.h"
 #include "h3.h"
+#include "models.h"
 
 static volatile int g_stop = 0;
 static volatile int g_signals = 0;
@@ -374,6 +375,7 @@ static int run_serve(const char *root, const char *host, int port,
                      int64_t max_tokens, int64_t max_context,
                      const char *prefix_cache_dir, int64_t prefix_cache_gib,
                      const char *image_dir,
+                     const char *rt_dir,
                      const char *spine, int verbose, int trace, int web,
                      int jev, const char *password,
                      const char *const *models_dirs, int models_dirs_n,
@@ -408,18 +410,50 @@ static int run_serve(const char *root, const char *host, int port,
                       "kernels (CWICK_THREADS to override)",
               nthr > 0 ? nthr : 1, nthr > 1 ? "s" : "");
     cwick_engine *eng = NULL;
-    cwick_status st = cwick_engine_new(&opt, &eng, &err);
-    if (st != CWICK_OK) {
-        /* Nothing was ever started, so nothing is being shut down: say that
-         * plainly (a "shutdown complete" line here would be a lie) and put the
-         * reason on stdout too, where the rest of the run log lives. */
-        CWICK_INFO("init", "startup failed: %s", cwick_error_message(&err));
-        fprintf(stderr, "cwick: %s\n", cwick_error_message(&err));
-        return 1;
+    /* A full-duplex speech checkpoint has no text decoder at its root: the
+     * weights live in thinker/ and talker/, and the resident pipeline is the
+     * realtime one. Building a text engine from it would fail on a missing
+     * safetensors index, so hand the directory to the server instead and let
+     * /v1/realtime be the only generation path. */
+    char probe_id[CWICK_MODEL_ID_MAX];
+    bool speech = cwick_model_dir_probe(root, probe_id, sizeof(probe_id)) &&
+                  strcmp(probe_id, "sophon_realtime") == 0;
+    /* --root decides which model is resident at startup (goal #10: exactly one
+     * model, the one root names). A speech root has no text decoder, so the
+     * realtime pipeline is resident; any other root builds the text engine.
+     * --rt / --img only register the other pipelines as hot-switch targets —
+     * they never displace root, and the server opens a pipeline at startup only
+     * when no text engine is resident. */
+    const char *realtime_dir = (rt_dir && *rt_dir) ? rt_dir
+                               : (speech ? root : NULL);
+    if (speech) {
+        CWICK_INFO("init", "speech checkpoint %s: the realtime pipeline is the "
+                          "resident model (ws /v1/realtime); text endpoints "
+                          "answer 503 until a switch to a text id", realtime_dir);
+    } else if (realtime_dir || (image_dir && *image_dir)) {
+        CWICK_INFO("init", "root %s is the resident text model; --rt/--img "
+                          "register the realtime/image pipelines for hot-switch "
+                          "(POST /v1/models/switch), not loaded at startup", root);
     }
-    /* Warm before the port opens: a request that arrives during the warmup
-     * would wait for the socket, not for generation. */
-    if (warmup > 0) serve_warmup(eng, warmup);
+    /* One model at a time: build the text engine whenever root is not a speech
+     * checkpoint. A speech root leaves eng NULL and the server opens the
+     * realtime pipeline instead. Creating a text engine alongside a resident
+     * speech/image pipeline would wire both weight banks at once and push the
+     * host into swap before the port opens. */
+    if (!speech) {
+        cwick_status st = cwick_engine_new(&opt, &eng, &err);
+        if (st != CWICK_OK) {
+            /* Nothing was ever started, so nothing is being shut down: say that
+             * plainly (a "shutdown complete" line here would be a lie) and put
+             * the reason on stdout too, where the rest of the run log lives. */
+            CWICK_INFO("init", "startup failed: %s", cwick_error_message(&err));
+            fprintf(stderr, "cwick: %s\n", cwick_error_message(&err));
+            return 1;
+        }
+        /* Warm before the port opens: a request that arrives during the warmup
+         * would wait for the socket, not for generation. */
+        if (warmup > 0) serve_warmup(eng, warmup);
+    }
     cwick_server_options sopts;
     memset(&sopts, 0, sizeof(sopts));
     sopts.host = host;
@@ -428,6 +462,8 @@ static int run_serve(const char *root, const char *host, int port,
     sopts.prefix_cache_dir = prefix_cache_dir;
     sopts.prefix_cache_gib = prefix_cache_gib;
     sopts.image_dir = image_dir;
+    sopts.realtime_dir = realtime_dir;
+    sopts.startup_root = speech ? NULL : root;
     sopts.verbose = verbose;
     sopts.trace = trace;
     sopts.web = web != 0;
@@ -452,7 +488,7 @@ static int run_serve(const char *root, const char *host, int port,
     cwick_engine *live = eng;
     sopts.live_engine = &live;
     *ran = 1;                     /* the engine exists from here on */
-    st = cwick_server_run(eng, &sopts, &g_stop, &err);
+    cwick_status st = cwick_server_run(eng, &sopts, &g_stop, &err);
     if (st != CWICK_OK) {
         CWICK_INFO("init", "server stopped with an error: %s",
                   cwick_error_message(&err));
@@ -1204,6 +1240,12 @@ static void usage(void) {
            "                  CWICK_IMAGE_MODEL sets the same value for launchers.\n"
            "                  The image model can also be switched to at runtime\n"
            "                  from POST /v1/models/switch (id MiniMax-H3-Image).\n"
+           "  --rt DIR        load the full-duplex speech checkpoint under DIR and\n"
+           "                  expose the WebSocket /v1/realtime interface. DIR is\n"
+           "                  the Sophon-Realtime-32B-Tag checkpoint directory.\n"
+           "                  CWICK_REALTIME_MODEL sets the same value for launchers.\n"
+           "                  The realtime model can also be switched to at runtime\n"
+           "                  from POST /v1/models/switch (settings / model list).\n"
            "  --api-key NAME  mint an API key for third-party agents and print\n"
            "                  it once on stdout (only its hash is stored, in the\n"
            "                  sqlite file, so it survives a restart). Sending one\n"
@@ -1484,6 +1526,8 @@ int main(int argc, char **argv) {
         /* --img wins over the environment variable so one launcher can serve
          * several checkpoints without editing its environment per model. */
         const char *image_dir = getenv("CWICK_IMAGE_MODEL");
+        /* --rt wins over the environment variable, same rationale as --img. */
+        const char *rt_dir = getenv("CWICK_REALTIME_MODEL");
         bool verbose = false, trace = false;
         bool allow_swap = false;
         /* CWICK_WEB=1 turns the UI on for everyone who starts the same
@@ -1547,6 +1591,9 @@ int main(int argc, char **argv) {
                 prefix_cache_dir = need_arg(&i, argc, argv, "--prefix-cache-dir");
             else if (strcmp(argv[i], "--img") == 0)
                 image_dir = need_arg(&i, argc, argv, "--img");
+            else if (strcmp(argv[i], "--rt") == 0 ||
+                     strcmp(argv[i], "--realtime") == 0)
+                rt_dir = need_arg(&i, argc, argv, "--rt");
             else if (strcmp(argv[i], "--prefix-cache-gib") == 0) {
                 if (!parse_i64(need_arg(&i, argc, argv, "--prefix-cache-gib"),
                                1, 4096, &prefix_cache_gib)) {
@@ -1662,7 +1709,7 @@ int main(int argc, char **argv) {
         int ran = 0;
         int rc;
         rc = run_serve(root, host, port, max_tokens, max_context,
-                       prefix_cache_dir, prefix_cache_gib, image_dir,
+                       prefix_cache_dir, prefix_cache_gib, image_dir, rt_dir,
                        spine, verbose, trace, web, jev, password,
                        models_dirs, models_dirs_n, store_path,
                        api_key, api_key_secret, warmup, &ran);

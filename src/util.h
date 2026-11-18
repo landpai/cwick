@@ -14,12 +14,22 @@ bool cwick_env_true(const char *name);
 
 int cwick_read_file(const char *path, char **out, size_t *out_len);
 const void *cwick_mmap_file(const char *path, size_t *out_len);
+/* Same, with an explicit madvise: use MADV_NORMAL for a mapping that is
+ * re-read in full on every step, MADV_SEQUENTIAL for a read-once spine. */
+const void *cwick_mmap_file_advice(const char *path, size_t *out_len, int advice);
 void cwick_munmap(const void *base, size_t len);
 int cwick_write_file(const char *path, const void *data, size_t n);
 int cwick_mkdir_p(const char *path);
 int cwick_file_exists(const char *path);
 int cwick_dir_exists(const char *path);
 void cwick_path_join(char *out, size_t cap, const char *a, const char *b);
+
+/* Standard base64 (RFC 4648, with padding). The realtime socket carries audio
+ * both ways as base64 inside JSON, so both directions are needed.
+ * encode returns a malloc'd NUL-terminated string; decode returns malloc'd
+ * bytes and sets *out_len, or NULL on a malformed input. */
+char *cwick_b64_encode(const void *data, size_t len);
+void *cwick_b64_decode(const char *s, size_t len, size_t *out_len);
 
 /* First non-loopback, non-link-local IPv4 address (e.g. en0's 192.168.x.x).
  * Used only to print the LAN URL / build a share QR; returns false when the

@@ -15,6 +15,7 @@
   路径是在剥掉查询串之后才比较的，所以 Anthropic 客户端给每个请求都加的 `?beta=true` 无害；重复的 `/v1/v1/` 前缀也会被折叠 —— base URL 本身已经以 `/v1` 结尾时照常服务，而不是回 `404 unknown endpoint`。访问日志和 `--trace` 行仍然原样打印收到的路径。
 - `POST /v1/images/generations`（以及 `/images/generations`）—— JSON 请求，返回 `b64_json` 图像。
 - `POST /v1/images/edits`（以及 `/images/edits`）—— `multipart/form-data`，`image` 字段可重复；返回同一个响应形态。两者都要求已配置图像模型（`--img DIR`、`CWICK_IMAGE_MODEL`，或按需切换）；见 `docs/IMAGE.zh-CN.md`。
+- `GET /v1/realtime?model=Sophon-Realtime-32B-Tag` —— WebSocket 升级，用于全双工语音；需要 `--rt DIR` 且已切换到该模型 id。音频以 base64 PCM16 的 `input_audio_buffer.append` 事件进入，以 `response.audio.delta` 返回；`GET /v1/realtime/stats` 给出聚合后的全链路计数。事件列表、耗时字段与 H5 TeachMe 应用见 `docs/REALTIME.zh-CN.md`。
 - `GET /v1/metrics`（以及 `/metrics`）—— Prometheus 文本，采用 vLLM 的命名。`cwick:model_loaded`（1/0）是实时的常驻状态位；`cwick:model_info` 保留上一次成功装载的 checkpoint 标签。
 - `POST /v1/auth/login`、`GET /v1/auth/status`、`POST /v1/auth/logout` —— 单用户登录 endpoint。登录接受 `{"password":"..."}`，设置 HttpOnly 的 `cwick_session` cookie 并返回一个 Bearer token。配置了密码之后，其他每一个 API/metrics/logs endpoint 在没有它时都返回 401；`/`、应用 HTML 和管理页面则重定向到 `/login`。
 - `GET /v1/config`（以及 `/config`）—— 本进程正在运行的选项，包括 `image_model.dir` 与 `image_model.loaded`。只读：其中一切都是装载期选择或状态报告（见下文）。

@@ -4873,3 +4873,70 @@ six DiT steps under one `[req 1]`, 117284 ms total with dit 50673 ms; an
 line and the same phase sequence under `[req 2]`. The edits client hit the test
 harness timeout mid-render while the server kept rendering and logging — the
 stdout sequence stayed readable throughout. `make cwick` and `make test` pass.
+
+
+## 82. A "completed" turn with no audio was an assistant-template bug
+
+TeachMe showed a transcript and `response.done`, but never spoke. The chain
+summary in stdout made the failure unambiguous:
+`turn completed … decode 0 tokens … talker 0.000 (0.00 s audio, 0 chunks)`.
+The WebSocket layer was fine: the transcript was streamed, the closing events
+were sent, and the browser had no audio buffers to play.
+
+The decoder was being handed
+`<|im_end|>\n<|im_start|>assistant\n\n\n\n`. Those four newlines are inside the
+assistant turn, so the model reads the reply as already begun and finished: the
+first sampled token is end-of-turn, no sentence ever reaches the talker, and
+the state machine honestly reports a completed response.
+
+Isolating it took three A/B steps. A text-only turn with the same weights still
+answered coherently, so the decoder and kernels were not at fault. Feeding a
+fixed WAV through the offline listener reproduced zero decoded tokens and put
+EOS at the top of the distribution (20.30, ahead of the best content token at
+19.58); replacing the audio vectors with the learned placeholder embeddings
+did not help, which ruled out the audio frontend. Ending the prompt at the bare
+assistant opener dropped EOS to 4.67 and produced a normal answer. The same
+tail is used in `fwd_user_block()` and `turn_positions()`, so both were changed
+together — the latter must stay in step or the KV budget drifts from what is
+actually forwarded.
+
+After the fix, a live `--backend metal` WS run returned 53 `response.audio.delta`
+events (10.44 s, PCM16/24 kHz) for 40 reply tokens. The reply WAV is not silent:
+RMS 0.087, peak 0.84. A two-turn run produced 21 deltas per turn and confirmed
+the warm turn prefill drops from 8.16 s to 2.83 s. `make test` passes. The full
+breakdown and both failure modes are written up in `docs/REALTIME.md` and its
+Chinese counterpart.
+
+
+## 83. Turn detection needed hysteresis and a noise floor, not a lower threshold
+
+The realtime input VAD was a single RMS threshold: above it, speech starts
+immediately; below it, a fixed quiet timer ends the turn. Two field failures
+follow from that shape. A 40 ms click is indistinguishable from a word and was
+committed as a full turn, which could cancel a reply in progress. And a quiet
+syllable between two loud ones — common in connected speech — lets the quiet
+timer reach its limit and split one utterance into two, so the model answers
+half a sentence.
+
+A study of a full-duplex voice-agent stack pointed at two small mechanisms
+rather than a neural detector: a release level below the onset level, and a
+minimum active duration before a burst counts as speech. Both were adopted in
+`src/rt_vad.c`. Onset and release are 0.15 apart on the client's 0..1 threshold
+scale (`-40` vs `-44.5 dBFS` at 0.5); the band between them is a hold region
+that does not advance the end timer. A burst must stay above onset for 100 ms
+before it is reported, and a rejected burst is dropped from the pre-commit
+buffer so repeated clicks cannot grow it without bound.
+
+The decision was extracted into a pure module before changing it, so the same
+code can be driven twice on one signal. `tools/rtvad.c` (`make rtvad`) shows
+the click going from 1 start/1 end to 1 drop, the mid-word dip from 2 turns to
+1, and a real 400 ms pause still splitting in both modes. The original rule is
+kept behind `CWICK_RT_VAD_LEGACY=1`; five assertions in `make test` pin the new
+behaviour. A live `--backend metal` manual-commit turn still produced 51 audio
+deltas / 10.08 s of non-silent speech (RMS 0.095, peak 0.82).
+
+`tools/rtws --vad` replays a finished recording plus trailing silence. A clip
+with pauses longer than `silence_duration_ms` is split several times and the
+rest is interpreted as barge-in; the same three commits and cancelled response
+appear with the legacy flag, so this is a harness property, not a regression.
+Use `--burst` when measuring a pre-recorded clip.

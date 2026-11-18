@@ -257,6 +257,18 @@ static cwick_status saf_parse_shard(cwick_safetensors *saf, const char *shard,
                                  (int)(nlen - 7), name);
                     }
                 }
+                /* A third naming, from the compressed-tensors exporter:
+                 * `<name>_scale`, i.e. `....weight_scale` beside `....weight`
+                 * with the same rank and a trailing 1. The caller reads the
+                 * shape and dtype it actually got, so recognising the name is
+                 * all the loader has to do here. */
+                if (!cwick_json_get(root, dname)) {
+                    size_t nlen = strlen(name);
+                    if (nlen > 7 && strcmp(name + nlen - 7, ".weight") == 0) {
+                        snprintf(dname, sizeof(dname), "%.*s.weight_scale",
+                                 (int)(nlen - 7), name);
+                    }
+                }
                 /* A tensor that names itself a scale has no scale of its own.
                  * MiniMax-M3.1 stores the expert block scales as e4m3 -- a
                  * `*.weight_scale` beside a `*.weight_packed` -- so the byte
@@ -321,8 +333,24 @@ cwick_status cwick_safetensors_open(const char *root, cwick_safetensors *saf,
         if (cwick_read_file(alt, &text, &len) == 0) {
             memcpy(idxpath, alt, sizeof(idxpath));
         } else {
-            cwick_error_set(err, CWICK_ERR_IO, "missing safetensors index %s", idxpath);
-            return CWICK_ERR_IO;
+            /* A checkpoint small enough for one shard is written without an
+             * index at all. The index only enumerates shard *files* here --
+             * tensor names come from each shard's own header -- so a one-entry
+             * map is enough to open it the same way. */
+            char single[1152];
+            cwick_path_join(single, sizeof(single), root, "model.safetensors");
+            FILE *probe = fopen(single, "rb");
+            if (!probe) {
+                cwick_error_set(err, CWICK_ERR_IO, "missing safetensors index %s",
+                                idxpath);
+                return CWICK_ERR_IO;
+            }
+            fclose(probe);
+            const char *synth =
+                "{\"weight_map\":{\"model\":\"model.safetensors\"}}";
+            len = strlen(synth);
+            text = cwick_xmalloc(len + 1);
+            memcpy(text, synth, len + 1);
         }
     }
     json_value *rootv = cwick_json_parse(text, len, err);

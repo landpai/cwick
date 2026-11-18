@@ -1,0 +1,8 @@
+{
+  "id": "teachme",
+  "name": "TeachMe 语音对话",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "description": "H5 full-duplex voice tutor: microphone -> /v1/realtime (Sophon-Realtime-32B-Tag) -> spoken reply, with live transcripts, barge-in and a full-chain performance dashboard.",
+  "storage": "server sqlite via /v1/apps/teachme/state (conversation + turn metrics), localStorage:cwick.teachme.v1 fallback"
+}

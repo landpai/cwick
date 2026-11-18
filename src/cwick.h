@@ -510,6 +510,14 @@ void cwick_metal_set_slot(int slot);
 
 int cwick_metal_linear_bf16(const void *w_bf16, const float *x, float *out,
                            int64_t k, int64_t cols);
+
+/* Plain f32 linear for the speech stages: y[m][n] = x[m][k] * w[n][k]^T.
+ * Returns 0 when the shape, alignment or policy does not suit the GPU, and
+ * the caller must then use Accelerate. Enabled by `--backend metal` or
+ * CWICK_RT_GPU=1; cwick_metal_rt_gpu() is the cheap test for that policy. */
+int cwick_metal_rt_gpu(void);
+int cwick_metal_gemm_f32(const float *w, const float *x, float *out,
+                         int64_t k, int64_t n, int64_t m);
 /* Batched resident-BF16 GEMV: group the independent projections of one
  * sublayer, pay one commit+wait for all of them. NULL from begin (or 0 from
  * add) means "not eligible" and the caller uses the serial path; end()
@@ -1260,6 +1268,11 @@ typedef struct cwick_tokenizer {
 cwick_status cwick_tokenizer_load(const char *dir, const cwick_model_spec *spec,
                                 cwick_tokenizer **tok, cwick_error *err);
 void cwick_tokenizer_free(cwick_tokenizer *tok);
+/* Register a control token the checkpoint adds at load time rather than
+ * shipping it in vocab.json / tokenizer.json. `id` is the id the model was
+ * trained on; encoding then splits text on the string instead of BPE-ing it. */
+cwick_status cwick_tokenizer_add_special(cwick_tokenizer *tok, const char *text,
+                                       int64_t id);
 cwick_status cwick_tokenizer_encode(const cwick_tokenizer *tok, const char *text,
                                   uint32_t **ids, int64_t *n, cwick_error *err);
 cwick_status cwick_tokenizer_decode(const cwick_tokenizer *tok, const uint32_t *ids,
@@ -1494,6 +1507,18 @@ typedef struct cwick_server_options {
      * into the server at startup, so a later hot switch can reopen the image
      * pipeline from the same directory. */
     const char *image_dir;
+    /* Directory holding a full-duplex speech checkpoint (--rt / --realtime, or
+     * a --root whose config.json says model_type "sophon_realtime"). When set,
+     * the speech pipeline is the resident model and `eng` may be NULL: the
+     * thinker, ear and talker are one model, and the machine holds one model.
+     * /v1/realtime serves it; the text endpoints answer 503 until a switch
+     * back to a text checkpoint. */
+    const char *realtime_dir;
+    /* The --root the operator launched with, kept so the catalog can still
+     * offer it as a switch-back target when no text engine was built (a
+     * realtime/image pipeline is resident from startup and the machine holds
+     * one model). NULL/empty when --root was itself the speech checkpoint. */
+    const char *startup_root;
     /* Extra local models to advertise and to allow switching to. Each entry
      * is a directory that is itself a checkpoint root, or one whose immediate
      * children are; discovered entries join the running model in GET

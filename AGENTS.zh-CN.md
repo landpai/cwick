@@ -86,6 +86,12 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
 
 - 三个 checkpoint 端到端：加载 + `/v1/models` + 生成 + 切换，逐位验证过
   （DeepSeek 全链路 0 误差；GLM 走 `doctor` 结构校验，见 `docs/PRECISION*.md`）。
+- Realtime 语音（`--rt`，`Sophon-Realtime-32B-Tag`）：WebSocket `/v1/realtime`，
+  音频前端 + 64 层 thinker + talker/flow/HiFT，流式 PCM16 回复并逐轮给耗时；
+  Metal 实机端到端验证（53 个音频 delta / 10.44 s 非静音语音，热轮 prefill
+  2.83 s）。H5 TeachMe 在 `/apps/teachme/`。assistant prompt 必须停在裸的
+  `<|im_start|>assistant\n`，多出的换行会让首个 token 变 EOS，于是回合
+  「完成」却没声音（§82）。详见 `docs/REALTIME.zh-CN.md`。
 - OpenAI 兼容 API：`/v1/models`、`/v1/models/<id>`、`/v1/completions`、
   `/v1/chat/completions`（SSE、`reasoning_content` 与 `content` 分离、
   `tool_calls` 按 checkpoint 自己的协议生成再解析回 OpenAI 形状）。

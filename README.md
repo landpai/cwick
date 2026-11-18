@@ -239,7 +239,10 @@ easy to forget one at a time. Without a script the same server is:
 
 The binary's own default port is 8000; `start.sh` serves 8001. Switching models
 later needs no restart — `POST /v1/models/switch` unloads one and loads another
-in the same process.
+in the same process. `--rt <dir>` registers the speech pipeline in the same way;
+after switching to `Sophon-Realtime-32B-Tag`, WebSocket clients connect to
+`/v1/realtime?model=Sophon-Realtime-32B-Tag`. The H5 TeachMe app is at
+`/apps/teachme/`. See [docs/REALTIME.md](docs/REALTIME.md).
 
 ## Usage
 
@@ -417,6 +420,7 @@ always writes to `./models`; it is in `.gitignore`.
 | method | path | notes |
 |---|---|---|
 | GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir`; each entry carries `supported` / `unsupported_reason` |
+| GET | `/v1/realtime` | WebSocket full-duplex speech (`?model=…`); requires `--rt`, base64 PCM16 in and `response.audio.delta` out |
 | POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` instead hot-loads the image pipeline without touching the text model |
 | POST | `/v1/images/generations` | `b64_json` image from a JSON prompt; requires `--img` / `CWICK_IMAGE_MODEL` or an on-demand image switch |
 | POST | `/v1/images/edits` | `multipart/form-data` with repeatable `image` parts; same image response shape |
@@ -712,6 +716,7 @@ first line:
 
 - [Runtime architecture and component map](docs/ARCHITECTURE.md)
 - [Memory-bounded streaming and the storage split](docs/STORAGE.md)
+- [Realtime speech and its measured full chain](docs/REALTIME.md)
 - [Measured performance, phase by phase](docs/PERF.md)
 - [Decisions: what was tried, rejected, and why](docs/DECISIONS.md)
 - [OpenAI-compatible server reference](docs/SERVER.md) — API, auth, apps, storage

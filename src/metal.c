@@ -32,6 +32,8 @@ int cwick_metal_gemv_fp8(const void *w_fp8, const float *scale_inv,
                         uint32_t n_rows, uint32_t stride);
 int cwick_metal_gemv_bf16(const void *w_bf16, const float *x, float *out,
                          uint32_t k, uint32_t cols);
+int cwick_metal_gemm_f32_bridge(const float *w, const float *x, float *out,
+                                uint32_t k, uint32_t n, uint32_t m);
 void *cwick_metal_batch_begin_bridge(int slot);
 int   cwick_metal_batch_gemv_bridge(void *batch, const void *w_fp8,
                                    const float *scale_inv, const float *x,
@@ -372,6 +374,40 @@ int cwick_metal_linear_bf16(const void *w_bf16, const float *x, float *out,
     const uint64_t elements = (uint64_t)k * (uint64_t)cols;
     if (elements < (1u << 18)) return 0; /* <256 Ki elements: CPU is faster */
     return cwick_metal_gemv_bf16(w_bf16, x, out, (uint32_t)k, (uint32_t)cols);
+}
+
+/* ---- plain f32 linear for the speech stages -------------------------
+ * The talker/flow/hift checkpoints are f32 and are never converted, so the
+ * fp8 and bf16 kernels above do not apply to them. This is the same
+ * weight-stationary product over f32 weights.
+ *
+ * Opt-in two ways: an explicit `--backend metal`, or CWICK_RT_GPU=1. Without
+ * either the speech stages stay on Accelerate, which keeps them runnable and
+ * testable on a machine with no usable GPU. */
+int cwick_metal_rt_gpu(void) {
+    if (g_metal_selected == 0) return 0;
+    if (g_metal_selected != 1 && !env_enabled("CWICK_RT_GPU")) return 0;
+    if (!metal_probe()) return 0;
+    /* The speech loop leaves the GPU idle for milliseconds at a time between
+     * projections, which is exactly the gap that drops its clock; the same
+     * keepalive the decode path uses holds it up. Idempotent. */
+    cwick_metal_keepalive_start();
+    return 1;
+}
+
+int cwick_metal_gemm_f32(const float *w, const float *x, float *out,
+                         int64_t k, int64_t n, int64_t m) {
+    if (!w || !x || !out) return 0;
+    if (k <= 0 || n <= 0 || m <= 0) return 0;
+    if (k > 0x7FFFFFFF || n > 0x7FFFFFFF || m > 0x7FFFFFFF) return 0;
+    /* Only the narrow products. At m=1 the kernel is weight-bandwidth bound
+     * and reads the mapped page at ~215 GB/s against one CPU core's ~28, but
+     * by m=346 the same kernel manages ~500 GFLOP/s where Accelerate's AMX
+     * path does 2 TFLOP/s -- so wide products stay on the CPU. */
+    if (m > 8) return 0;
+    if ((uint64_t)k * (uint64_t)n < (1u << 19)) return 0;
+    return cwick_metal_gemm_f32_bridge(w, x, out, (uint32_t)k, (uint32_t)n,
+                                       (uint32_t)m);
 }
 
 /* ---- batched BF16 GEMV ---------------------------------------------

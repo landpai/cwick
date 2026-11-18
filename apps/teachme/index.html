@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>TeachMe 语音对话 · cwick app</title>
+<link rel="stylesheet" href="/apps/teachme/app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="head">
+    <a class="back" href="/#apps" target="_top">← cwick</a>
+    <div class="title">
+      <h1>TeachMe <span>REALTIME</span></h1>
+      <p id="status">全双工语音对话 · /v1/realtime · Sophon-Realtime-32B-Tag</p>
+    </div>
+    <div class="head-actions">
+      <button id="share" class="btn" type="button">分享 / 二维码</button>
+    </div>
+  </header>
+
+  <main class="grid">
+
+    <!-- left: conversation + controls -->
+    <section class="talk panel">
+      <div class="panel-head">
+        <h2>对话</h2>
+        <div class="head-right">
+          <span class="pill" id="connPill">未连接</span>
+          <label class="voice-pick">
+            <span>音色</span>
+            <select id="voice">
+              <option value="vivian_zh" selected>vivian · 中文女声</option>
+              <option value="chelsie_zh">chelsie · 中文女声</option>
+              <option value="brand_zh">brand · 中文男声</option>
+              <option value="chelsie_en">chelsie · English</option>
+              <option value="ryan_en">ryan · English</option>
+              <option value="brand_en">brand · English</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="convo" id="convo">
+        <div class="empty" id="emptyState">
+          <div class="empty-icon">🎙</div>
+          <p>点击下方麦克风开始说话</p>
+          <small>模型直接听你的声音，并把回答说出来 · 可随时插话打断</small>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="orb-wrap">
+          <button id="mic" class="orb idle" type="button" aria-label="开始对话">
+            <span class="orb-ring"></span>
+            <span class="orb-core" id="orbCore">🎙</span>
+          </button>
+          <div class="orb-meta">
+            <b id="stateLabel">点击开始</b>
+            <div class="level"><div class="level-in" id="levelIn"></div></div>
+            <small id="stateHint">首次点击会请求麦克风权限</small>
+          </div>
+        </div>
+        <div class="ctl-buttons">
+          <button id="mode" class="btn" type="button" title="切换免提/按住说话">免提 VAD</button>
+          <button id="interrupt" class="btn" type="button" disabled>打断</button>
+          <button id="hangup" class="btn danger" type="button" disabled>结束</button>
+        </div>
+      </div>
+
+      <div class="text-row">
+        <input type="text" id="textInput" placeholder="设置教学指令（如：请用简单的中文教我分数），然后说话提问…" autocomplete="off">
+        <button id="textSend" class="btn primary" type="button">设置指令</button>
+      </div>
+    </section>
+
+    <!-- right: full-chain performance -->
+    <section class="perf panel">
+      <div class="panel-head">
+        <h2>全链路性能</h2>
+        <button id="refreshStats" class="link" type="button">刷新聚合</button>
+      </div>
+
+      <div class="kpis">
+        <div class="kpi"><b id="kFirst">—</b><small>首音频延迟</small></div>
+        <div class="kpi"><b id="kTurn">—</b><small>整轮耗时</small></div>
+        <div class="kpi"><b id="kDecode">—</b><small>解码 tok/s</small></div>
+        <div class="kpi"><b id="kTalker">—</b><small>合成实时率</small></div>
+      </div>
+
+      <div class="stages">
+        <div class="stage-head"><span>最近一轮各阶段</span><span class="mono" id="stageTotal">—</span></div>
+        <div class="stage" data-stage="ear"><span class="s-name">听觉编码 ear</span><div class="s-bar"><div class="s-in"></div></div><span class="s-val mono">—</span></div>
+        <div class="stage" data-stage="prefill"><span class="s-name">预填充 prefill</span><div class="s-bar"><div class="s-in"></div></div><span class="s-val mono">—</span></div>
+        <div class="stage" data-stage="decode"><span class="s-name">解码 decode</span><div class="s-bar"><div class="s-in"></div></div><span class="s-val mono">—</span></div>
+        <div class="stage" data-stage="talker"><span class="s-name">语音合成 talker</span><div class="s-bar"><div class="s-in"></div></div><span class="s-val mono">—</span></div>
+        <p class="stage-note">各阶段并行流水：解码出整句即交给合成器，故阶段之和大于整轮耗时。</p>
+      </div>
+
+      <div class="tokens">
+        <div class="tok"><span>输入 token</span><b class="mono" id="tPrompt">—</b></div>
+        <div class="tok"><span>音频 token</span><b class="mono" id="tAudio">—</b></div>
+        <div class="tok"><span>回复 token</span><b class="mono" id="tReply">—</b></div>
+        <div class="tok"><span>语音 token</span><b class="mono" id="tSpeech">—</b></div>
+        <div class="tok"><span>输入音频</span><b class="mono" id="tIn">—</b></div>
+        <div class="tok"><span>输出音频</span><b class="mono" id="tOut">—</b></div>
+      </div>
+
+      <div class="agg">
+        <div class="panel-head small-head"><h3>进程聚合</h3><span class="pill" id="aggPill">—</span></div>
+        <div class="agg-grid">
+          <div class="tok"><span>会话</span><b class="mono" id="aSessions">—</b></div>
+          <div class="tok"><span>轮次</span><b class="mono" id="aTurns">—</b></div>
+          <div class="tok"><span>打断</span><b class="mono" id="aCancel">—</b></div>
+          <div class="tok"><span>平均首音频</span><b class="mono" id="aFirst">—</b></div>
+        </div>
+      </div>
+
+      <div class="evlog">
+        <div class="panel-head small-head"><h3>阶段事件</h3><button id="clearLog" class="link" type="button">清空</button></div>
+        <ul class="log" id="log"></ul>
+      </div>
+    </section>
+
+  </main>
+
+  <dialog id="shareDialog" class="share-dlg">
+    <div class="share-box">
+      <h2>分享到手机</h2>
+      <p class="share-url mono" id="shareUrl">—</p>
+      <img id="qrImg" alt="二维码" hidden>
+      <p class="share-note" id="shareNote"></p>
+      <div class="share-actions">
+        <button id="closeShare" class="btn" type="button">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+</div>
+<script src="/apps/teachme/app.js"></script>
+</body>
+</html>

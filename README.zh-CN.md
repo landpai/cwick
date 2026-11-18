@@ -157,7 +157,7 @@ sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 
 ./cwick serve --root ./zai-org/GLM-5.3-Flash --port 8001 --web --prefix-cache-dir ./pfxcache
 ```
 
-二进制自己的默认端口是 8000，`start.sh` 服务的是 8001。之后换模型不用重启——`POST /v1/models/switch` 在同一进程里卸载一个、加载另一个。
+二进制自己的默认端口是 8000，`start.sh` 服务的是 8001。之后换模型不用重启——`POST /v1/models/switch` 在同一进程里卸载一个、加载另一个。`--rt <目录>` 用同样方式注册语音管线，切到 `Sophon-Realtime-32B-Tag` 后 WebSocket 连接 `/v1/realtime?model=Sophon-Realtime-32B-Tag`，H5 TeachMe 应用在 `/apps/teachme/`。详见 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md)。
 
 ## 用法
 
@@ -253,6 +253,7 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/v1/models` | 常驻模型，加上 `--models-dir` 下找到的模型；每条带 `supported` / `unsupported_reason` |
+| GET | `/v1/realtime` | WebSocket 全双工语音（`?model=…`）；需要 `--rt`，base64 PCM16 入、`response.audio.delta` 出 |
 | POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。`MiniMax-H3-Image` 改为热装载图像管线，不触碰文本模型 |
 | POST | `/v1/images/generations` | 由 JSON prompt 返回 `b64_json` 图像；需要 `--img` / `CWICK_IMAGE_MODEL` 或按需切换图像模型 |
 | POST | `/v1/images/edits` | `multipart/form-data`，`image` 字段可重复；返回同样的图像响应 |
@@ -438,6 +439,7 @@ make bench       # 不加载 checkpoint 也能测内核
 
 - [运行时架构与组件地图](docs/ARCHITECTURE.zh-CN.md)
 - [有界内存流式与存储分层](docs/STORAGE.zh-CN.md)
+- [Realtime 语音与全链路实测](docs/REALTIME.zh-CN.md)
 - [逐相实测性能](docs/PERF.zh-CN.md)
 - [决策记录：试过什么、否决了什么、为什么](docs/DECISIONS.zh-CN.md)
 - [OpenAI 兼容服务端参考](docs/SERVER.zh-CN.md)——API、认证、应用、存储

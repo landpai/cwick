@@ -111,6 +111,13 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
 - Three checkpoints end to end: load + `/v1/models` + generate + switch, verified
   numerically (DeepSeek is bit-exact across the whole chain; GLM gets a structural check
   from `doctor` — see `docs/PRECISION*.md`).
+- Realtime speech (`--rt`, `Sophon-Realtime-32B-Tag`): WebSocket `/v1/realtime`,
+  audio frontend + 64-layer thinker + talker/flow/HiFT, streaming PCM16 replies
+  and per-turn timing, verified end to end on Metal (53 audio deltas / 10.44 s
+  of non-silent speech; warm-turn prefill 2.83 s). H5 TeachMe lives at
+  `/apps/teachme/`. The assistant prompt must stop at the bare
+  `<|im_start|>assistant\n` — extra newlines make the first token EOS and the
+  turn "complete" without audio (§82). See `docs/REALTIME.md`.
 - OpenAI-compatible API: `/v1/models`, `/v1/models/<id>`, `/v1/completions`,
   `/v1/chat/completions` (SSE, `reasoning_content` separate from `content`, `tool_calls`
   generated in each checkpoint's own protocol and parsed back to the OpenAI shape).

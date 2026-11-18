@@ -31,6 +31,16 @@
       "entry": "/apps/imagegen/index.html",
       "description": "输入 prompt，上传头像/服装/姿势参考图，一键调用本机 /v1/images/edits 与 /v1/images/generations；支持进度、在线查看与下载 PNG。本机同一时刻只运行一个模型。",
       "meta": "图像 · 三参考图 · 进度 · 在线查看 · 下载"
+    },
+    {
+      "id": "teachme",
+      "name": "TeachMe 语音对话",
+      "tag": "H5",
+      "icon": "语",
+      "version": "1.0.0",
+      "entry": "/apps/teachme/index.html",
+      "description": "全双工语音对话：麦克风采集 PCM 经 WebSocket 送入 /v1/realtime（Sophon-Realtime-32B-Tag），模型直接听声音并把回答说出来；服务端 VAD 免提轮转、可随时插话打断，右侧实时展示耳/预填充/解码/合成全链路耗时与聚合统计。",
+      "meta": "实时语音 · 全双工 · 插话打断 · 全链路性能 · sqlite"
     }
   ]
 }

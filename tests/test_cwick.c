@@ -39,6 +39,8 @@
 #include "../src/q35.h"
 #include "../src/qr.h"
 #include "../src/h3.h"
+#include "../src/rt_realtime.h"
+#include "../src/rt_vad.h"
 #include "pfx.h"
 #include "../src/sample.h"
 
@@ -1584,6 +1586,20 @@ static void test_models(void) {
     CHECK(!cwick_model_served_alias(m1, alias, sizeof(alias)) && alias[0] == '\0',
           "alias: a fixture keeps its own model_type");
     {
+        /* start.sh passes checkpoint dirs with a trailing slash; the basename
+         * must still match, not collapse to the empty string after the last '/'. */
+        char slashroot[256];
+        snprintf(slashroot, sizeof(slashroot), "%s/", glmroot);
+        CHECK(cwick_model_served_alias(slashroot, alias, sizeof(alias)) &&
+                  strcmp(alias, "glm-5.3-flash") == 0,
+              "alias: a trailing slash does not hide the release name");
+        snprintf(slashroot, sizeof(slashroot),
+                 "%s/models/adventists-ai/Sophon-Realtime-32B-Tag/", parent);
+        CHECK(cwick_model_served_alias(slashroot, alias, sizeof(alias)) &&
+                  strcmp(alias, "Sophon-Realtime-32B-Tag") == 0,
+              "alias: the speech release name survives a trailing slash");
+    }
+    {
         cwick_model_list al;
         cwick_models_list_init(&al);
         CHECK(cwick_models_list_add(&al, "glm5_next", glmroot),
@@ -1625,6 +1641,33 @@ static void test_models(void) {
     cwick_models_list_free(&l);
     CHECK(cwick_models_scan_dir("/tmp/cwick-test-no-such-dir", &l) == -1,
           "scan: an unreadable directory reports -1 (does not crash)");
+
+    /* The same checkpoint spelled differently is still one model: the --root
+     * the operator typed and the library's "./models/owner/name" scan resolve
+     * to one directory, so the second spelling must not survive as a duplicate
+     * "id@2" entry in the settings model list. */
+    {
+        cwick_model_list dl;
+        cwick_models_list_init(&dl);
+        CHECK(cwick_models_list_add(&dl, "glm_5_3_flash_synthetic", m1),
+              "dedupe: the first spelling is listed");
+        char alt[256];
+        snprintf(alt, sizeof(alt), "%s/./m1", parent);
+        CHECK(!cwick_models_list_add(&dl, "glm_5_3_flash_synthetic", alt),
+              "dedupe: a '/./' spelling of the same root is refused");
+        snprintf(alt, sizeof(alt), "%s/m1/", parent);
+        CHECK(!cwick_models_list_add(&dl, "glm_5_3_flash_synthetic", alt),
+              "dedupe: a trailing-slash spelling of the same root is refused");
+        CHECK(dl.n == 1, "dedupe: one directory is one entry");
+        CHECK(cwick_models_list_add(&dl, "glm_5_3_flash_synthetic", m2),
+              "dedupe: a different root sharing the id is still listed");
+        cwick_models_list_dedupe_ids(&dl);
+        CHECK(dl.n == 2 && strcmp(dl.v[0].id, dl.v[1].id) != 0,
+              "dedupe: two real checkpoints keep distinct ids");
+        CHECK(strcmp(dl.v[0].root, m1) == 0,
+              "dedupe: the first spelling is kept so resident matching lines up");
+        cwick_models_list_free(&dl);
+    }
 
     /* Full residency is a size decision, not a preference. The numbers are the
      * real ones: 18 GiB of BF16 weights and ~1.8 GiB of KV/DeltaNet state on
@@ -5472,6 +5515,159 @@ static void test_h3_multipart(void) {
           "h3: the reference cap is honoured");
 }
 
+/* ------------------------------------------------------------------ */
+/* Realtime append resampler (overlap-save)                            */
+/* ------------------------------------------------------------------ */
+static void test_rt_resample(void) {
+    /* Identity rate is a straight copy. */
+    {
+        float in[8] = { 0.1f, -0.2f, 0.3f, -0.4f, 0.5f, -0.6f, 0.7f, -0.8f };
+        rt_resample_state st; memset(&st, 0, sizeof(st));
+        float *out = NULL;
+        int n = rt_resample_stream(&st, in, 8, 16000, 16000, &out);
+        CHECK(n == 8, "rt resample identity count");
+        int same = 1;
+        for (int i = 0; i < 8; i++) if (out[i] != in[i]) same = 0;
+        CHECK(same, "rt resample identity values");
+        free(out);
+        rt_resample_free(&st);
+    }
+    /* Chunked appends must equal one whole-clip resample: zero-padding each
+     * chunk instead gates the waveform at every boundary (the bug that made
+     * the audio tower hear silence). */
+    {
+        const int N = 24000;             /* 1 s at the wire rate */
+        float *x = malloc((size_t)N * sizeof(float));
+        for (int i = 0; i < N; i++)
+            x[i] = 0.6f * sinf(2 * (float)M_PI * 440 * i / 24000)
+                 + 0.2f * sinf(2 * (float)M_PI * 1300 * i / 24000);
+        rt_resample_state whole; memset(&whole, 0, sizeof(whole));
+        float *ref = NULL;
+        int ref_n = rt_resample_stream(&whole, x, N, 24000, 16000, &ref);
+        rt_resample_state st; memset(&st, 0, sizeof(st));
+        float *acc = malloc((size_t)N * sizeof(float));
+        int acc_n = 0;
+        const int CH = 4800;             /* 200 ms appends */
+        for (int p = 0; p < N; p += CH) {
+            int k = N - p < CH ? N - p : CH;
+            float *part = NULL;
+            int pn = rt_resample_stream(&st, x + p, k, 24000, 16000, &part);
+            memcpy(acc + acc_n, part, (size_t)pn * sizeof(float));
+            acc_n += pn;
+            free(part);
+        }
+        CHECK(acc_n == ref_n, "rt resample chunked count matches whole");
+        double maxerr = 0;
+        for (int i = 0; i < ref_n && i < acc_n; i++) {
+            double e = fabs((double)acc[i] - (double)ref[i]);
+            if (e > maxerr) maxerr = e;
+        }
+        CHECK(maxerr < 1e-4, "rt resample chunked equals whole (no boundary gating)");
+        free(acc); free(ref); free(x);
+        rt_resample_free(&whole);
+        rt_resample_free(&st);
+    }
+    /* Unity DC gain across chunk boundaries: a constant must stay constant in
+     * the interior. (The clip's own tail droops from zero-padding — identical
+     * in whole and chunked, already covered above — so probe an interior
+     * chunk, not the last.) */
+    {
+        rt_resample_state st; memset(&st, 0, sizeof(st));
+        float dc[4800];
+        for (int i = 0; i < 4800; i++) dc[i] = 0.5f;
+        float *out = NULL;
+        int n = 0;
+        for (int c = 0; c < 4; c++) {
+            float *part = NULL;
+            int pn = rt_resample_stream(&st, dc, 4800, 24000, 16000, &part);
+            if (c == 2) { out = part; n = pn; }  /* interior: real samples both sides */
+            else free(part);
+        }
+        double maxerr = 0;
+        for (int i = 0; i < n; i++) {
+            double e = fabs((double)out[i] - 0.5);
+            if (e > maxerr) maxerr = e;
+        }
+        CHECK(maxerr < 1e-3, "rt resample unity DC gain across chunks");
+        free(out);
+        rt_resample_free(&st);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Realtime turn detection: hysteresis + short-fragment floor          */
+/* ------------------------------------------------------------------ */
+static void rt_vad_tone(float *p, int n, double db) {
+    double a = pow(10.0, db / 20.0), ph = 0.0;
+    for (int i = 0; i < n; i++) {
+        p[i] = (float)(a * sin(ph));
+        ph += 2 * M_PI * 180.0 / 16000;
+    }
+    double s = 0;
+    for (int i = 0; i < n; i++) s += (double)p[i] * p[i];
+    double g = (a / sqrt(2.0)) / sqrt(s / n);
+    for (int i = 0; i < n; i++) p[i] = (float)(p[i] * g);
+}
+
+/* Feed a whole clip, return the number of start/end/discard decisions. */
+static void rt_vad_run(const float *p, int n, bool hyst,
+                       int *starts, int *ends, int *drops) {
+    rt_vad_state v;
+    rt_vad_state_init(&v);
+    *starts = *ends = *drops = 0;
+    for (int off = 0; off + 160 <= n; off += 160) {
+        int st; bool stopped, discarded;
+        rt_vad_feed(&v, p + off, 160, 16000, 0.5f, 300, 200, hyst,
+                    RT_VAD_MIN_ACTIVE_MS, &st, &stopped, &discarded);
+        if (st >= 0) (*starts)++;
+        if (stopped) (*ends)++;
+        if (discarded) (*drops)++;
+    }
+}
+
+static void test_rt_vad(void) {
+    /* A click at -20 dBFS for 40 ms with no speech: the original detector
+     * committed it as a turn, which could cancel a reply in progress. */
+    {
+        int n = 16000, click = 640;
+        float *p = calloc((size_t)n, sizeof(float));
+        rt_vad_tone(p + 8000, click, -20);
+        int ls, le, ld, es, ee, ed;
+        rt_vad_run(p, n, false, &ls, &le, &ld);
+        rt_vad_run(p, n, true, &es, &ee, &ed);
+        CHECK(ls == 1, "rt vad legacy commits a click");
+        CHECK(es == 0 && ed == 1, "rt vad drops the click below the fragment floor");
+        free(p);
+    }
+    /* A 260 ms dip between two loud stretches: both are above the release
+     * level but below onset, so hysteresis keeps one turn where the original
+     * detector manufactured two. */
+    {
+        int a = 8000, dip = 4160, b = 8000, tail = 8000, n = a + dip + b + tail;
+        float *p = calloc((size_t)n, sizeof(float));
+        rt_vad_tone(p, a, -25);
+        rt_vad_tone(p + a, dip, -38);
+        rt_vad_tone(p + a + dip, b, -25);
+        int ls, le, ld, es, ee, ed;
+        rt_vad_run(p, n, false, &ls, &le, &ld);
+        rt_vad_run(p, n, true, &es, &ee, &ed);
+        CHECK(ls == 2, "rt vad legacy splits on a mid-word dip");
+        CHECK(es == 1 && ee == 1, "rt vad hysteresis keeps the dip in one turn");
+        free(p);
+    }
+    /* A genuine end must still be detected: hysteresis must not turn the
+     * detector into one that never ends a turn. */
+    {
+        int n = 16000;
+        float *p = calloc((size_t)n, sizeof(float));
+        rt_vad_tone(p, n - 8000, -25);
+        int es, ee, ed;
+        rt_vad_run(p, n, true, &es, &ee, &ed);
+        CHECK(es == 1 && ee == 1, "rt vad still ends on a real pause");
+        free(p);
+    }
+}
+
 int main(void) {
     printf("cwick verification suite\n");
     test_bf16();
@@ -5519,6 +5715,8 @@ int main(void) {
     test_jev_adapter();
     test_h3_png();
     test_h3_multipart();
+    test_rt_resample();
+    test_rt_vad();
     if (g_fail) {
         printf("\nRESULT: FAIL\n");
         return 1;

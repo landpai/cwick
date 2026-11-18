@@ -158,6 +158,24 @@ void cwick_metrics_set_prefill(int64_t done_tokens, int64_t total_tokens,
                               int64_t layer, int64_t nlayer);
 
 /* ------------------------------------------------------------------ */
+/* Realtime turns                                                      */
+/* ------------------------------------------------------------------ */
+/* One completed (or cancelled) speech turn. The stage seconds are wall
+ * clock measured around the same calls the stdout stage lines describe;
+ * `decode_s` overlaps `talker_s`, because a finished sentence is synthesised
+ * inside the decode loop before the next token is sampled. */
+typedef struct {
+    double ear_s, prefill_s, decode_s, talker_s, first_audio_s, turn_s;
+    double audio_in_s, audio_out_s;
+    uint64_t prompt_tokens, reply_tokens, speech_tokens, audio_tokens, out_samples;
+    bool cancelled;
+} cwick_rt_turn_metrics;
+
+/* A WebSocket session was accepted. */
+void cwick_metrics_rt_session(void);
+void cwick_metrics_rt_observe(const cwick_rt_turn_metrics *m);
+
+/* ------------------------------------------------------------------ */
 /* Exposition                                                          */
 /* ------------------------------------------------------------------ */
 /* Render the whole registry in Prometheus text format (v0.0.4). Returns a

@@ -169,6 +169,17 @@ static _Atomic uint64_t m_pfx_hits;
 static _Atomic uint64_t m_pfx_reused;    /* prompt tokens skipped by a hit */
 static _Atomic uint64_t m_empty_answers; /* 200 OK, but nothing in `content` */
 
+/* Realtime: cumulative stage seconds and token counts, plus the most recent
+ * turn's numbers for a dashboard that wants this answer, not the average. */
+static _Atomic uint64_t m_rt_sessions, m_rt_turns, m_rt_cancelled;
+static _Atomic uint64_t m_rt_ear_bits, m_rt_prefill_bits, m_rt_decode_bits;
+static _Atomic uint64_t m_rt_talker_bits, m_rt_turn_bits, m_rt_first_bits;
+static _Atomic uint64_t m_rt_audio_in_bits, m_rt_audio_out_bits;
+static _Atomic uint64_t m_rt_prompt_tokens, m_rt_reply_tokens;
+static _Atomic uint64_t m_rt_speech_tokens, m_rt_audio_tokens, m_rt_out_samples;
+static _Atomic uint64_t g_rt_last_turn_bits, g_rt_last_first_bits;
+static _Atomic uint64_t g_rt_last_audio_out_bits;
+
 static _Atomic uint64_t m_expert_reads;
 static _Atomic uint64_t m_expert_bytes;
 
@@ -280,6 +291,32 @@ void cwick_metrics_observe_ttft(double seconds) {
 
 void cwick_metrics_empty_answer(void) {
     counter_add(&m_empty_answers, 1);
+}
+
+void cwick_metrics_rt_session(void) { counter_add(&m_rt_sessions, 1); }
+
+void cwick_metrics_rt_observe(const cwick_rt_turn_metrics *m) {
+    if (!m) return;
+    counter_add(&m_rt_turns, 1);
+    if (m->cancelled) counter_add(&m_rt_cancelled, 1);
+    gauge_add(&m_rt_ear_bits, m->ear_s);
+    gauge_add(&m_rt_prefill_bits, m->prefill_s);
+    gauge_add(&m_rt_decode_bits, m->decode_s);
+    gauge_add(&m_rt_talker_bits, m->talker_s);
+    gauge_add(&m_rt_turn_bits, m->turn_s);
+    gauge_add(&m_rt_first_bits, m->first_audio_s);
+    gauge_add(&m_rt_audio_in_bits, m->audio_in_s);
+    gauge_add(&m_rt_audio_out_bits, m->audio_out_s);
+    counter_add(&m_rt_prompt_tokens, m->prompt_tokens);
+    counter_add(&m_rt_reply_tokens, m->reply_tokens);
+    counter_add(&m_rt_speech_tokens, m->speech_tokens);
+    counter_add(&m_rt_audio_tokens, m->audio_tokens);
+    counter_add(&m_rt_out_samples, m->out_samples);
+    atomic_store_explicit(&g_rt_last_turn_bits, d2u(m->turn_s), memory_order_relaxed);
+    atomic_store_explicit(&g_rt_last_first_bits, d2u(m->first_audio_s),
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_rt_last_audio_out_bits, d2u(m->audio_out_s),
+                          memory_order_relaxed);
 }
 
 void cwick_metrics_request_finish(int64_t prompt_tokens, int64_t gen_tokens,
@@ -624,6 +661,72 @@ char *cwick_metrics_render(size_t *out_len) {
                  "nor a tool call (the generation stopped inside the thinking "
                  "block, or ran out of budget there).",
                  atomic_load_explicit(&m_empty_answers, memory_order_relaxed));
+
+    /* ---- realtime speech turns ---- */
+    emit_counter(&b, "cwick:realtime_sessions_total",
+                 "WebSocket sessions accepted on /v1/realtime.",
+                 atomic_load_explicit(&m_rt_sessions, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_turns_total",
+                 "Speech turns that reached a summary line.",
+                 atomic_load_explicit(&m_rt_turns, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_cancelled_total",
+                 "Speech turns cut short by barge-in or an explicit cancel.",
+                 atomic_load_explicit(&m_rt_cancelled, memory_order_relaxed));
+    emit_help_type(&b, "cwick:realtime_stage_seconds_total",
+                   "Wall seconds accumulated per pipeline stage. `decode` "
+                   "overlaps `talker` because synthesis runs inside the decode "
+                   "loop at sentence boundaries.", "counter");
+    {
+        static const struct { const char *name; _Atomic uint64_t *p; } stage[] = {
+            { "ear", &m_rt_ear_bits }, { "prefill", &m_rt_prefill_bits },
+            { "decode", &m_rt_decode_bits }, { "talker", &m_rt_talker_bits },
+            { "turn", &m_rt_turn_bits },
+        };
+        for (size_t i = 0; i < sizeof(stage) / sizeof(stage[0]); i++)
+            buf_addf(&b, "cwick:realtime_stage_seconds_total{stage=\"%s\"} %.6g\n",
+                     stage[i].name, gauge_get(stage[i].p));
+    }
+    emit_gauge(&b, "cwick:realtime_audio_in_seconds",
+               "Cumulative 16 kHz audio accepted from clients, in seconds.",
+               gauge_get(&m_rt_audio_in_bits));
+    emit_gauge(&b, "cwick:realtime_audio_out_seconds",
+               "Cumulative 24 kHz speech sent to clients, in seconds.",
+               gauge_get(&m_rt_audio_out_bits));
+    emit_counter(&b, "cwick:realtime_pcm_samples_total",
+                 "24 kHz PCM samples sent to clients.",
+                 atomic_load_explicit(&m_rt_out_samples, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_audio_tokens_total",
+                 "Projected audio rows placed at <|audio|> positions.",
+                 atomic_load_explicit(&m_rt_audio_tokens, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_prompt_tokens_total",
+                 "Decoder positions prefilled for speech turns.",
+                 atomic_load_explicit(&m_rt_prompt_tokens, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_reply_tokens_total",
+                 "Decoder tokens sampled for speech turns.",
+                 atomic_load_explicit(&m_rt_reply_tokens, memory_order_relaxed));
+    emit_counter(&b, "cwick:realtime_speech_tokens_total",
+                 "Talker LM tokens decoded for speech turns.",
+                 atomic_load_explicit(&m_rt_speech_tokens, memory_order_relaxed));
+    emit_gauge(&b, "cwick:realtime_last_turn_seconds",
+               "Wall seconds of the most recent speech turn.",
+               u2d(atomic_load_explicit(&g_rt_last_turn_bits, memory_order_relaxed)));
+    emit_gauge(&b, "cwick:realtime_last_first_audio_seconds",
+               "Commit-to-first-audio delay of the most recent speech turn.",
+               u2d(atomic_load_explicit(&g_rt_last_first_bits, memory_order_relaxed)));
+    emit_gauge(&b, "cwick:realtime_last_audio_out_seconds",
+               "Spoken seconds in the most recent speech turn.",
+               u2d(atomic_load_explicit(&g_rt_last_audio_out_bits, memory_order_relaxed)));
+    {
+        double turn = u2d(atomic_load_explicit(&g_rt_last_turn_bits,
+                                               memory_order_relaxed));
+        double out = u2d(atomic_load_explicit(&g_rt_last_audio_out_bits,
+                                              memory_order_relaxed));
+        emit_gauge(&b, "cwick:realtime_last_rtf",
+                   "Real-time factor of the most recent turn: spoken seconds "
+                   "divided by wall seconds. Below 1 means the answer took "
+                   "longer to produce than to listen to.",
+                   turn > 0 ? out / turn : 0.0);
+    }
 
     /* ---- gauges ---- */
     uint64_t used = atomic_load_explicit(&g_expert_used, memory_order_relaxed);
