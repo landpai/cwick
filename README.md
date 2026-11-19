@@ -16,23 +16,29 @@ Serve `:8001` · `./cwick run` · [Architecture](docs/ARCHITECTURE.md) ·
 [Development handoff](AGENTS.md)
 
 The name is the picture: a wick is the narrow thread that lets a large body of
-wax burn. Here the wax is a 233–475 GiB weight bank on the SSD and the wick is
+wax burn. Here the wax is an 18–475 GiB weight bank on the SSD, and the wick is
 the few gigabytes per token that actually cross the bus.
 
-Three checkpoints are supported end to end today — not by design a closed list, but
-each needs its own loader, quantizer, prompt renderer and kernels:
+Six checkpoints are supported end to end today — not by design a closed list,
+but each needs its own loader, quantizers, prompt renderer and kernels. Four are
+text models, one generates images and one is a full-duplex speech model:
 
 | model | on disk | shape | why it is here |
 |---|---|---|---|
 | **GLM-5.3-flash** | ≈306 GiB, 62 shards | 45 layers, 288 routed experts, top-8, FP8-E4M3 | the original model, ≈320B parameters |
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB, 48 shards | 40 layers, 384 routed experts top-6, MLA + FP4 experts + FP8 attention | the largest one that still fits a laptop |
-| **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest footprint of the three |
-| **Qwen3.5-9B** | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only one that is not an MoE, and the only one held wholly in RAM |
+| **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest of the MoE models |
+| **Qwen3.5-9B** | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only dense text model, held wholly in RAM, and the fastest |
+| **MiniMax-H3-Image** | ≈190 GiB, two trees | Qwen3-VL conditioner → 50-layer DiT → tiled ViT VAE | text-to-image and image editing behind the OpenAI image API |
+| **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64-layer FP8 thinker → talker → flow + HiFT, 24 kHz | full-duplex speech over a WebSocket, hearing and speaking in the same turn |
 
-The quality rule is not negotiable and is enforced at load time: **top-k is the
-model's own `num_experts_per_token`** (never reduced), experts are never pruned,
-embeddings are never tied, and a missing shard fails closed instead of quietly
-running a smaller model.
+One model is resident at a time across **all six**: the image and speech
+pipelines are hot-switched through the same `/v1/models/switch` as the text
+backends, and each release the previous pipeline before loading. The quality
+rule is not negotiable and is enforced at load time for the text models:
+**top-k is the model's own `num_experts_per_token`** (never reduced), experts
+are never pruned, embeddings are never tied, and a missing shard fails closed
+instead of quietly running a smaller model.
 
 # Contents
 
@@ -47,6 +53,7 @@ running a smaller model.
 - [Models, context and memory](#models-context-and-memory)
 - [Long prompts and the prefix cache](#long-prompts-and-the-prefix-cache)
 - [Thinking, streaming and tools](#thinking-streaming-and-tools)
+- [Image and speech pipelines](#image-and-speech-pipelines)
 - [Speed](#speed)
 - [Verification](#verification)
 - [Detailed Guides](#detailed-guides)
@@ -79,8 +86,8 @@ Everything below is a reason it has to look the way it does:
 * MoE models tolerate aggressive expert quantization far better than dense ones,
   so the sparse part can live on disk while the arithmetic stays exact where it
   matters.
-* An inference engine specialized for three checkpoints can be far simpler, and
-  far more honest about its numbers, than a general-purpose runner.
+* An inference engine specialized for a small set of checkpoints can be far
+  simpler, and far more honest about its numbers, than a general-purpose runner.
 
 ## How this was built: an agent in a loop
 
@@ -145,21 +152,24 @@ benchmark command — which is the actual point. A verdict is a file, not a feel
 ## Architecture
 
 ```text
-client (curl / coding agent / desktop chat app / web console)
+client (curl / coding agent / desktop chat app / web console / WebSocket)
   └── HTTP :8001 ──► server.c
         ├── /v1/chat/completions ──► queue (single slot, arrival order)
         │        └── engine.c ──► render prompt, prefill, decode, sample
         │              ├── GLM-5.3-flash : spine.c  attention.c  moe.c  pfx.c
         │              ├── DeepSeek-V4.1  : ds_model.c  ds_ops.c  ds_quant.c
         │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
-        │              └── Qwen3.5-9B      : q35_model.c  q35_prompt.c
+        │              └── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
+        ├── /v1/images/{generations,edits} ──► h3.c ──► text encode → DiT → tiled VAE
+        ├── /v1/realtime (WebSocket) ──► ws.c + rt_realtime.c ──► VAD + session state
+        │        └── rt_audio.c → rt_thinker.c → rt_talker.c → rt_flow.c → rt_hift.c
         ├── /v1/systemone ──► jev.c ──► one prefill, read the distribution
         ├── /v1/metrics  /v1/models  /v1/config  /v1/logs/stream
         ├── /v1/hub/*    ──► hub.c (download jobs, model catalog)
         │        └── answered while the slot is busy — this is how a 30-minute
         │            prefill stays watchable
         └── /  ├── web/     single-page console, embedded at build time
-                ├── apps/   three H5 apps, one sqlite file each (store.c)
+                ├── apps/   four H5 apps, one sqlite file each (store.c)
                 └── models/ downloaded checkpoints, scanned at startup
 
 state on this machine
@@ -169,18 +179,21 @@ state on this machine
   └── compute  : pool.c (NEON threads) or metal.c (zero-copy arena blobs)
 ```
 
-- **Language and dependencies**: C11 plus two Objective-C files for the Metal
+- **Language and dependencies**: C11 plus a few Objective-C files for the Metal
   bridge. It links nothing but macOS system frameworks — Accelerate, Metal,
   CoreImage, ImageIO, CoreGraphics — and the system `sqlite3`. No Python, no
-  BLAS, no runtime conversion step.
+  BLAS, no runtime conversion step. `.pt` speech tensors are read in place by a
+  small pure-C zip/pickle reader (`rt_torch.c`); no checkpoint is converted.
 - **One binary, four subcommands**: `setup` (synthetic verification model), `run`
   (one prompt, or a batch-decode harness), `serve` (the API server), `doctor`
   (read every resident byte and print the plan).
 - **The web console is compiled in** (`src/webui_embed.c`), so `--web` needs no
   assets on disk and no second process; the apps are files under `apps/`, served
   by the same server and stored in sqlite.
-- **One model resident at a time.** That is a bandwidth decision, not a missing
-  feature: two generations would halve each other's cache.
+- **One model resident at a time across all six pipelines.** That is a bandwidth
+  decision, not a missing feature: two generations would halve each other's
+  cache. Switching to the image or speech model releases the text engine first,
+  and switching back releases it again.
 
 ## Quick Start
 
@@ -188,8 +201,10 @@ state on this machine
 
 - macOS on Apple Silicon, and `clang`. Nothing else — see
   [Supported hardware](#supported-hardware) for the memory design point.
-- A checkpoint: ~233 GiB (MiniMax), ~306 GiB (GLM) or ~475 GiB (DeepSeek) of SSD
-  free, downloaded as published.
+- A checkpoint: ~18 GiB (Qwen3.5), ~233 GiB (MiniMax), ~306 GiB (GLM) or
+  ~475 GiB (DeepSeek) of SSD free for text; the image model needs ~190 GiB and
+  the speech model ~42 GiB. Download each as published — there is no conversion
+  step.
 
 ### 1. Build and test
 
@@ -229,8 +244,14 @@ sh ./start.sh minimax          # MiniMax-M3.1-Flash, 32K context (its KV is 2.3 
 sh ./start.sh qwen3.5-9b       # Qwen3.5-9B, 128K context (dense BF16, 18 GiB wired resident at load)
 ```
 
+`start.sh` also passes `--rt` and `--img` so the speech and image pipelines are
+available as hot-switch targets; pick one from the settings panel (or with
+`POST /v1/models/switch`) to make it resident. The two image endpoints and the
+WebSocket speech endpoint answer 503 while a text model is resident, and vice
+versa — see [Image and speech pipelines](#image-and-speech-pipelines).
+
 `start.sh` is the recommended entry point: it turns on the prefix cache, the web
-console, LAN sharing, three model directories and a password, all of which are
+console, LAN sharing, the model directories and a password, all of which are
 easy to forget one at a time. Without a script the same server is:
 
 ```sh
@@ -346,7 +367,7 @@ Range request. Repositories of a few hundred GiB and shards above 100 GiB are
 handled with 64-bit sizes throughout. `docs/SERVER.md` has the five endpoints
 and the on-disk layout.
 
-The market ships three H5 apps in `apps/`, each with its own sqlite database and
+The market ships four H5 apps in `apps/`, each with its own sqlite database and
 its own manifest. In **tic-tac-toe** the human plays X first; every machine
 move is a `/v1/systemone` decision asking which empty cell gives O the greatest
 probability of winning, with per-cell tactical facts in the state and the full
@@ -356,11 +377,16 @@ its twelve option letters, draws a variation seed and a pressure point, and
 asks for the hardest possible obstacle, while the sidebar shows obstacle and
 kart statistics. **H5 image studio** takes a prompt plus optional face, outfit
 and pose uploads and calls `/v1/images/edits` (or `/v1/images/generations` for
-plain text), showing progress, an inline preview and a PNG download. The two game
-apps call `POST /v1/systemone`; the chat tab goes to whichever
-endpoint its selector names. Each app lays itself out for a phone screen as well as
-a desktop one; the console only hosts them. With `--lan` each app has a QR code,
-so a phone on the same Wi-Fi can open it without knowing the address.
+plain text), showing progress, an inline preview and a PNG download. **TeachMe**
+captures the microphone as 16 kHz PCM and streams it over the `/v1/realtime`
+WebSocket: the model hears and speaks back, server-side VAD handles hands-free
+turns and barge-in, and the sidebar shows the per-turn ear / prefill / decode /
+talker timings. The two game apps call `POST /v1/systemone`, the image studio
+calls the image endpoints and TeachMe calls the speech endpoint; the chat tab
+goes to whichever endpoint its selector names. Each app lays itself out for a
+phone screen as well as a desktop one; the console only hosts them. With `--lan`
+each app has a QR code, so a phone on the same Wi-Fi can open it without knowing
+the address.
 
 What they ask the model for is a decision, not prose, and the state each one
 keeps (a game, its decision log, a lap) goes into its own sqlite file under
@@ -406,20 +432,21 @@ serve also have an environment twin:
 | `--password P` / `--api-key NAME` | — | single-user login / named key for agent platforms |
 | `--models-dir DIR` | — | extra checkpoints to list (up to 8); switching loads one at a time |
 | `--img DIR` | `CWICK_IMAGE_MODEL` | image checkpoint directory; exposes `POST /v1/images/generations` and `/v1/images/edits` and allows an on-demand switch to `MiniMax-H3-Image` |
+| `--rt DIR` | `CWICK_REALTIME_MODEL` | speech checkpoint directory; exposes the `/v1/realtime` WebSocket and allows a switch to `Sophon-Realtime-32B-Tag` |
 | `--store DIR` | `~/.cwick/apps` | one sqlite file per app plus `auth.db` |
 
 Environment twins: `CWICK_MEM_PCT`, `CWICK_MEM_MAX_GIB`, `CWICK_STORE`,
 `CWICK_PASSWORD`, `CWICK_API_KEY`, `CWICK_WARMUP`, `CWICK_WEB`, `CWICK_METAL`,
-`CWICK_IMAGE_MODEL`, `CWICK_SEED` (sampling seed, so a run is repeatable),
-`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` (model catalog host for the **模型** tab).
-`--img` wins when both it and the environment variable are set. The library
-always writes to `./models`; it is in `.gitignore`.
+`CWICK_IMAGE_MODEL`, `CWICK_REALTIME_MODEL`, `CWICK_SEED` (sampling seed, so a
+run is repeatable), `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` (model catalog host for
+the **模型** tab). `--img` / `--rt` win when both they and the environment
+variable are set. The library always writes to `./models`; it is in `.gitignore`.
 
 ## API
 
 | method | path | notes |
 |---|---|---|
-| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir`; each entry carries `supported` / `unsupported_reason` |
+| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` / `--img` / `--rt`; each entry carries `supported` / `unsupported_reason`, and the image pipeline is marked `cwick.kind:"image"` |
 | GET | `/v1/realtime` | WebSocket full-duplex speech (`?model=…`); requires `--rt`, base64 PCM16 in and `response.audio.delta` out |
 | POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` instead hot-loads the image pipeline without touching the text model |
 | POST | `/v1/images/generations` | `b64_json` image from a JSON prompt; requires `--img` / `CWICK_IMAGE_MODEL` or an on-demand image switch |
@@ -622,6 +649,41 @@ the end. Concatenating the shards gives byte-for-byte the object in the final
 payload; the private `delta.cwick_tool` progress field is still sent for the
 bundled console. See DECISIONS §58 and §59.
 
+## Image and speech pipelines
+
+Two more checkpoints sit behind their own endpoints. Both are single-resident
+like the text models: switching to one releases the text engine, and switching
+back releases it. `--img DIR` / `--rt DIR` (or `CWICK_IMAGE_MODEL` /
+`CWICK_REALTIME_MODEL`) register them as switch targets; `start.sh` passes both.
+A request to the wrong pipeline while another is resident returns 503.
+
+**Images** — `POST /v1/images/generations` takes a JSON prompt and returns
+`{"created":…,"data":[{"b64_json":"…"}]}`; `POST /v1/images/edits` is
+`multipart/form-data` with a repeatable `image` field and the same response.
+`MiniMax-H3-Image` runs a Qwen3-VL conditioner, a 50-layer DiT and a tiled ViT
+VAE decoder. Two weight rules matter: the checkpoint only produces clean images
+above ~4 MP, so any request is rendered on a 2048² canvas and Lanczos-downscaled
+to the requested size (a 512² request costs the same as a 2048² one);
+and the VAE must be decoded in 256 px tiles with overlap and cross-fade — one
+whole-image pass produces a visible grid. Both responses carry a `cwick` timing
+object per phase, and every phase prints a stamped `[image]` line to stdout as
+it happens. Parameter limits (six steps, `guidance_scale: 1`, `b64_json` only)
+and the full numerical alignment are in [docs/IMAGE.md](docs/IMAGE.md).
+
+**Speech** — `/v1/realtime` is a WebSocket: base64 PCM16 at 16 kHz goes in with
+`input_audio_buffer.append`, and `response.audio.delta` carries 24 kHz PCM back
+out. `Sophon-Realtime-32B-Tag` runs a 64-layer FP8 thinker (its per-row scales
+read straight from the mapped shards), then a talker, flow and HiFT vocoder;
+`.pt` tensors are read in place by `rt_torch.c`, with no conversion. Every
+`response.done` carries a `cwick` object with the full-chain breakdown
+(`ear_s`, `prefill_s`, `decode_s`, `talker_s`, `turn_s`, `first_audio_s`, audio
+token counts, `pcm_chunks`), and the same numbers reach stdout and
+`/v1/metrics` as `cwick:realtime_*`. Server-side VAD uses release hysteresis and
+a 100 ms fragment floor so a quiet syllable does not split a word and a click
+does not open a turn (`CWICK_RT_VAD_LEGACY=1` restores the old single threshold).
+Events, metrics, and the two known failure modes are in
+[docs/REALTIME.md](docs/REALTIME.md), along with the full-chain numbers below.
+
 ## Speed
 
 Measured on an M3 Max, 128 GiB, `--backend metal`, one commit — not a fresh
@@ -649,9 +711,26 @@ decode is the default 21 GiB cache from the work in
 | Qwen3.5-9B | prefill, 30,970-token prompt | 436 s | **71.0** | 94% of the flat rate at 30K — a block spends 2.3 s in attention, 4.5 s in projections |
 | Qwen3.5-9B | decision, 3 questions / 525 tokens | 9.44 s | **55.6** | three prefills, no decode (see [docs/PERF.md](docs/PERF.md)) |
 
+The two non-text pipelines have their own units — one rendered image or one
+spoken reply, not a token rate. Both measured on the same M3 Max:
+
+| pipeline | phase | wall | note |
+|---|---|---|---|
+| MiniMax-H3-Image | image, 2048² canvas, `--backend cpu` | 949.0 s | text encode 46.1 + DiT 874.3 + VAE 28.3; 512² costs the same |
+| MiniMax-H3-Image | image, 2048² canvas, `--backend metal` | **535.6 s** | attention 64.5 → 9.0 s/step; projections stay on the BF16 GEMM path |
+| MiniMax-H3-Image | edit, 1 ref, 256² (debug floor) | 515.4 s | 2124 rows; a 2048² canvas with 3 refs is 40.3 min |
+| Sophon-Realtime-32B-Tag | ear, 8.73 s audio | 0.17 s | ≈52× realtime, 55 audio embeddings |
+| Sophon-Realtime-32B-Tag | turn 1, cold | 18.54 s | prefill 8.16 + decode 9.40, first audio 12.96 s, 4.08 s speech |
+| Sophon-Realtime-32B-Tag | turn 2, warm | **13.22 s** | prefill 2.83 s (static prompt reused), first audio 7.67 s |
+
+The speech figures are wall time for one 8.73 s utterance; decode overlaps
+talker synthesis, so subtracting `talker_s` leaves ~4 tok/s of pure decoding,
+and prefill runs at ~22 tok/s. Full per-phase tables are in
+[docs/REALTIME.md](docs/REALTIME.md) and [docs/IMAGE.md](docs/IMAGE.md).
+
 ### What sets the token rate
 
-The three rates are far apart for one reason: they move different numbers of bytes
+The text rates are far apart for one reason: they move different numbers of bytes
 per step. Same method as the table above:
 
 | model | best decode | bytes per step | what sets the ceiling |
@@ -696,7 +775,7 @@ kept, and the ones that lost are written down in
 [docs/DECISIONS.md](docs/DECISIONS.md) — including the ones that looked obvious.
 
 ```sh
-make test        # 678 checks: engines, sampler, prefix cache, server, web UI, apps
+make test        # 747 checks: engines, sampler, prefix cache, server, web UI, apps, image, speech
 make bench       # kernel timings without loading a checkpoint
 ```
 
@@ -716,6 +795,7 @@ first line:
 
 - [Runtime architecture and component map](docs/ARCHITECTURE.md)
 - [Memory-bounded streaming and the storage split](docs/STORAGE.md)
+- [Image endpoints, canvas rules and measured pipeline](docs/IMAGE.md)
 - [Realtime speech and its measured full chain](docs/REALTIME.md)
 - [Measured performance, phase by phase](docs/PERF.md)
 - [Decisions: what was tried, rejected, and why](docs/DECISIONS.md)
@@ -761,6 +841,9 @@ cwick/
 │   ├── ds_*.c         DeepSeek-V4.1 backend: FP4 experts, FP8 attention
 │   ├── q35_*.c        Qwen3.5 backend: Gated DeltaNet + gated GQA, dense BF16
 │   ├── mm_*.c         MiniMax-M3.1 backend: NVFP4 experts, bf16 GQA
+│   ├── h3*.c/.m       MiniMax-H3-Image: conditioner, DiT, tiled VAE
+│   ├── rt_*.c         speech: .pt reader, audio tower, thinker, talker, flow, HiFT, VAD
+│   ├── ws.c           WebSocket transport for /v1/realtime
 │   ├── metal*.c/.m    Metal kernels and the zero-copy arena
 │   ├── pfx.c          prefix-cache snapshots on disk
 │   ├── jev.c          decision endpoint: three prompt grammars, letter readout,
@@ -769,9 +852,9 @@ cwick/
 │   ├── store.c        one sqlite file per app
 │   └── webui*.c       the console, embedded at build time
 ├── web/               console source: index.html, app.js, app.css, login.html
-├── apps/              three H5 apps plus manifest.json
-├── docs/              architecture, storage, performance, decisions, server, precision
-├── tests/             test_cwick.c — 651 checks
+├── apps/              four H5 apps plus manifest.json (tic-tac-toe, kart, image, TeachMe)
+├── docs/              architecture, storage, performance, decisions, server, precision, image, realtime
+├── tests/             test_cwick.c — 747 checks
 ├── tools/             standalone C probes: kernels, layer tests, model runners
 ├── start.sh           recommended entry point (prefix cache + web + LAN + password)
 └── download_model.sh  resumable checkpoint download
