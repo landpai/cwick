@@ -159,6 +159,67 @@ uint64_t cwick_process_footprint_bytes(void) {
 double cwick_gib(uint64_t bytes) { return (double)bytes / CWICK_GIB; }
 
 /* ------------------------------------------------------------------ */
+/* Per-model residency fit                                              */
+/* ------------------------------------------------------------------ */
+void cwick_mem_fit_model(uint64_t weight_bytes, uint64_t runtime_bytes,
+                         uint64_t reserve_bytes, cwick_model_fit *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->weight_bytes = weight_bytes;
+    out->runtime_bytes = runtime_bytes;
+
+    double frac;
+    uint64_t limit;
+    cwick_memory_policy(&frac, &limit);
+    uint64_t host = cwick_host_memory_bytes();
+    long double target_ld = (long double)host * (long double)frac;
+    if (target_ld > (long double)UINT64_MAX) target_ld = (long double)UINT64_MAX;
+    uint64_t target = (uint64_t)target_ld;
+    if (limit > 0 && target > limit) target = limit;
+    if (host == 0 || target == 0) {
+        /* Unknown machine: fail safe to streaming, never wire an unbounded
+         * amount of memory we cannot account for. */
+        out->streamed_bytes = weight_bytes;
+        out->target_bytes = target;
+        out->host_bytes = host;
+        return;
+    }
+    out->host_bytes = host;
+    out->target_bytes = target;
+
+    uint64_t reserve = reserve_bytes ? reserve_bytes : host / 16;
+    out->reserve_bytes = reserve;
+
+    /* Saturating sum: a corrupt/oversized weight total must not wrap into a
+     * small number and pass the fit check. */
+    uint64_t need = weight_bytes;
+    bool overflow = false;
+    if (need > UINT64_MAX - runtime_bytes) overflow = true;
+    else need += runtime_bytes;
+    if (!overflow && need > UINT64_MAX - reserve) overflow = true;
+    else if (!overflow) need += reserve;
+
+    uint64_t usable = target > runtime_bytes ? target - runtime_bytes : 0;
+    if (usable > reserve) usable -= reserve;
+    else usable = 0;
+
+    if (!overflow && need <= target) {
+        out->fits = true;
+        out->resident_bytes = weight_bytes;
+        out->streamed_bytes = 0;
+        out->wire = cwick_memory_noswap();
+    } else {
+        out->fits = false;
+        out->limited_by_ram = true;
+        out->resident_bytes = weight_bytes < usable ? weight_bytes : usable;
+        out->streamed_bytes = weight_bytes - out->resident_bytes;
+        /* A partial stage is never wired: with the ceiling already exceeded,
+         * wiring part of it would just push the rest into the compressor. */
+        out->wire = false;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Swap, the compressor, and wiring                                    */
 /* ------------------------------------------------------------------ */
 /* Page size is a machine fact, not a constant: Apple Silicon has used 16 KiB

@@ -28,7 +28,7 @@ text models, one generates images and one is a full-duplex speech model:
 | **GLM-5.3-flash** | ≈306 GiB, 62 shards | 45 layers, 288 routed experts, top-8, FP8-E4M3 | the original model, ≈320B parameters |
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB, 48 shards | 40 layers, 384 routed experts top-6, MLA + FP4 experts + FP8 attention | the largest one that still fits a laptop |
 | **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest of the MoE models |
-| **Qwen3.5-9B** | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only dense text model, held wholly in RAM, and the fastest |
+| **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic** (Qwen3.5-9B) | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only dense text model, held wholly in RAM, and the fastest |
 | **MiniMax-H3-Image** | ≈190 GiB, two trees | Qwen3-VL conditioner → 50-layer DiT → tiled ViT VAE | text-to-image and image editing behind the OpenAI image API |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64-layer FP8 thinker → talker → flow + HiFT, 24 kHz | full-duplex speech over a WebSocket, hearing and speaking in the same turn |
 
@@ -244,6 +244,12 @@ sh ./start.sh minimax          # MiniMax-M3.1-Flash, 32K context (its KV is 2.3 
 sh ./start.sh qwen3.5-9b       # Qwen3.5-9B, 128K context (dense BF16, 18 GiB wired resident at load)
 ```
 
+The Qwen3.5 checkpoint is announced to clients as
+`DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` — that is the name to put in the
+`model` field and the one `GET /v1/models` reports. Its internal `model_type`
+tags (`qwen3_5` / `qwen3_5_text`) only select the kernels and are also accepted
+for compatibility, but are no longer the advertised name.
+
 `start.sh` also passes `--rt` and `--img` so the speech and image pipelines are
 available as hot-switch targets; pick one from the settings panel (or with
 `POST /v1/models/switch`) to make it resident. The two image endpoints and the
@@ -331,7 +337,15 @@ in-flight request ends with a 503, snapshots are flushed, and the last line says
 so.
 
 `/v1/metrics` carries the same state under vLLM-compatible names, so it can be
-scraped or watched in the console's **控制台** tab.
+scraped or watched in the console's **控制台** tab. Video jobs add
+`cwick:video_stage_seconds_total{stage=...}` (text, pack, encode, dit, vae,
+audio_vae, mux, load, total), `cwick:video_dit_steps_done` / `_total` for a live
+sampling progress bar, job/frame/byte counters and `cwick:video_last_total_seconds`.
+The `encode` stage is the reference-image visual VAE pass and stays zero for
+text-only jobs. Completed jobs also return the same split in their `cwick`
+object under `GET /v1/videos/{id}`, with `encode_ms` for first-frame conditioning.
+The DiT and visual VAE also run on `--backend metal` (BF16 and F32 tensor-core
+GEMMs plus tiled attention); `CWICK_H3V_GPU=0` forces the CPU path for A/B.
 
 ### Web console, model library and the app market
 

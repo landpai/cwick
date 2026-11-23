@@ -40,7 +40,7 @@ cd "$(dirname "$0")" || exit 1
 
 case "$1" in
     glm|glm-5.3-flash)
-        ROOT=./zai-org/GLM-5.3-Flash
+        ROOT=./models/zai-org/GLM-5.3-Flash
         CTX=500000 ;;
     qwen|qwen3.5|qwen3.5-9b|DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic)
         # Dense BF16, 18 GiB, no experts: nothing streams, so the whole
@@ -66,25 +66,24 @@ case "$1" in
         # 32K positions, not 500K: this checkpoint's KV is bf16 GQA at 2.3 KiB
         # per position per layer, so 500K would be 64 GiB of cache -- taken out
         # of the expert cache, which is what the token rate actually runs on.
-        ROOT=./MiniMaxAI/MiniMax-M3.1-Flash
+        ROOT=./models/MiniMaxAI/MiniMax-M3.1-Flash
         CTX=32768 ;;
     ""|ds|deepseek|deepSeek-v4.1-flash-1017)
-        ROOT=./deepseek-ai/DeepSeek-V4.1-Flash-1017
+        ROOT=./models/deepseek-ai/DeepSeek-V4.1-Flash-1017
         CTX=500000 ;;
     *)
         echo "unknown model '$1' (want glm-5.3-flash, deepSeek-v4.1-flash-1017, MiniMax-M3.1-Flash or qwen3.5-9b)" >&2
         exit 2 ;;
 esac
 
-CWICK_ALLOW_MULTI=1 CWICK_SEED=42 CWICK_H3_WIRE=1 ./cwick serve --root "$ROOT" --host 0.0.0.0 --lan --web --jev --port 8001 \
+CWICK_H3V_REF_EDGE=256 CWICK_ALLOW_MULTI=1 CWICK_SEED=42 CWICK_H3_WIRE=1 ./cwick serve --root "$ROOT" --host 0.0.0.0 --lan --web --jev --port 8001 \
     --verbose --backend metal --trace \
-    --rt ./models/adventists-ai/Sophon-Realtime-32B-Tag/ \
-    --img ./models/MiniMaxAI/MiniMax-H3-Image/ \
+    --rt ./models/adventists-ai/Sophon-Realtime-32B-Tag \
+    --img ./models/MiniMaxAI/MiniMax-H3-Image \
+    --videos ./models/MiniMaxAI/MiniMax-H3 \
     --context "$CTX"  --max-tokens 8192 \
     --prefix-cache-dir ./pfxcache --password "${CWICK_PASSWORD:-cwick-local}" \
-    --store ./dbs/ --models-dir ./zai-org/GLM-5.3-Flash \
-    --models-dir ./deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-    --models-dir ./MiniMaxAI/MiniMax-M3.1-Flash \
-    --models-dir ./models/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic \
+    --store ./dbs/  \
+    --models-dir ./models/ \
     --prefix-cache-gib 80 \
     | tee "${CWICK_LOG:-./logs/cwick-serve.log}"

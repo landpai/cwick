@@ -39,6 +39,10 @@
 #include "../src/q35.h"
 #include "../src/qr.h"
 #include "../src/h3.h"
+#include "../src/h3v.h"
+#include "../src/h3v_gpu.h"
+#include "../src/h3v_internal.h"
+#include "../src/metrics.h"
 #include "../src/rt_realtime.h"
 #include "../src/rt_vad.h"
 #include "pfx.h"
@@ -1573,16 +1577,22 @@ static void test_models(void) {
     /* Served aliases: release checkpoints advertise their familiar names,
      * everything else keeps what its config.json says. */
     char alias[128];
-    char glmroot[192], dsroot[256];
+    char glmroot[192], dsroot[256], q35root[320];
     snprintf(glmroot, sizeof(glmroot), "%s/zai-org/GLM-5.3-Flash", parent);
     snprintf(dsroot, sizeof(dsroot), "%s/deepseek-ai/DeepSeek-V4.1-Flash-1017",
              parent);
+    snprintf(q35root, sizeof(q35root),
+             "%s/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic", parent);
     CHECK(cwick_model_served_alias(glmroot, alias, sizeof(alias)) &&
               strcmp(alias, "glm-5.3-flash") == 0,
           "alias: the GLM release name is derived from the directory");
     CHECK(cwick_model_served_alias(dsroot, alias, sizeof(alias)) &&
               strcmp(alias, "deepSeek-v4.1-flash-1017") == 0,
           "alias: the DeepSeek release name keeps its interior capital");
+    CHECK(cwick_model_served_alias(q35root, alias, sizeof(alias)) &&
+              strcmp(alias, "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic") == 0,
+          "alias: the Qwen3.5 hybrid answers to its real release name, not "
+          "the inner qwen3_5_text type tag");
     CHECK(!cwick_model_served_alias(m1, alias, sizeof(alias)) && alias[0] == '\0',
           "alias: a fixture keeps its own model_type");
     {
@@ -1609,6 +1619,14 @@ static void test_models(void) {
         CHECK(cwick_models_list_add(&al, "other_type", m1) &&
               al.v[1].alias[0] == '\0',
               "alias: a non-release entry has none");
+        /* The Qwen3.5 entry's id is its config model_type (qwen3_5), which
+         * differs from the served name — so list_add must keep the alias
+         * rather than blanking it as "no better name". */
+        CHECK(cwick_models_list_add(&al, "qwen3_5", q35root) &&
+              strcmp(al.v[2].alias,
+                     "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic") == 0,
+              "alias: the Qwen3.5 catalog entry keeps the real name alongside "
+              "its internal model_type id");
         cwick_models_list_dedupe_ids(&al);
         CHECK(strcmp(al.v[0].alias, "glm-5.3-flash") == 0,
               "alias: dedupe leaves a unique alias alone");
@@ -4227,6 +4245,27 @@ static void test_hub(void) {
         }
     }
 
+    /* A pipeline downloaded by hand has no .cwick-repo marker and its class
+     * need not be the image one this build loads. The top-level manifest is
+     * still enough to put it in the library; whether cwick can load it is a
+     * separate answer. */
+    {
+        char mod_owner[512], mod[512], manifest[512], shard[512], sub[512];
+        static const char *const modular_json =
+            "{\"_class_name\":\"MiniMaxH3ModularPipeline\"}";
+        snprintf(mod_owner, sizeof(mod_owner), "%s/MiniMaxAI", root);
+        snprintf(mod, sizeof(mod), "%s/MiniMax-H3", mod_owner);
+        snprintf(manifest, sizeof(manifest), "%s/model_index.json", mod);
+        snprintf(sub, sizeof(sub), "%s/transformer", mod);
+        snprintf(shard, sizeof(shard), "%s/pdd.safetensors", sub);
+        CHECK(cwick_mkdir_p(mod) == 0, "hub: hand-downloaded pipeline directory exists");
+        CHECK(cwick_write_file(manifest, modular_json, strlen(modular_json)) == 0,
+              "hub: modular pipeline manifest written");
+        CHECK(cwick_mkdir_p(sub) == 0, "hub: modular transformer submodule exists");
+        CHECK(cwick_write_file(shard, "w", 1) == 0,
+              "hub: modular pipeline has a real weight shard");
+    }
+
     cwick_hub *h = cwick_hub_open(root, NULL);
     CHECK(h != NULL, "hub: library opens without a network");
     if (!h) return;
@@ -4271,6 +4310,10 @@ static void test_hub(void) {
           strstr(js, "\"complete\":true") != NULL &&
           strstr(js, "\"supported\":true") != NULL,
           "hub: a finished image pipeline is complete and supported");
+    CHECK(js && strstr(js, "\"id\":\"MiniMax-H3\"") != NULL,
+          "hub: a hand-downloaded pipeline is listed without a repo marker");
+    CHECK(js && strstr(js, "\"complete\":false") == NULL,
+          "hub: every finished checkpoint in the inventory is complete");
     free(js);
 
     char *p = cwick_hub_local_path(h, "acme/tiny");
@@ -4567,6 +4610,16 @@ static void test_webui(void) {
           igendir && igendir->len == igenhtml->len &&
           memcmp(igendir->data, igenhtml->data, igenhtml->len) == 0,
           "webui: the image app has prompt, three uploads, download and a dir alias");
+    /* Step 1 and step 2 sizes come from one table; the video select keeps a
+     * separate optgroup for explicitly unpaired manual sizes. */
+    CHECK(igenjs && strstr((const char *)igenjs->data, "SIZE_PAIRS") != NULL &&
+          strstr((const char *)igenjs->data, "portrait34") != NULL &&
+          strstr((const char *)igenjs->data, "applyPair") != NULL,
+          "webui: the image app shares one size-pair table across both steps");
+    CHECK(igenhtml && strstr((const char *)igenhtml->data, "pairHintVideo") != NULL &&
+          strstr((const char *)igenhtml->data, "optgroup") != NULL &&
+          strstr((const char *)igenhtml->data, "2560x1440") != NULL,
+          "webui: the video size list separates paired and extended canvases");
 
     const cwick_webui_blob *login = cwick_webui_lookup("/login");
     const cwick_webui_blob *login2 = cwick_webui_lookup("/login.html");
@@ -5668,8 +5721,250 @@ static void test_rt_vad(void) {
     }
 }
 
+/* The video validator rounds a requested duration up to whole 17-frame clips
+ * at 24 fps and clamps to the checkpoint's [4,15] s window. The HTTP layer and
+ * the renderer share h3v_frames_for_seconds so the `seconds` a client sees in
+ * the job object is the clip that was actually rendered. */
+static void test_h3v_video(void) {
+    CHECK(h3v_frames_for_seconds(4) == 102, "h3v: 4 s -> 102 frames (6 clips)");
+    CHECK(h3v_frames_for_seconds(5) == 136, "h3v: 5 s -> 136 frames (8 clips)");
+    CHECK(h3v_frames_for_seconds(7) == 170, "h3v: 7 s -> 170 frames (10 clips)");
+    CHECK(h3v_frames_for_seconds(15) == 374, "h3v: 15 s -> 374 frames (22 clips)");
+    CHECK(h3v_frames_for_seconds(1) == 102, "h3v: below-min seconds clamps to 4 s");
+    CHECK(h3v_frames_for_seconds(0) == 102, "h3v: zero seconds clamps to 4 s");
+    CHECK(h3v_frames_for_seconds(100) == 374, "h3v: above-max seconds clamps to 15 s");
+    bool all_clips = true, monotone = true;
+    int64_t prev = 0;
+    for (int s = -5; s <= 40; s++) {
+        int64_t f = h3v_frames_for_seconds(s);
+        if (f % H3V_CLIP_FRAMES != 0 || f < H3V_CLIP_FRAMES) all_clips = false;
+        if (f < prev) monotone = false;
+        prev = f;
+    }
+    CHECK(all_clips, "h3v: every frame count is a whole 17-frame clip");
+    CHECK(monotone, "h3v: frame count is non-decreasing in seconds");
+    /* 5 latent steps per clip, 4 frames per latent step: the decoder emits 20
+     * and the mux keeps the 17 the checkpoint's frame rule asks for. */
+    CHECK(H3V_CLIP_FRAMES == 17 && H3V_CLIP_LATENT == 5 &&
+          H3V_FRAMES_PER_LATENT == 4, "h3v: clip/latent frame constants agree");
+    CHECK(H3V_SERVED_ID[0] && strcmp(H3V_SERVED_ID, "MiniMax-H3") == 0,
+          "h3v: served id is MiniMax-H3");
+
+    /* Reference encode is not bound to the 1280 canvas cap. The released
+     * checkpoint presents an image at its own 2048 short edge, so that knob
+     * value must survive the range check (it used to be clamped by canvas). */
+    CHECK(H3V_REF_EDGE_MAX >= 2048,
+          "h3v: REF_EDGE ceiling admits the checkpoint's 2048 default");
+    int ew = 0, eh = 0;
+    h3v_ref_encode_size(1152, 1536, 2048, &ew, &eh);
+    CHECK(ew == 2048 && eh == 2720 && eh > H3V_MAX_SIZE,
+          "h3v: REF_EDGE=2048 scales a 1152x1536 ref to 2048x2720 past canvas cap");
+    ew = eh = 0;
+    h3v_ref_encode_size(1152, 1536, 0, &ew, &eh);
+    CHECK(ew == 0 && eh == 0,
+          "h3v: unset REF_EDGE leaves the canvas fallback to the caller");
+    ew = 256; eh = 256;
+    h3v_ref_encode_size(1152, 1536, 16, &ew, &eh);
+    CHECK(ew == 256 && eh == 256,
+          "h3v: out-of-range REF_EDGE is ignored, canvas unchanged");
+
+    /* Generated canvas admits 2K (2560x1440) but not 4K. The request check
+     * compares each axis against H3V_MAX_SIZE, so asserting the constant keeps
+     * the UI's advertised ceiling and the engine in sync. */
+    CHECK(H3V_MAX_SIZE == 2560 && 2560 <= H3V_MAX_SIZE && 1440 <= H3V_MAX_SIZE,
+          "h3v: canvas ceiling admits 2560x1440 (2K)");
+    CHECK(3840 > H3V_MAX_SIZE && 2160 <= H3V_MAX_SIZE,
+          "h3v: 4K-wide canvas (3840) is still refused");
+}
+
+static void test_video_metrics(void) {
+    CHECK(h3v_layout_selftest(),
+          "h3v layout: [C][T][H][W] stats and pack/unpack round-trip");
+    CHECK(h3v_variant_selftest(),
+          "h3v variant: case-insensitive Ref2VA name resolution");
+    CHECK(h3v_latnorm_selftest(),
+          "h3v vae: 24-channel latent normalise/denormalise round-trip");
+    cwick_metrics_init(NULL);
+    cwick_metrics_video_start(0, 30);
+    cwick_metrics_video_step(15, 30);
+    cwick_video_job_metrics m;
+    memset(&m, 0, sizeof(m));
+    m.total_s = 12.5; m.encode_s = 0.5; m.dit_s = 9.0;
+    m.frames = 102; m.bytes = 4096; m.steps = 30;
+    m.video_tokens = 1920; m.audio_tokens = 340;
+    m.first_frame = true; m.success = true;
+    m.suspect_noise = true;
+    cwick_metrics_video_observe(&m);
+    size_t n = 0;
+    char *text = cwick_metrics_render(&n);
+    CHECK(text && n > 0, "video metrics: exposition rendered");
+    if (text) {
+        CHECK(strstr(text, "cwick:video_jobs_total 1") != NULL,
+              "video metrics: job counter present");
+        CHECK(strstr(text, "cwick:video_stage_seconds_total{stage=\"encode\"} 0.5") != NULL,
+              "video metrics: reference encode stage present");
+        CHECK(strstr(text, "cwick:video_jobs_total{kind=\"video\"}") == NULL,
+              "video metrics: counter names are not reused for labelled series");
+        CHECK(strstr(text, "cwick:video_tokens_total{kind=\"video\"} 1920") != NULL,
+              "video metrics: token breakdown present");
+        CHECK(strstr(text, "cwick:video_last_total_seconds 12.5") != NULL,
+              "video metrics: last-job total present");
+        CHECK(strstr(text, "cwick:video_suspect_noise_jobs_total 1") != NULL,
+              "video metrics: suspect-noise job counter present");
+        free(text);
+    }
+}
+
+static uint32_t mp4_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* The muxer used to write moov's *children* at top level and to pair a
+ * single-chunk stsc with a per-sample stco. Both are invisible to a producer
+ * that never replays its own output; ffprobe rejects the file. A tiny
+ * synthetic clip keeps this in the suite without loading the checkpoint. */
+static void test_h3v_mp4(void) {
+    const int w = 32, h = 32, nf = 3;
+    size_t npix = (size_t)w * h * 3 * nf;
+    unsigned char *rgb = (unsigned char *)calloc(npix, 1);
+    int64_t samples = (int64_t)nf * H3V_AUDIO_RATE / H3V_FPS;
+    float *audio = (float *)calloc((size_t)samples * 2, sizeof(float));
+    CHECK(rgb && audio, "h3v mp4: synthetic buffers allocated");
+    if (!rgb || !audio) { free(rgb); free(audio); return; }
+
+    cwick_error e;
+    cwick_error_clear(&e);
+    size_t len = 0;
+    unsigned char *mp4 = h3v_mp4_encode(rgb, nf, w, h, audio, samples, &len, &e);
+    CHECK(mp4 != NULL, "h3v mp4: mux succeeded");
+    if (mp4) {
+        bool moov = false, mdat = false, covered = true;
+        size_t off = 0;
+        while (off + 8 <= len) {
+            uint32_t sz = mp4_be32(mp4 + off);
+            if (sz < 8 || (uint64_t)off + sz > len) { covered = false; break; }
+            if (!memcmp(mp4 + off + 4, "moov", 4)) moov = true;
+            if (!memcmp(mp4 + off + 4, "mdat", 4)) mdat = true;
+            off += sz;
+        }
+        CHECK(moov && mdat && covered && off == len,
+              "h3v mp4: moov/mdat are top-level boxes covering the file");
+
+        /* stsc must declare one sample per chunk to match the per-sample stco,
+         * and stco's entry count must equal stsz's sample count. */
+        bool stsc_ok = false, stco_ok = false, asc_ok = false;
+        for (size_t i = 0; i + 8 <= len; i++) {
+            if (!memcmp(mp4 + i, "stsc", 4) && i + 20 <= len)
+                stsc_ok = (mp4_be32(mp4 + i + 16) == 1);
+            if (!memcmp(mp4 + i, "stco", 4) && i + 12 <= len) {
+                uint32_t nchunk = mp4_be32(mp4 + i + 8);
+                for (size_t k = 0; k + 12 <= len; k++)
+                    if (!memcmp(mp4 + k, "stsz", 4) &&
+                        mp4_be32(mp4 + k + 12) == nchunk) stco_ok = true;
+            }
+            /* DecSpecificInfo 0x05, size 2, AAC-LC AudioSpecificConfig. */
+            if (i + 12 <= len && mp4[i] == 0x05 && mp4[i + 1] == 0x02 &&
+                (mp4[i + 2] >> 3) == 2) asc_ok = true;
+        }
+        CHECK(stsc_ok, "h3v mp4: stsc uses one sample per chunk");
+        CHECK(stco_ok, "h3v mp4: stco count matches stsz sample count");
+        CHECK(asc_ok, "h3v mp4: esds carries a bare AAC-LC config");
+
+        /* A strict player shows B frames in decode order unless ctts carries
+         * their display time. The encoder is pinned to Baseline (no B frames),
+         * so avcC must report 0x42 and ctts must hold zero offsets: every
+         * sample's presentation time then equals its decode time and the
+         * timeline is monotonic. */
+        bool baseline = false, ctts_zero = false;
+        for (size_t i = 0; i + 8 <= len; i++) {
+            if (!memcmp(mp4 + i, "avcC", 4) && i + 6 <= len)
+                baseline = (mp4[i + 5] == 0x42);   /* AVCProfileIndication */
+            if (!memcmp(mp4 + i, "ctts", 4) && i + 16 <= len) {
+                uint32_t entries = mp4_be32(mp4 + i + 12);
+                bool all_zero = entries > 0;
+                for (uint32_t k = 0; k < entries && i + 16 + (size_t)k * 8 + 8 <= len; k++)
+                    if (mp4_be32(mp4 + i + 20 + (size_t)k * 8 + 4) != 0)
+                        all_zero = false;
+                ctts_zero = all_zero;
+            }
+        }
+        CHECK(baseline, "h3v mp4: avcC selects Baseline so no B frames are coded");
+        CHECK(ctts_zero, "h3v mp4: ctts offsets are zero (PTS == DTS)");
+
+        /* stss must list only real IDR samples. A previous build checked just
+         * the first NAL for type 5; the encoder prefixes IDR with SEI (type 6),
+         * so no sample was recognised and a fallback marked them all sync.
+         * QuickTime then restarted decode at P frames and ghosted the picture.
+         * The 3-frame synthetic clip has one IDR; never advertise all 3. */
+        uint32_t nsync = 0, nsamples = 0;
+        bool first_sync = false, sync_within = true;
+        for (size_t i = 0; i + 12 <= len; i++) {
+            if (!memcmp(mp4 + i, "stss", 4)) {
+                nsync = mp4_be32(mp4 + i + 8);
+                for (uint32_t k = 0; k < nsync && i + 12 + (size_t)k * 4 + 4 <= len; k++) {
+                    uint32_t s = mp4_be32(mp4 + i + 12 + (size_t)k * 4);
+                    if (s == 1) first_sync = true;
+                    if (s == 0 || s > (uint32_t)nf) sync_within = false;
+                }
+            }
+            if (!memcmp(mp4 + i, "stsz", 4)) nsamples = mp4_be32(mp4 + i + 12);
+        }
+        CHECK(first_sync && sync_within && nsync >= 1 && nsync <= (uint32_t)nf,
+              "h3v mp4: stss lists only IDR samples (not every P frame)");
+        CHECK(nsync < nsamples,
+              "h3v mp4: P frames are not advertised as random-access points");
+        free(mp4);
+    }
+    free(audio);
+    free(rgb);
+}
+
+/* The video shader is production source: check every kernel is present and
+ * that the one function whose shape guard is pure C rejects what the kernel
+ * cannot serve. Compiling the shader itself is tools/h3vgpuprobe's job. */
+static void test_h3v_gpu_shader(void) {
+    const char *s = h3v_gpu_shader_source();
+    CHECK(s && *s, "h3v gpu: shader source is available");
+    if (s) {
+        CHECK(strstr(s, "kernel void gemm_bf16") != NULL,
+              "h3v gpu: BF16 DiT GEMM kernel is defined");
+        CHECK(strstr(s, "kernel void gemm_f32") != NULL,
+              "h3v gpu: F32 VAE GEMM kernel is defined");
+        CHECK(strstr(s, "kernel void attn128") != NULL,
+              "h3v gpu: 128-wide attention kernel is defined");
+        CHECK(strstr(s, "kernel void attn64") != NULL,
+              "h3v gpu: 64-wide attention kernel is defined");
+    }
+    float z[4] = {0};
+    /* Shapes the kernels cannot serve exactly must stay on the CPU. */
+    CHECK(!h3v_gpu_attention(z, z, z, z, 8, 72, 3, 72),
+          "h3v gpu: unsupported head width is rejected");
+    CHECK(!h3v_gpu_gemm_f32(z, z, z, 4, 24, 4, 24, 4),
+          "h3v gpu: non-16 K stride is rejected");
+}
+
+static void test_h3_progress(void) {
+    h3_progress pr;
+    memset(&pr, 0xff, sizeof(pr));
+    h3_progress_get(&pr);
+    CHECK(pr.phase >= 0 && pr.phase <= 7,
+          "h3 progress: getter returns a valid phase code");
+    CHECK(pr.stamp_ms >= 0.0, "h3 progress: getter returns a monotonic stamp");
+    /* The step counter is only meaningful inside the DiT phase. Outside it
+     * the publisher writes 0/0, and a fresh snapshot must never report a step
+     * larger than its total. */
+    if (pr.phase != 4)
+        CHECK(pr.step == 0 && pr.steps == 0,
+              "h3 progress: step counters are zero outside DiT");
+    else
+        CHECK(pr.step <= pr.steps, "h3 progress: step never exceeds total");
+}
+
 int main(void) {
     printf("cwick verification suite\n");
+    test_h3_progress();
+    test_h3v_gpu_shader();
     test_bf16();
     test_mxfp4();
     test_mxfp4_spec();
@@ -5717,6 +6012,9 @@ int main(void) {
     test_h3_multipart();
     test_rt_resample();
     test_rt_vad();
+    test_h3v_video();
+    test_h3v_mp4();
+    test_video_metrics();
     if (g_fail) {
         printf("\nRESULT: FAIL\n");
         return 1;

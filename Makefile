@@ -13,8 +13,10 @@
 CC      ?= clang
 CFLAGS   = -O2 -Wall -Wextra -fobjc-arc -I src -DACCELERATE_NEW_LAPACK -DACCELERATE_LAPACK_ILP64
 LDFLAGS  = -framework Accelerate -lpthread -framework Metal -framework Foundation \
-           -framework CoreImage -framework ImageIO -framework CoreGraphics -lsqlite3 \
-           -lcurl
+           -framework CoreImage -framework ImageIO -framework CoreGraphics \
+           -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+           -framework AudioToolbox \
+           -lsqlite3 -lcurl
 
 SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/model.c \
        src/safetensors.c \
@@ -22,6 +24,7 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
        src/h3.c src/h3_gpu.c src/h3_gpu.m \
+       src/h3v.c src/h3v_gpu.c src/h3v_gpu.m src/h3v_vae.c src/h3v_audio.c src/h3v_mp4.m \
        src/spine.c src/tensor.c src/pool.c \
        src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
        src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
@@ -35,6 +38,7 @@ HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/m
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
        src/mm.h src/mm_engine.h src/mm_prompt.h \
        src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h src/h3.h src/h3_gpu.h \
+       src/h3v.h src/h3v_gpu.h src/h3v_internal.h \
        src/rt_torch.h src/rt_thinker.h src/rt_audio.h src/rt_dsp.h src/rt_hift.h src/rt_flow.h \
        src/rt_talker.h src/rt_vad.h src/rt_realtime.h src/ws.h
 
@@ -61,6 +65,7 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
        src/ds_prompt.c src/mm_model.c src/mm_engine.c src/mm_prompt.c \
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
             src/h3.c src/h3_gpu.c src/h3_gpu.m \
+            src/h3v.c src/h3v_gpu.c src/h3v_gpu.m src/h3v_vae.c src/h3v_audio.c src/h3v_mp4.m \
             src/spine.c src/tensor.c src/pool.c \
             src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
             src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
@@ -132,6 +137,29 @@ gemvstep: tools/q35step.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o tools/q35step tools/q35step.c \
 		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
 
+# tools/h3vprobe runs one MiniMax-H3 clip without the HTTP server, which is the
+# only way to see which stage is wrong: the endpoint reports a job state, not a
+# tensor. CWICK_H3V_STEPS=1 makes a wiring check cost one sampling step.
+h3vprobe: tools/h3vprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/h3vprobe tools/h3vprobe.c \
+		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
+
+# tools/h3vencprobe encodes one RGB frame with the visual VAE encoder and dumps
+# the latent, so the first-frame conditioning path can be checked in isolation.
+h3vencprobe: tools/h3vencprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/h3vencprobe tools/h3vencprobe.c \
+		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
+
+# Muxer-only regression: synthetic pixels and PCM, no checkpoint and no DiT.
+h3vmuxprobe: tools/h3vmuxprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/h3vmuxprobe tools/h3vmuxprobe.c \
+		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
+
+# Compile the video shader and compare its kernels with CPU loops, no weights.
+h3vgpuprobe: tools/h3vgpuprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/h3vgpuprobe tools/h3vgpuprobe.c \
+		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
+
 # Read the MiniMax-M3.1-Flash quantizer constants out of the shards and print
 # what a decoded weight looks like (see the header comment in the source).
 mmprobe: tools/mm_probe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
@@ -176,9 +204,10 @@ jevprobe: tools/jevprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
 clean:
 	rm -f cwick tests/test_cwick $(EMBED) tools/pf8probe tools/ds_gemvbench
 	rm -f tools/ds_run tools/ds_layertest tools/mm_decodeprobe tools/jevprobe
+	rm -f tools/h3vprobe tools/h3vencprobe tools/h3vmuxprobe tools/h3vgpuprobe
 	rm -rf /tmp/cwick-test-*
 
-.PHONY: test clean probe bench layercheck mmdecodeprobe jevprobe
+.PHONY: test clean probe h3vprobe h3vencprobe h3vmuxprobe h3vgpuprobe bench layercheck mmdecodeprobe jevprobe
 
 # Drive the MiniMax-M3.1-Flash port on its own (see the header in the source).
 # bf16/fp16 dot-product throughput, one thread. Needs -march because bf16 is an

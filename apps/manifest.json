@@ -24,13 +24,13 @@
     },
     {
       "id": "imagegen",
-      "name": "H5 图像生成",
+      "name": "图像与视频生成",
       "tag": "H5",
-      "icon": "图",
-      "version": "1.0.0",
+      "icon": "影",
+      "version": "2.0.0",
       "entry": "/apps/imagegen/index.html",
-      "description": "输入 prompt，上传头像/服装/姿势参考图，一键调用本机 /v1/images/edits 与 /v1/images/generations；支持进度、在线查看与下载 PNG。本机同一时刻只运行一个模型。",
-      "meta": "图像 · 三参考图 · 进度 · 在线查看 · 下载"
+      "description": "两步工作流：第 1 步输入 prompt、上传头像/服装/姿势参考图，调用 /v1/images/edits 与 /v1/images/generations 生成图像；第 2 步把该图像连同视频 prompt 提交给 /v1/videos，轮询任务进度，在线播放并下载 MP4。提供「快速验证档」：最小画布 256×256、最短 4 秒、4 步，本机数分钟出片，用于快速验证生成效果。全程展示各阶段进度。",
+      "meta": "图像 + 视频 · 三参考图 · 图生视频 · 快速验证档(256²/4s/4步) · 进度 · 在线查看 · 下载"
     },
     {
       "id": "teachme",

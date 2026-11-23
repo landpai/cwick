@@ -2,14 +2,25 @@
 
 <p align="center"><a href="IMAGE.md">English</a> · <a href="IMAGE.zh-CN.md">简体中文</a></p>
 
-本构建提供两个 OpenAI 风格的图像 endpoint，模型为 `MiniMax-H3-Image`。
+本构建提供两个 OpenAI 风格的图像 endpoint 与一个进度 endpoint，模型为 `MiniMax-H3-Image`。
 
 ## Endpoint
 
 - `POST /v1/images/generations`（以及 `/images/generations`）—— JSON 请求，返回 `{"created":…,"data":[{"b64_json":"…"}]}`。
 - `POST /v1/images/edits`（以及 `/images/edits`）—— `multipart/form-data`，`image` 字段可重复；返回同一个响应形态。
+- `GET /v1/images/progress`（以及 `/images/progress`）—— 当前渲染的实时阶段。
 
-两个 endpoint 都在响应中额外返回一个 `cwick` 计时对象，字段为 `total_ms`、`tokenize_ms`、`text_encode_ms`、`pack_ms`、`dit_ms`、`vae_ms`、`png_ms`、`text_tokens`、`image_tokens`、`canvas_w/h`、`output_w/h`。
+两个 POST endpoint 都会按需装载图像模型：若当前没有常驻管线，首个请求会关闭交换门、
+释放当前的文本/实时模型并映射 `MiniMax-H3-Image`，与 `POST /v1/models/switch` 完全一致，
+无需手动切换。若此时并发进行模型切换，返回 503 而不是双重装载。
+
+`GET /v1/images/progress` 在生成准入之前应答，因此轮询不会排在被观察的那个长达数分钟的
+任务后面。返回
+`{"object":"image_progress","phase":P,"phase_name":"…","step":N,"steps":M,"idle":bool,"age_ms":…}`。
+阶段为 0 idle、1 tokenize、2 text_encode、3 pack、4 dit（`step`/`steps` 是 DiT 计数）、
+5 vae、6 png、7 done；静止或快照超过 10 秒时 `idle` 为 true。
+
+两个 POST endpoint 都在响应中额外返回一个 `cwick` 计时对象，字段为 `total_ms`、`tokenize_ms`、`text_encode_ms`、`pack_ms`、`dit_ms`、`vae_ms`、`png_ms`、`text_tokens`、`image_tokens`、`canvas_w/h`、`output_w/h`。
 
 参数约束：`size` 必须是 `WIDTHxHEIGHT`；`num_inference_steps` 只能省略或 6；`guidance_scale` 只能省略或 1；`negative_prompt` 不支持，会被 400 拒绝；`response_format` 只接受 `b64_json`。
 

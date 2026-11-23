@@ -1507,6 +1507,12 @@ typedef struct cwick_server_options {
      * into the server at startup, so a later hot switch can reopen the image
      * pipeline from the same directory. */
     const char *image_dir;
+    /* Directory holding the video checkpoint (--videos / CWICK_VIDEO_MODEL).
+     * The video pipeline is a 134 GiB Ref2VA download: the transformer
+     * (62 GiB) and the text encoder (62 GiB) cannot be resident together, so
+     * the pipeline maps one at a time and /v1/videos runs as an async job
+     * rather than inside the request thread. */
+    const char *video_dir;
     /* Directory holding a full-duplex speech checkpoint (--rt / --realtime, or
      * a --root whose config.json says model_type "sophon_realtime"). When set,
      * the speech pipeline is the resident model and `eng` may be NULL: the

@@ -111,6 +111,7 @@ apps/**/*.sqlite3
 /goal.md
 /sample.txt
 /output/
+/input/
 
 # Methodology notes for building this kind of runtime, kept locally: the
 # markdown is long-lived reference material for whoever works on the engine,

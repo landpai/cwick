@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>H5 图像生成 · cwick app</title>
+<title>图像与视频生成 · cwick app</title>
 <link rel="stylesheet" href="/apps/imagegen/app.css">
 </head>
 <body>
@@ -13,124 +13,282 @@
   <header class="head">
     <a class="back" href="/#apps" target="_top">← cwick</a>
     <div class="title">
-      <h1>H5 图像生成 <span>STUDIO</span></h1>
-      <p id="status">调用本机两个图像接口 · 单模型运行 · 进度/预览/下载</p>
+      <h1>图像与视频生成 <span>STUDIO</span></h1>
+      <p id="status">两步工作流：先生成图像，再用它生成视频 · 进度 / 在线查看 / 下载</p>
     </div>
     <div class="head-actions">
       <button id="share" class="btn" type="button">分享 / 二维码</button>
     </div>
   </header>
 
-  <main class="grid">
+  <nav class="stepper" role="tablist" aria-label="工作流步骤">
+    <button class="step on" data-step="1" role="tab" aria-selected="true">
+      <span class="step-n">1</span><span class="step-t">生成图像<small>/v1/images/edits · generations</small></span>
+    </button>
+    <span class="step-line"></span>
+    <button class="step" data-step="2" role="tab" aria-selected="false">
+      <span class="step-n">2</span><span class="step-t">生成视频<small>/v1/videos · 图生视频</small></span>
+    </button>
+  </nav>
 
-    <!-- left: compose -->
-    <section class="compose panel">
-      <div class="panel-head">
-        <h2>创作台</h2>
-        <span class="pill" id="modelPill">图像模型检测中…</span>
-      </div>
+  <!-- ============================ STEP 1 : IMAGE ============================ -->
+  <section class="stage" id="stage1">
+    <main class="grid">
 
-      <div class="mode-switch" role="tablist" aria-label="接口模式">
-        <button class="mode on" data-mode="edit" role="tab" aria-selected="true">参考图编辑 · /v1/images/edits</button>
-        <button class="mode" data-mode="gen" role="tab" aria-selected="false">纯文生图 · /v1/images/generations</button>
-      </div>
-
-      <label class="field">
-        <span class="lbl">提示词 <b>prompt</b></span>
-        <textarea id="prompt" rows="5" placeholder="例：全身人像，3:4 竖构图，干净背景，柔和影棚光，写实摄影质感…">全身人像，3:4 竖构图，全身入镜，干净简洁的背景，柔和影棚光，写实摄影质感。人物的脸部以第一张参考图为唯一依据，五官、脸型、骨相、发型保持一致，是同一个人。整套服装参考第二张图，保留单品、配色、材质与配饰细节。姿态参考第三张图的机位与自然站姿，四肢自然、手指正常、不穿模。画面中不要出现任何文字、水印或多余人物。</textarea>
-      </label>
-
-      <div class="refs" id="refs">
-        <div class="ref" data-slot="face">
-          <label class="drop">
-            <input type="file" accept="image/*" data-input="face">
-            <span class="thumb" data-thumb="face"><i>脸</i></span>
-            <span class="ref-meta"><b>脸 / 头像</b><small data-name="face">未选择</small></span>
-            <span class="ref-tag">identity</span>
-          </label>
+      <section class="compose panel">
+        <div class="panel-head">
+          <h2>创作台 · 图像</h2>
+          <span class="pill" id="modelPill">图像模型检测中…</span>
         </div>
-        <div class="ref" data-slot="outfit">
-          <label class="drop">
-            <input type="file" accept="image/*" data-input="outfit">
-            <span class="thumb" data-thumb="outfit"><i>装</i></span>
-            <span class="ref-meta"><b>服装</b><small data-name="outfit">未选择</small></span>
-            <span class="ref-tag">outfit</span>
-          </label>
-        </div>
-        <div class="ref" data-slot="pose">
-          <label class="drop">
-            <input type="file" accept="image/*" data-input="pose">
-            <span class="thumb" data-thumb="pose"><i>姿</i></span>
-            <span class="ref-meta"><b>姿势</b><small data-name="pose">未选择</small></span>
-            <span class="ref-tag">pose</span>
-          </label>
-        </div>
-      </div>
-      <p class="hint" id="refHint">编辑模式至少上传一张参考图（脸/服装/姿势任意组合）；三者都传效果最佳。</p>
 
-      <div class="opts">
-        <label class="field small">
-          <span class="lbl">尺寸 <b>size</b></span>
-          <select id="size">
-            <option value="1536x2048" selected>1536 × 2048（3:4 竖版）</option>
-            <option value="1024x1024">1024 × 1024（方形）</option>
-            <option value="2048x1536">2048 × 1536（4:3 横版）</option>
-            <option value="1024x1536">1024 × 1536（2:3 竖版）</option>
-          </select>
+        <div class="mode-switch" role="tablist" aria-label="接口模式">
+          <button class="mode on" data-mode="edit" role="tab" aria-selected="true">参考图编辑 · /v1/images/edits</button>
+          <button class="mode" data-mode="gen" role="tab" aria-selected="false">纯文生图 · /v1/images/generations</button>
+        </div>
+
+        <label class="field">
+          <span class="lbl">图像提示词 <b>prompt</b></span>
+          <textarea id="prompt" rows="5" placeholder="例：全身人像，3:4 竖构图，干净背景，柔和影棚光，写实摄影质感…">全身人像，3:4 竖构图，全身入镜，干净简洁的背景，柔和影棚光，写实摄影质感。人物的脸部以第一张参考图为唯一依据，五官、脸型、骨相、发型保持一致，是同一个人。整套服装参考第二张图，保留单品、配色、材质与配饰细节。姿态参考第三张图的机位与自然站姿，四肢自然、手指正常、不穿模。画面中不要出现任何文字、水印或多余人物。</textarea>
         </label>
-        <label class="field small">
-          <span class="lbl">随机种子 <b>seed</b></span>
-          <input type="number" id="seed" value="42" min="0" step="1">
+
+        <div class="refs" id="refs">
+          <div class="ref" data-slot="face">
+            <label class="drop">
+              <input type="file" accept="image/*" data-input="face">
+              <span class="thumb" data-thumb="face"><i>脸</i></span>
+              <span class="ref-meta"><b>脸 / 头像</b><small data-name="face">未选择</small></span>
+              <span class="ref-tag">identity</span>
+            </label>
+          </div>
+          <div class="ref" data-slot="outfit">
+            <label class="drop">
+              <input type="file" accept="image/*" data-input="outfit">
+              <span class="thumb" data-thumb="outfit"><i>装</i></span>
+              <span class="ref-meta"><b>服装</b><small data-name="outfit">未选择</small></span>
+              <span class="ref-tag">outfit</span>
+            </label>
+          </div>
+          <div class="ref" data-slot="pose">
+            <label class="drop">
+              <input type="file" accept="image/*" data-input="pose">
+              <span class="thumb" data-thumb="pose"><i>姿</i></span>
+              <span class="ref-meta"><b>姿势</b><small data-name="pose">未选择</small></span>
+              <span class="ref-tag">pose</span>
+            </label>
+          </div>
+        </div>
+        <p class="hint" id="refHint">编辑模式至少上传一张参考图（脸/服装/姿势任意组合）；三者都传效果最佳。</p>
+
+        <div class="opts">
+          <label class="field small">
+            <span class="lbl">配对尺寸 <b>图像 size → 视频 size</b></span>
+            <select id="size">
+              <option value="verify">快速验证 · 256×256 → 256×256（1:1 · 最小画布）</option>
+              <option value="square">方形 · 1024×1024 → 1024×1024（1:1）</option>
+              <option value="portrait34" selected>竖版 · 1536×2048 → 768×1024（3:4）</option>
+              <option value="portrait23">竖版 · 1024×1536 → 768×1152（2:3）</option>
+              <option value="landscape43">横版 · 2048×1536 → 1280×960（4:3）</option>
+              <option value="landscape169">横版 · 2048×1152 → 1024×576（16:9）</option>
+              <option value="k2_169">2K 横版 · 2560×1440 → 2560×1440（16:9 · 数小时）</option>
+            </select>
+          </label>
+          <label class="field small">
+            <span class="lbl">随机种子 <b>seed</b></span>
+            <input type="number" id="seed" value="42" min="0" step="1">
+          </label>
+        </div>
+        <p class="hint pair-hint" id="pairHintImage">选中的档位同时决定第 1 步图像尺寸与第 2 步视频尺寸，两步一一对应。</p>
+
+        <div class="actions">
+          <button id="generate" class="btn primary" type="button">生成图像</button>
+          <button id="cancel" class="btn" type="button" disabled>取消等待</button>
+          <span class="cost mono" id="cost">单模型约 40 分钟 / 张</span>
+        </div>
+      </section>
+
+      <section class="result panel">
+        <div class="panel-head">
+          <h2>图像结果</h2>
+          <div class="result-actions">
+            <button id="toVideo" class="btn primary sm" type="button" disabled>用于生成视频 →</button>
+            <button id="download" class="btn" type="button" disabled>下载 PNG</button>
+            <button id="clear" class="btn" type="button">清空</button>
+          </div>
+        </div>
+
+        <div class="preview" id="preview">
+          <div class="empty" id="emptyState">
+            <div class="empty-icon">◇</div>
+            <p>生成后在这里在线查看</p>
+            <small>支持下载为 PNG · 可一键送入第二步生成视频</small>
+          </div>
+          <img id="resultImg" alt="生成结果" hidden>
+        </div>
+
+        <div class="progress" id="progress" hidden>
+          <div class="progress-head">
+            <span class="spin" id="spin"></span>
+            <b id="progressPhase">准备中…</b>
+            <span class="mono" id="elapsed">0:00</span>
+          </div>
+          <div class="bar"><div class="bar-in" id="barIn"></div></div>
+          <ul class="timeline" id="timeline"></ul>
+          <p class="progress-note" id="progressNote">图像生成约需 40 分钟，同步返回；关闭页面不会中断服务端计算，但本页不再显示结果。</p>
+        </div>
+
+        <div class="history">
+          <div class="panel-head small-head">
+            <h3>图像记录</h3>
+            <button id="clearHistory" class="link" type="button">清除</button>
+          </div>
+          <div id="historyList" class="history-list"><p class="muted small">还没有生成记录。</p></div>
+        </div>
+      </section>
+
+    </main>
+  </section>
+
+  <!-- ============================ STEP 2 : VIDEO ============================ -->
+  <section class="stage" id="stage2" hidden>
+    <main class="grid">
+
+      <section class="compose panel">
+        <div class="panel-head">
+          <h2>创作台 · 视频</h2>
+          <span class="pill" id="videoPill">视频模型检测中…</span>
+        </div>
+
+        <div class="source-box" id="sourceBox">
+          <div class="source-empty" id="sourceEmpty">
+            <div class="empty-icon">▢</div>
+            <p>还没有源图</p>
+            <small>回到第 1 步生成图像后点「用于生成视频」，或直接上传一张图片</small>
+          </div>
+          <img id="sourceImg" alt="源图" hidden>
+          <div class="source-meta" id="sourceMeta" hidden>
+            <b id="sourceName">源图</b>
+            <small id="sourcePrompt"></small>
+          </div>
+        </div>
+        <label class="drop-inline" for="sourceFile">
+          <input type="file" accept="image/*" id="sourceFile">
+          <span class="btn sm">上传 / 更换源图</span>
         </label>
-      </div>
 
-      <div class="actions">
-        <button id="generate" class="btn primary" type="button">生成图像</button>
-        <button id="cancel" class="btn" type="button" disabled>取消等待</button>
-        <span class="cost mono" id="cost">单模型约 40 分钟 / 张</span>
-      </div>
-    </section>
+        <label class="field">
+          <span class="lbl">视频提示词 <b>prompt</b></span>
+          <textarea id="vprompt" rows="4" placeholder="例：镜头缓慢推进，人物微笑转身，头发随微风飘动，光影自然流动，写实电影质感…">镜头缓慢推进，人物自然微笑并轻轻转身，头发随微风飘动，背景光影柔和流动，写实电影质感，画面稳定无抖动。</textarea>
+        </label>
 
-    <!-- right: result + progress -->
-    <section class="result panel">
-      <div class="panel-head">
-        <h2>结果</h2>
-        <div class="result-actions">
-          <button id="download" class="btn" type="button" disabled>下载 PNG</button>
-          <button id="clear" class="btn" type="button">清空</button>
+        <label class="check">
+          <input type="checkbox" id="useRef" checked>
+          <span>把源图作为参考提交给 /v1/videos（image 字段 · 默认 Ref2VA）</span>
+        </label>
+        <p class="hint" id="videoHint">源图以 base64 随请求提交。视频接口默认用 Ref2VA 工作流的图像参考：服务端把它作为一张视觉图编入文本条件（Picture 1），连同视频提示词一起指导生成，不覆盖首帧 latent。可用 CWICK_H3V_REF_PRESENT=0 回退旧条件布局。</p>
+
+        <div class="fastbar">
+          <button id="fastVerify" class="btn sm" type="button">快速验证档</button>
+          <span class="fast-note" id="fastNote">一键设为最小画布 256×256 · 最短 4 秒 · 4 步，本机数分钟出片，用于快速验证生成效果</span>
         </div>
-      </div>
 
-      <div class="preview" id="preview">
-        <div class="empty" id="emptyState">
-          <div class="empty-icon">◇</div>
-          <p>生成后在这里在线查看</p>
-          <small>支持下载为 PNG · 历史记录见下方</small>
+        <div class="opts">
+          <label class="field small">
+            <span class="lbl">尺寸 <b>size</b></span>
+            <select id="vsize">
+              <optgroup label="与步骤 1 配对（同宽高比）">
+                <option value="256x256">配对 · 256×256 ← 图 256×256（最小画布）</option>
+                <option value="1024x1024">配对 · 1024×1024 ← 图 1024×1024（1:1）</option>
+                <option value="768x1024">配对 · 768×1024 ← 图 1536×2048（3:4）</option>
+                <option value="768x1152">配对 · 768×1152 ← 图 1024×1536（2:3）</option>
+                <option value="1280x960">配对 · 1280×960 ← 图 2048×1536（4:3）</option>
+                <option value="1024x576">配对 · 1024×576 ← 图 2048×1152（16:9）</option>
+                <option value="2560x1440">配对 · 2560×1440 ← 图 2560×1440（2K · 数小时）</option>
+              </optgroup>
+              <optgroup label="扩展画布（不与步骤 1 配对）">
+                <option value="320x320">320 × 320（10 万像素）</option>
+                <option value="512x512">512 × 512（开发验证 · 26 万像素）</option>
+                <option value="960x544">960 × 544（Fast 16:9 · 52 万像素）</option>
+                <option value="544x960">544 × 960（Fast 9:16 · 52 万像素）</option>
+                <option value="768x768">768 × 768（方形 · 59 万像素）</option>
+                <option value="1024x768">1024 × 768（4:3 · 79 万像素）</option>
+                <option value="1280x720">1280 × 720（横版 · 92 万像素）</option>
+                <option value="960x960">960 × 960（方形 · 92 万像素）</option>
+                <option value="720x1280">720 × 1280（竖版 · 92 万像素）</option>
+                <option value="1600x900">1600 × 900（HD+ · 144 万像素）</option>
+                <option value="1920x1080">1920 × 1080（1080p · 207 万像素）</option>
+              </optgroup>
+            </select>
+          </label>
+          <label class="field small">
+            <span class="lbl">时长 <b>seconds</b></span>
+            <select id="vseconds">
+              <option value="4" selected>4 秒（最短 · 102 帧）</option>
+              <option value="8">8 秒</option>
+              <option value="12">12 秒</option>
+            </select>
+          </label>
         </div>
-        <img id="resultImg" alt="生成结果" hidden>
-      </div>
-
-      <div class="progress" id="progress" hidden>
-        <div class="progress-head">
-          <span class="spin" id="spin"></span>
-          <b id="progressPhase">准备中…</b>
-          <span class="mono" id="elapsed">0:00</span>
+        <p class="hint pair-hint" id="pairHintVideo">当前视频尺寸由第 1 步档位决定；选择「扩展画布」会解除配对。</p>
+        <div class="opts steps-opts">
+          <label class="field small">
+            <span class="lbl">采样步数 <b>steps</b></span>
+            <input type="number" id="vsteps" value="30" min="1" max="30" step="1">
+          </label>
+          <label class="field small">
+            <span class="lbl">随机种子 <b>seed</b></span>
+            <input type="number" id="vseed" value="42" min="0" step="1">
+          </label>
         </div>
-        <div class="bar"><div class="bar-in" id="barIn"></div></div>
-        <ul class="timeline" id="timeline"></ul>
-        <p class="progress-note" id="progressNote">图像生成约需 40 分钟，请求以流式无关的同步方式返回；关闭页面不会中断服务端计算，但本页不再显示结果。</p>
-      </div>
+        <p class="hint" id="stepsHint">步数越小越快、细节越粗略：30 步是完整质量，4 步用于本机快速验证。服务端把步数限制在 1–30；留空或 0 用默认值。</p>
+        <p class="hint" id="sizeHint">尺寸每轴 256–2560（上限为 2K，低于 4K）；配对档位都是 32 的整倍数，扩展档位中非对齐的尺寸由服务端向上取整到 32 的倍数；更大的请求（如 3840×2160）会被拒绝。像素越多细节越好，但 DiT 行数近似平方增长：2560×1440 全 30 步在数小时量级，先用下方「快速验证」档看效果。</p>
 
-      <div class="history">
-        <div class="panel-head small-head">
-          <h3>本次会话记录</h3>
-          <button id="clearHistory" class="link" type="button">清除</button>
+        <div class="actions">
+          <button id="vgenerate" class="btn primary" type="button">生成视频</button>
+          <button id="vcancel" class="btn" type="button" disabled>取消等待</button>
+          <span class="cost mono" id="vcost">首次请求会热切换到视频模型</span>
         </div>
-        <div id="historyList" class="history-list"><p class="muted small">还没有生成记录。</p></div>
-      </div>
-    </section>
+      </section>
 
-  </main>
+      <section class="result panel">
+        <div class="panel-head">
+          <h2>视频结果</h2>
+          <div class="result-actions">
+            <button id="vdownload" class="btn" type="button" disabled>下载 MP4</button>
+            <button id="vclear" class="btn" type="button">清空</button>
+          </div>
+        </div>
+
+        <div class="preview" id="vpreview">
+          <div class="empty" id="vempty">
+            <div class="empty-icon">▷</div>
+            <p>生成后在这里在线播放</p>
+            <small>支持下载为 MP4（含音频）· 任务进度见下方</small>
+          </div>
+          <video id="resultVideo" controls playsinline hidden></video>
+        </div>
+
+        <div class="progress" id="vprogress" hidden>
+          <div class="progress-head">
+            <span class="spin" id="vspin"></span>
+            <b id="vprogressPhase">准备中…</b>
+            <span class="mono" id="velapsed">0:00</span>
+          </div>
+          <div class="bar"><div class="bar-in" id="vbarIn"></div></div>
+          <ul class="timeline" id="vtimeline"></ul>
+          <p class="progress-note" id="vprogressNote">视频以异步任务生成，可关闭页面后再回来查看；进度来自服务端 job 状态。</p>
+        </div>
+
+        <div class="history">
+          <div class="panel-head small-head">
+            <h3>视频记录</h3>
+            <button id="vclearHistory" class="link" type="button">清除</button>
+          </div>
+          <div id="vhistoryList" class="history-list"><p class="muted small">还没有生成记录。</p></div>
+        </div>
+      </section>
+
+    </main>
+  </section>
 
   <dialog id="shareDialog" class="share-dlg">
     <div class="share-box">

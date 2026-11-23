@@ -21,7 +21,7 @@ apps/
     index.html
     app.css
     app.js
-  imagegen/              # H5 图像生成
+  imagegen/              # H5 image + video studio (two steps)
     app.json
     index.html
     app.css
@@ -30,7 +30,8 @@ apps/
 
 The decision apps (tictactoe, kart) ask the model through `POST /v1/systemone`;
 `imagegen` calls the image endpoints `/v1/images/edits` and
-`/v1/images/generations` instead. The chat tab keeps using
+`/v1/images/generations` in step one, then the async `/v1/videos` job in step
+two (see the two-step section below). The chat tab keeps using
 `/v1/chat/completions`. Every request an app makes is same-origin —
 there is no configurable external endpoint. The resident model is discovered
 from `GET /v1/models` and re-discovered after a server-side switch, so the
@@ -266,3 +267,44 @@ password — which is why every share note says the first open needs it. The app
 are responsive (tested at 390 px) and do not need the main console shell when
 opened from that URL — the kart opens straight into its race because that is all
 it does.
+
+## The two-step workflow in `apps/imagegen`
+
+App 3 is a wizard with two stages in one bundle. **Step 1 — image**: a prompt
+plus up to three uploaded references (face / outfit / pose) go to
+`POST /v1/images/edits`, or a prompt alone to `POST /v1/images/generations`.
+Both are synchronous and return one `b64_json` PNG; the stage panel fills in
+the real per-phase timings from the response's `cwick` object when it arrives
+(the image endpoints have no progress stream, so before that it only shows
+elapsed time). The generated PNG stays in memory and can be downloaded or sent
+straight to step two.
+
+**Step 2 — video**: the source PNG (now from step one, or uploaded directly)
+plus a video prompt create a job with `POST /v1/videos`. The body carries the
+image as an `image` data URL; the browser first shrinks it to a 1024px JPEG so
+the request stays under the server's 8 MiB body ceiling. The panel exposes the
+canvas (`size`), duration (`seconds`) and sampling budget (`steps`) — the last
+is an optional integer the engine clamps to 1–30, defaulting to the full
+30-step schedule. A one-click **quick-verify preset** sets 256x256 / 4 s / 4
+steps: the smallest canvas and shortest clip the server accepts, at a step
+count that renders in minutes on this machine, for checking that the pipeline
+produces a clean moving image before committing to a full-quality render. The app polls
+`GET /v1/videos/{id}` every two seconds — the progress bar follows the server's
+real `progress` and `phase`, not a local timer — and on `completed` streams
+`GET /v1/videos/{id}/content` into a `<video>` element for inline playback and
+download. `GET /v1/models` decides which pills read "ready": an image model is
+required for step one, while the video model is opened on demand by the first
+POST and therefore shown as "loads on first generation" until then.
+
+**About image-to-video.** The source frame really conditions the result. The
+server decodes the uploaded image and the visual VAE encoder maps it to a
+24-channel latent, which is written into latent step 0 and held clean across
+every sampling step while the DiT attends to it. The detail view
+reports `reference_image.conditioning = "first_frame"` on that path, and only
+falls back to `"text_only"` if the image cannot be decoded.
+
+Both histories (`images`, `videos` keys) live in the app's own sqlite through
+`/v1/apps/imagegen/state`, with localStorage as the fallback. A completed mp4
+is only retained for the lifetime of its server job slot — replaying an old
+video row after enough later jobs have run returns 409, which the app reports
+instead of showing a broken player.

@@ -142,6 +142,12 @@ void cwick_metrics_prefix_query(bool hit, int64_t reused);
  * cache as it is *now* rather than as it was at some earlier step. */
 void cwick_metrics_set_stream(const cwick_stream *s);
 void cwick_metrics_set_memory_ceiling(uint64_t bytes);
+/* Per-model residency decision (the video pipeline reports its heaviest
+ * stage here). Exposed so a scraper can confirm the wired bytes actually
+ * stayed under the ceiling, not just trust the startup log. */
+void cwick_metrics_set_model_residency(uint64_t weight_bytes,
+                                       uint64_t resident_bytes,
+                                       uint64_t target_bytes, int wired);
 void cwick_metrics_set_context_window(int64_t tokens);
 /* Number of requests currently holding the generation slot (0 or 1 for
  * cwick's single-turn engine, >1 the moment it batches). */
@@ -174,6 +180,33 @@ typedef struct {
 /* A WebSocket session was accepted. */
 void cwick_metrics_rt_session(void);
 void cwick_metrics_rt_observe(const cwick_rt_turn_metrics *m);
+
+/* ------------------------------------------------------------------ */
+/* Video generation jobs                                               */
+/* ------------------------------------------------------------------ */
+/* One completed /v1/videos job. Stage seconds come from the same
+ * monotonic clock as the job detail's `cwick` object, so the counters here
+ * reconcile with what the client sees. `encode_s` is the reference-image
+ * VAE pass and is zero for text-only jobs. */
+typedef struct {
+    double total_s, text_s, pack_s, encode_s, dit_s, vae_s, audio_vae_s,
+           mux_s, load_s;
+    int64_t frames, bytes, steps, video_tokens, audio_tokens;
+    bool first_frame;
+    bool success;
+    /* A job that muxed a file whose generated latent was still white noise.
+     * Reported separately from success: the mp4 is well-formed and the HTTP
+     * status was 200, but the frames are not a usable result. */
+    bool suspect_noise;
+} cwick_video_job_metrics;
+
+/* A job entered the DiT phase. Publishes the step denominator so a scrape
+ * during a long sample can tell progress from a hang; jobs_total is counted
+ * at completion so a failure before the sampler still balances. */
+void cwick_metrics_video_start(int steps_done, int steps_total);
+void cwick_metrics_video_step(int steps_done, int steps_total);
+/* Every job that reached the muxer, successful or not. */
+void cwick_metrics_video_observe(const cwick_video_job_metrics *m);
 
 /* ------------------------------------------------------------------ */
 /* Exposition                                                          */

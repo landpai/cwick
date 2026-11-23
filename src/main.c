@@ -375,6 +375,7 @@ static int run_serve(const char *root, const char *host, int port,
                      int64_t max_tokens, int64_t max_context,
                      const char *prefix_cache_dir, int64_t prefix_cache_gib,
                      const char *image_dir,
+                     const char *video_dir,
                      const char *rt_dir,
                      const char *spine, int verbose, int trace, int web,
                      int jev, const char *password,
@@ -462,6 +463,7 @@ static int run_serve(const char *root, const char *host, int port,
     sopts.prefix_cache_dir = prefix_cache_dir;
     sopts.prefix_cache_gib = prefix_cache_gib;
     sopts.image_dir = image_dir;
+    sopts.video_dir = video_dir;
     sopts.realtime_dir = realtime_dir;
     sopts.startup_root = speech ? NULL : root;
     sopts.verbose = verbose;
@@ -1159,7 +1161,7 @@ static void usage(void) {
            "                                  [--context N] [--backend metal|cpu]\n"
            "                                  [--verbose] [--trace]\n"
            "  cwick serve --root DIR [--host H] [--port P] [--max-tokens N]\n"
-           "                        [--context N] [--spine bf16|int8]\n"
+           "                        [--videos DIR] [--context N] [--spine bf16|int8]\n"
            "                        [--warmup N]\n"
            "                        [--backend metal|cpu] [--verbose] [--trace]\n"
            "                        [--mem-fraction PCT] [--max-memory GiB]\n"
@@ -1257,6 +1259,18 @@ static void usage(void) {
            "                  required for those; a key cannot mint keys).\n"
            "                  CWICK_API_KEY=SECRET adopts a secret you chose\n"
            "                  instead of generating one.\n"
+           "\n"
+           "video generation:\n"
+           "  --videos DIR   load the MiniMax-H3 video checkpoint under DIR and\n"
+           "                 expose POST/GET /v1/videos (OpenAI videos API) plus\n"
+           "                 GET /v1/videos/{id}/content streaming the mp4.\n"
+           "                 CWICK_VIDEO_MODEL sets the same value for launchers.\n"
+           "                 /v1/videos uses the Ref2VA transformer only. The\n"
+           "                 first/last-frame partition is not probed or loaded.\n"
+           "                 The video model is switched to at runtime from\n"
+           "                 POST /v1/models/switch (id MiniMax-H3); switching\n"
+           "                 loads both VAE shards and leaves the resident text\n"
+           "                 model untouched.\n"
            "\n"
            "other local models:\n"
            "  --models-dir DIR   also scan DIR (and its immediate children) for\n"
@@ -1526,6 +1540,8 @@ int main(int argc, char **argv) {
         /* --img wins over the environment variable so one launcher can serve
          * several checkpoints without editing its environment per model. */
         const char *image_dir = getenv("CWICK_IMAGE_MODEL");
+        /* --videos wins over the environment variable, same rationale. */
+        const char *video_dir = getenv("CWICK_VIDEO_MODEL");
         /* --rt wins over the environment variable, same rationale as --img. */
         const char *rt_dir = getenv("CWICK_REALTIME_MODEL");
         bool verbose = false, trace = false;
@@ -1591,6 +1607,9 @@ int main(int argc, char **argv) {
                 prefix_cache_dir = need_arg(&i, argc, argv, "--prefix-cache-dir");
             else if (strcmp(argv[i], "--img") == 0)
                 image_dir = need_arg(&i, argc, argv, "--img");
+            else if (strcmp(argv[i], "--videos") == 0 ||
+                     strcmp(argv[i], "--video") == 0)
+                video_dir = need_arg(&i, argc, argv, "--videos");
             else if (strcmp(argv[i], "--rt") == 0 ||
                      strcmp(argv[i], "--realtime") == 0)
                 rt_dir = need_arg(&i, argc, argv, "--rt");
@@ -1709,7 +1728,8 @@ int main(int argc, char **argv) {
         int ran = 0;
         int rc;
         rc = run_serve(root, host, port, max_tokens, max_context,
-                       prefix_cache_dir, prefix_cache_gib, image_dir, rt_dir,
+                       prefix_cache_dir, prefix_cache_gib, image_dir, video_dir,
+                       rt_dir,
                        spine, verbose, trace, web, jev, password,
                        models_dirs, models_dirs_n, store_path,
                        api_key, api_key_secret, warmup, &ran);

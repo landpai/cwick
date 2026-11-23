@@ -134,7 +134,9 @@
       'hub.ready': '完整', 'hub.partial': '未下载完',
       'hub.unsupported': '不支持', 'hub.archMismatch': '架构未适配，不能切换',
       'hub.switchResident': '设为常驻', 'hub.switchImage': '切换到图像模型',
-      'hub.kindImage': '图像模型', 'hub.huge': '超大权重'
+      'hub.kindImage': '图像模型', 'hub.huge': '超大权重',
+      'hub.switchVideo': '切换到视频模型', 'hub.kindVideo': '视频模型',
+      'set.videoTip': '视频管线独占常驻槽位：热切换会先释放文本/语音/图像权重，因为采样阶段要映射 62 GiB  transformer'
     },
     en: {
       'doc.title': 'cwick · Local Chat',
@@ -179,7 +181,9 @@
       'hub.ready': 'Complete', 'hub.partial': 'Incomplete',
       'hub.unsupported': 'Unsupported', 'hub.archMismatch': 'No matching kernel',
       'hub.switchResident': 'Make resident', 'hub.switchImage': 'Switch to image model',
-      'hub.kindImage': 'Image model', 'hub.huge': 'Huge weights'
+      'hub.kindImage': 'Image model', 'hub.huge': 'Huge weights',
+      'hub.switchVideo': 'Switch to video model', 'hub.kindVideo': 'Video model',
+      'set.videoTip': 'The video pipeline owns the resident slot: a hot switch releases the text/voice/image weights first, because sampling maps the 62 GiB transformer'
     }
   };
   function t(key) {
@@ -2906,6 +2910,7 @@
       var huge = m.bytes >= 100 * 1073741824;
       var supported = m.supported !== false;
       var image = m.kind === 'image';
+      var video = m.kind === 'video';
       var served = m.served_id || m.id;
       var why = m.unsupported_reason || t('hub.archMismatch');
       return '<div class="hub-card ' + (ready ? 'is-ready' : 'is-partial') + '">' +
@@ -2914,6 +2919,8 @@
                  : '<span class="hub-badge warn">' + t('hub.partial') + '</span>') +
           (image ? '<span class="hub-badge info" title="' + esc(t('set.imageTip')) +
             '">' + t('hub.kindImage') + '</span>' : '') +
+          (video ? '<span class="hub-badge info" title="' + esc(t('set.videoTip')) +
+            '">' + t('hub.kindVideo') + '</span>' : '') +
           (ready && !supported
             ? '<span class="hub-badge warn" title="' + esc(why) + '">' +
               t('hub.unsupported') + '</span>' : '') +
@@ -2930,8 +2937,10 @@
         '<div class="hub-actions">' +
           (ready && supported
             ? '<button class="min-btn accent" type="button" data-hub-switch="' +
-              esc(served) + '"' + (image ? ' title="' + esc(t('set.imageTip')) + '"' : '') +
-              '>' + t(image ? 'hub.switchImage' : 'hub.switchResident') + '</button>'
+              esc(served) + '"' + (image ? ' title="' + esc(t('set.imageTip')) + '"' :
+                video ? ' title="' + esc(t('set.videoTip')) + '"' : '') +
+              '>' + t(image ? 'hub.switchImage' : video ? 'hub.switchVideo' :
+                'hub.switchResident') + '</button>'
             : (ready ? '<span class="hub-badge info" title="' + esc(why) +
                 '">' + t('hub.archMismatch') + '</span>' : '')) +
           '<button class="min-btn danger" type="button" data-hub-delete="' +

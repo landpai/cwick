@@ -39,6 +39,37 @@ OpenAI API.
   repeatable `image` parts; same response shape. Both require a configured
   image model (`--img DIR` or `CWICK_IMAGE_MODEL`, or an on-demand switch);
   see `docs/IMAGE.md`.
+- `GET /v1/images/progress` (and `/images/progress`) — live phase of the
+  image render in flight; answered before admission so a poll never queues
+  behind the job it watches. See `docs/IMAGE.md`.
+- `POST /v1/videos` (and `/videos`) — async video generation; requires
+  `--videos DIR`. JSON `prompt`, `size`, `seconds`, optional `image` (base64 or
+  data URL, reference-image conditioning) and optional `variant` (only
+  `"Ref2VA"` is available; case-insensitive; alias `model_variant`). Each
+  canvas axis is 256..2560 and a multiple of 32 (2K such as 2560x1440 is
+  admitted; 4K is refused); DiT rows grow roughly quadratically with the
+  canvas, so a 2K full 30-step job takes hours. An
+  optional `steps` (integer 1–30, default 0 = the 30-step schedule) sets the
+  flow-matching budget for that job; small values (2–4) give a minutes-long
+  verification clip at lower detail. The endpoint uses the omni-reference
+  transformer: the first/last-frame partition is not probed, loaded or
+  accepted, so a `variant` naming it is rejected with HTTP 400. The VAE and
+  text encoder stay mapped. Returns a job with an `id` (the job object also carries the requested
+  `steps`). `GET /v1/videos/{id}` polls it
+  (`status`, `progress`, the canonical `variant`, `reference_image` and a
+  `cwick` timing object once done), and `GET /v1/videos/{id}/content` streams
+  the mp4. The finished job's `cwick` object carries `spatial_corr`, `snr_db`
+  and `suspect_noise`: a low `spatial_corr` means the generated frames are still
+  white noise even though a valid mp4 was muxed. The matching
+  `cwick:video_suspect_noise_jobs_total` counter is exposed on `/v1/metrics`.
+  Video weight stages are wired resident when they fit under the memory ceiling
+  (`--mem-fraction`, default 80% of RAM) and no-swap is active; an over-budget
+  stage stays a lazy SSD-backed mapping. `CWICK_H3V_WIRE=0/1` overrides this,
+  and `cwick:model_resident_bytes` / `cwick:model_wired` report the decision.
+  The reference image is part of the text presentation by default;
+  `CWICK_H3V_REF_PRESENT=0` restores the bare prompt and
+  `CWICK_H3V_REF_EDGE=N` encodes the image at its own short edge rather than the
+  generated canvas. See `docs/DECISIONS.md` §94, §97, §101–§103.
 - `GET /v1/realtime?model=Sophon-Realtime-32B-Tag` — WebSocket upgrade for
   full-duplex speech; requires `--rt DIR` and an active switch to that id.
   Audio goes in as base64 PCM16 `input_audio_buffer.append` events and comes

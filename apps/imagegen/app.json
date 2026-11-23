@@ -1,8 +1,8 @@
 {
   "id": "imagegen",
-  "name": "H5 图像生成",
-  "version": "1.0.0",
+  "name": "图像与视频生成",
+  "version": "2.0.0",
   "entry": "index.html",
-  "description": "H5 image studio: prompt + face/outfit/pose references -> /v1/images/generations or /v1/images/edits, with staged progress, inline preview and download.",
-  "storage": "server sqlite via /v1/apps/imagegen/state (job history), localStorage:cwick.imagegen.v1 fallback"
+  "description": "Two-step studio: prompt + face/outfit/pose references -> /v1/images/edits or /v1/images/generations, then the generated image + a video prompt -> the async /v1/videos job (Ref2VA). One shared size-pair table binds step 1's image canvas to an aspect-ratio-matched step 2 video canvas; optional unpaired video sizes are marked explicitly. A quick-verify pair sets both canvases to 256x256 with the shortest clip (4s) and 4 steps so a clip renders in minutes on this machine. Staged progress, inline preview/playback and PNG/MP4 download.",
+  "storage": "server sqlite via /v1/apps/imagegen/state (image + video history), localStorage:cwick.imagegen.v2 fallback"
 }

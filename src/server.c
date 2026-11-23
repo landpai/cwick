@@ -34,6 +34,7 @@
 #include "jev.h"
 #include "h3.h"
 #include "h3_gpu.h"
+#include "h3v.h"
 #include "hub.h"
 #include "rt_realtime.h"
 #include "ws.h"
@@ -107,6 +108,49 @@ static bool srv_log_verbose_env(void) {
  * extra KV and the extra cache pressure stop paying. */
 #define CWICK_GEN_SLOTS 3
 
+/* ---- video jobs -------------------------------------------------------
+ * One clip is 30 sampling steps over a 62 GiB transformer, so a request is
+ * an async job: POST creates it, GET polls it, GET .../content streams the
+ * mp4. The table is small and fixed; a ninth concurrent clip is refused with
+ * 429 rather than queued, because each job holds the only video pipeline.
+ */
+#define CWICK_VIDEO_JOBS 8
+typedef struct {
+    bool used;
+    char id[48];
+    char *prompt;
+    int width, height, seconds;
+    int steps;                /* 0 = engine default; 1..30 = per-job smoke run */
+    uint64_t seed;
+    char status[16];          /* queued / in_progress / completed / failed */
+    char phase[24];
+    double progress;
+    int steps_done, steps_total;
+    unsigned char *mp4;
+    size_t mp4_len;
+    char error[256];
+    char variant[24];         /* canonical transformer variant that rendered this job */
+    int64_t created;
+    int64_t completed;
+    h3v_timing tim;
+    bool has_tim;
+    /* Optional first-frame / reference image submitted by a caller (the H5
+     * studio hands the image it generated in step one to step two). The bytes
+     * are decoded, VAE-encoded and held as the clean t=0 latent through every
+     * sampling step, so the reference really conditions the clip. `ref_encoded`
+     * records whether that path succeeded, for the detail view. */
+    unsigned char *ref_image;
+    size_t ref_image_len;
+    char ref_mime[24];
+    bool ref_encoded;
+} video_job;
+
+typedef struct {
+    pthread_mutex_t lock;
+    video_job jobs[CWICK_VIDEO_JOBS];
+    uint64_t next_seq;
+} video_book;
+
 typedef struct {
     /* Slot 0 owns the weight spine; the others borrow it (see
      * cwick_engine_options.shared_spine) so the 15.46 GiB mlocked spine is
@@ -117,6 +161,16 @@ typedef struct {
     /* Copy of --img / CWICK_IMAGE_MODEL. Kept so a settings switch can load
      * the image pipeline on demand without restarting the process. */
     char image_dir[CWICK_MODEL_ROOT_MAX];
+    /* Video pipeline, NULL unless a MiniMax-H3 Ref2VA download is
+     * resident. Jobs run on their own thread because one clip is minutes to
+     * tens of minutes; the HTTP request only creates and polls them. */
+    h3v_model *vid;
+    char video_dir[CWICK_MODEL_ROOT_MAX];
+    video_book vbook;
+    /* How many video clips are being rendered. A switch refuses while this is
+     * non-zero: freeing the transformer mid-clip would abort a job the client
+     * is already polling. Guarded by gen_lock, like img_busy. */
+    int vid_busy;
     /* The full-duplex speech pipeline, NULL unless a sophon_realtime checkpoint
      * is resident. It is the third occupant of the one-model slot: thinker,
      * ear and talker are one model and are loaded and freed together. */
@@ -5784,6 +5838,9 @@ static void srv_publish_nontext_gauges(server_ctx *srv) {
     } else if (srv->h3) {
         mi.model = H3_SERVED_ID;
         mi.spine = "bf16";
+    } else if (srv->vid) {
+        mi.model = H3V_SERVED_ID;
+        mi.spine = "bf16";
     } else {
         return;
     }
@@ -5807,6 +5864,26 @@ static char *image_model_entry_json(server_ctx *srv) {
                   "\"loaded\":%s,\"supported\":true,\"kind\":\"image\"}}",
                   jid, (long long)now_unix(), jroot,
                   srv->h3 ? "true" : "false");
+    free(jid);
+    free(jroot);
+    return b.p;
+}
+
+/* The video checkpoint is a second pipeline with its own weights and its own
+ * endpoint, so it is advertised next to the image one, tagged by kind. A
+ * client that only speaks the chat dialects sees `kind` and skips it. */
+static char *video_model_entry_json(server_ctx *srv) {
+    if (!srv->video_dir[0]) return NULL;
+    char *jid = json_str_alloc(H3V_SERVED_ID);
+    char *jroot = json_str_alloc(srv->video_dir);
+    srv_buf b = {0};
+    if (jid && jroot)
+        sbuf_putf(&b,
+                  "{\"id\":%s,\"object\":\"model\",\"created\":%lld,"
+                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,"
+                  "\"loaded\":%s,\"supported\":true,\"kind\":\"video\"}}",
+                  jid, (long long)now_unix(), jroot,
+                  srv->vid ? "true" : "false");
     free(jid);
     free(jroot);
     return b.p;
@@ -5843,10 +5920,18 @@ static char *models_json(server_ctx *srv) {
         free(jroot);
     }
     char *img = image_model_entry_json(srv);
+    bool any = srv->catalog.n > 0;
     if (img) {
-        if (srv->catalog.n) sbuf_puts(&b, ",");
+        if (any) sbuf_puts(&b, ",");
         sbuf_puts(&b, img);
         free(img);
+        any = true;
+    }
+    char *vid = video_model_entry_json(srv);
+    if (vid) {
+        if (any) sbuf_puts(&b, ",");
+        sbuf_puts(&b, vid);
+        free(vid);
     }
     pthread_mutex_unlock(&srv->gen_lock);
     sbuf_puts(&b, "]}");
@@ -5865,6 +5950,11 @@ static char *model_json_one(server_ctx *srv, const char *id) {
         char *img = image_model_entry_json(srv);
         pthread_mutex_unlock(&srv->gen_lock);
         return img;
+    }
+    if (strcmp(id, H3V_SERVED_ID) == 0 && srv->video_dir[0]) {
+        char *vid = video_model_entry_json(srv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return vid;
     }
     const cwick_model_entry *cur = resident_entry(srv);
     const cwick_model_entry *hit = NULL;
@@ -5925,6 +6015,7 @@ static char *config_json(server_ctx *srv) {
     char *jlib = json_str_alloc(srv->hub ? cwick_hub_root(srv->hub) : "");
     char *jcat = json_str_alloc(srv->hub ? cwick_hub_endpoint(srv->hub) : "");
     char *jimg = json_str_alloc(srv->image_dir);
+    char *jvid = json_str_alloc(srv->video_dir);
     srv_buf b = {0};
     sbuf_putf(&b,
               "{\"model\":%s,\"model_root\":%s,\"host\":%s,\"port\":%d,"
@@ -5934,6 +6025,7 @@ static char *config_json(server_ctx *srv) {
               "\"web\":%s,\"verbose\":%s,\"trace\":%s,\"systemone\":%s,"
               "\"prefix_cache\":{\"enabled\":%s,\"block_tokens\":%lld},"
               "\"image_model\":{\"dir\":%s,\"loaded\":%s},"
+              "\"video_model\":{\"dir\":%s,\"loaded\":%s},"
               "\"log_capture\":%s,\"log_retained\":%zu,"
               "\"model_library\":%s,\"model_catalog\":%s,"
               "\"models_dirs\":[",
@@ -5946,9 +6038,11 @@ static char *config_json(server_ctx *srv) {
               srv->jev ? "true" : "false",
               srv->pfx ? "true" : "false", (long long)srv->pfx_block,
               jimg ? jimg : "\"\"", srv->h3 ? "true" : "false",
+              jvid ? jvid : "\"\"", srv->vid ? "true" : "false",
               cwick_logcap_active() ? "true" : "false", cwick_logcap_lines(),
               jlib ? jlib : "\"\"", jcat ? jcat : "\"\"");
     free(jid); free(jroot); free(jhost); free(jlib); free(jcat); free(jimg);
+    free(jvid);
     for (int i = 0; i < srv->models_dirs_n; i++) {
         char *jd = json_str_alloc(srv->models_dirs[i]);
         sbuf_putf(&b, "%s%s", i ? "," : "", jd ? jd : "\"\"");
@@ -6151,6 +6245,10 @@ static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
                  srv->img_busy);
         return false;
     }
+    if (srv->vid_busy > 0) {
+        snprintf(why, cap, "%d video clip(s) are still rendering", srv->vid_busy);
+        return false;
+    }
     if (rt_realtime_busy(srv->rt)) {
         snprintf(why, cap, "a realtime voice session is connected");
         return false;
@@ -6196,6 +6294,15 @@ static void srv_release_image_model(server_ctx *srv) {
     h3_gpu_shutdown();
     h3_model_close(srv->h3);
     srv->h3 = NULL;
+}
+
+/* The video pipeline holds both VAEs resident (10.3 GiB) and maps the 62 GiB
+ * transformer under `m->lock` while a clip samples, so the switch refuses while
+ * vid_busy is non-zero and only unmaps here once it has dropped to zero. */
+static void srv_release_video_model(server_ctx *srv) {
+    if (!srv->vid) return;
+    h3v_model_close(srv->vid);
+    srv->vid = NULL;
 }
 
 /* The speech pipeline is the third occupant of the one-model slot. Its decoder
@@ -6305,6 +6412,11 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
         CWICK_INFO("model", "releasing realtime model %s before loading %s",
                    rt_realtime_model(srv->rt), served_name(target));
         srv_release_realtime_model(srv);
+    }
+    if (srv->vid) {
+        CWICK_INFO("model", "releasing video model %s before loading %s",
+                   H3V_SERVED_ID, served_name(target));
+        srv_release_video_model(srv);
     }
 
     /* Borrowers before the owner: they borrow the owner's mmaps. */
@@ -6534,13 +6646,18 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
     srv->swapping = true;
     pthread_mutex_unlock(&srv->gen_lock);
 
-    /* One model at a time. Only after the gate is closed do we drop the text
-     * engine — the image checkpoint itself is verified below, and a failed
-     * open leaves this instance with no resident model (the generation paths
-     * already answer 503 in that state), which is preferable to keeping two
-     * 60 GiB weight banks mapped at once. */
+    /* One model at a time. Only after the gate is closed do we drop the other
+     * weight banks — the image checkpoint itself is verified below, and a
+     * failed open leaves this instance with no resident model (the generation
+     * paths already answer 503 in that state), which is preferable to keeping
+     * two 60 GiB banks mapped at once. The video pipeline is the one that was
+     * missed: its VAEs (10.3 GiB) stay resident after a clip, so stacking the
+     * image DiT on top reached ~72 GiB RSS and the next video mlock failed
+     * with EAGAIN. swap_gate_open refused while vid_busy was non-zero, so no
+     * clip is reading these shards here. */
     const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
-                                  : (srv->rt ? rt_realtime_model(srv->rt) : "(none)");
+                                  : (srv->rt ? rt_realtime_model(srv->rt)
+                                     : (srv->vid ? H3V_SERVED_ID : "(none)"));
     CWICK_INFO("model", "switching to image model %s (%s) — releasing %s first "
                         "(one model at a time)", H3_SERVED_ID, srv->image_dir, old);
     srv_release_text_model(srv);
@@ -6551,6 +6668,11 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
         CWICK_INFO("model", "releasing realtime model %s before loading %s",
                    rt_realtime_model(srv->rt), H3_SERVED_ID);
         srv_release_realtime_model(srv);
+    }
+    if (srv->vid) {
+        CWICK_INFO("model", "releasing video model %s before loading %s",
+                   H3V_SERVED_ID, H3_SERVED_ID);
+        srv_release_video_model(srv);
     }
 
     cwick_error ie;
@@ -6617,7 +6739,8 @@ static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
     pthread_mutex_unlock(&srv->gen_lock);
 
     const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
-                                  : (srv->h3 ? H3_SERVED_ID : "(none)");
+                                  : (srv->h3 ? H3_SERVED_ID
+                                     : (srv->vid ? H3V_SERVED_ID : "(none)"));
     CWICK_INFO("model", "switching to realtime model %s — releasing %s first "
                         "(one model at a time)", dir, old);
     srv_release_text_model(srv);
@@ -6625,6 +6748,14 @@ static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
         CWICK_INFO("model", "releasing image model %s before loading the "
                             "realtime model", H3_SERVED_ID);
         srv_release_image_model(srv);
+    }
+    /* Same one-model-slot rule as the image/video switches: a resident video
+     * pipeline keeps 10.3 GiB of VAEs mapped, and gate_open already refused
+     * while a clip was rendering. */
+    if (srv->vid) {
+        CWICK_INFO("model", "releasing video model %s before loading the "
+                            "realtime model", H3V_SERVED_ID);
+        srv_release_video_model(srv);
     }
 
     cwick_error re;
@@ -6653,6 +6784,109 @@ static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
              rt_realtime_model(m));
     CWICK_INFO("model", "switched to realtime model %s (%s)",
                rt_realtime_model(m), dir);
+    return 200;
+}
+
+/* Hot-load the video pipeline. Unlike the image and speech pipelines it does
+ * not evict the resident text engine: at rest it holds only the two VAEs
+ * (10.3 GiB), and the 62 GiB transformer is mapped inside a sampling loop and
+ * released before the decoders run. A clip therefore coexists with a text
+ * model, which is the point of --videos being a separate argument. */
+static int srv_switch_video(server_ctx *srv, char *msg, size_t msgcap,
+                            bool *already) {
+    if (already) *already = false;
+    if (!srv->video_dir[0] && srv->hub) {
+        char *found = cwick_hub_local_path(srv->hub, H3V_SERVED_ID);
+        if (found) {
+            int n = snprintf(srv->video_dir, sizeof(srv->video_dir), "%s", found);
+            free(found);
+            if (n < 0 || (size_t)n >= sizeof(srv->video_dir)) {
+                snprintf(msg, msgcap, "video model directory is too long");
+                srv->video_dir[0] = '\0';
+                return 400;
+            }
+            CWICK_INFO("model", "discovered video model at %s", srv->video_dir);
+        }
+    }
+    if (!srv->video_dir[0]) {
+        snprintf(msg, msgcap, "no video directory configured: pass --videos DIR, "
+                              "set CWICK_VIDEO_MODEL, or download "
+                              H3V_SERVED_ID " into the model library");
+        return 400;
+    }
+    if (srv->vid) {
+        if (already) *already = true;
+        snprintf(msg, msgcap, "video model already loaded from %s", srv->video_dir);
+        return 200;
+    }
+    char why[256];
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->swapping) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "a model swap is already in progress");
+        return 409;
+    }
+    if (!swap_gate_open(srv, why, sizeof(why))) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "cannot switch to the video model now: %s", why);
+        return 409;
+    }
+    if (srv->stop_owner && *srv->stop_owner) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "server is shutting down");
+        return 503;
+    }
+    srv->swapping = true;
+    pthread_mutex_unlock(&srv->gen_lock);
+
+    /* One model at a time. Opening the video model maps only the 10.3 GiB of
+     * VAE shards, but the DiT phase then maps the 62 GiB transformer on top —
+     * with a ~60 GiB text engine still resident that is ~134 GiB and the clip
+     * would OOM the machine. So the other weight banks go first, exactly as in
+     * the image/realtime switches. The gate above already refused while any
+     * generation, voice session or tokenizer user was active. */
+    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
+                                  : (srv->rt ? rt_realtime_model(srv->rt)
+                                     : (srv->h3 ? H3_SERVED_ID : "(none)"));
+    CWICK_INFO("model", "switching to video model %s (%s) — releasing %s first "
+                        "(one model at a time)", H3V_SERVED_ID, srv->video_dir,
+               old);
+    srv_release_text_model(srv);
+    if (srv->rt) {
+        CWICK_INFO("model", "releasing realtime model %s before loading %s",
+                   rt_realtime_model(srv->rt), H3V_SERVED_ID);
+        srv_release_realtime_model(srv);
+    }
+    if (srv->h3) {
+        CWICK_INFO("model", "releasing image model %s before loading %s",
+                   H3_SERVED_ID, H3V_SERVED_ID);
+        srv_release_image_model(srv);
+    }
+
+    cwick_error ve;
+    cwick_error_clear(&ve);
+    h3v_model *m = h3v_model_open(srv->video_dir, &ve);
+    pthread_mutex_lock(&srv->gen_lock);
+    if (!m) {
+        snprintf(msg, msgcap, "cannot load video model from %s: %s",
+                 srv->video_dir, cwick_error_message(&ve));
+        CWICK_INFO("model", "%s", msg);
+        srv->swapping = false;
+        pthread_cond_broadcast(&srv->gen_cv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return 500;
+    }
+    srv->vid = m;
+    srv->swapping = false;
+    pthread_cond_broadcast(&srv->gen_cv);
+    pthread_mutex_unlock(&srv->gen_lock);
+    srv_publish_nontext_gauges(srv);
+    snprintf(msg, msgcap, "video model loaded from %s (%s, %s layout) — "
+                          "/v1/videos is ready; text endpoints need a switch "
+                          "back", srv->video_dir, H3V_SERVED_ID,
+             h3v_model_variant(m));
+    CWICK_INFO("model", "switched to video model %s (%s)", H3V_SERVED_ID,
+               srv->video_dir);
     return 200;
 }
 
@@ -7713,11 +7947,57 @@ int h3_multipart_refs(const char *body, size_t body_len, const char *boundary,
 }
 
 static int srv_image_route(server_ctx *srv, int fd, const http_req *req,
-                           const char *ponly) {    bool gen = strcmp(ponly, "/v1/images/generations") == 0 ||
+                           const char *ponly) {
+    /* GET /v1/images/progress — live phase of the render in flight. Answered
+     * before admission so a poll never queues behind the ~40-minute job it is
+     * watching. Phase 0 is idle, 1..6 are the six pipeline stages, 4 carries
+     * the DiT step counter, and 7 means the last render finished. `idle` is a
+     * convenience for the H5 app: true once the snapshot is done or stale. */
+    if (strcmp(req->method, "GET") == 0 &&
+        (strcmp(ponly, "/v1/images/progress") == 0 ||
+         strcmp(ponly, "/images/progress") == 0)) {
+        h3_progress pr;
+        h3_progress_get(&pr);
+        static const char *NAMES[] = { "idle", "tokenize", "text_encode", "pack",
+                                       "dit", "vae", "png", "done" };
+        const char *name = (pr.phase >= 0 && pr.phase <= 7)
+                            ? NAMES[pr.phase] : "idle";
+        double now = now_ms();
+        bool stale = (now - pr.stamp_ms) > 10000.0;
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"object\":\"image_progress\",\"phase\":%d,"
+                 "\"phase_name\":\"%s\",\"step\":%d,\"steps\":%d,"
+                 "\"idle\":%s,\"age_ms\":%.0f}",
+                 pr.phase, name, pr.step, pr.steps,
+                 ((pr.phase == 0 || pr.phase == 7 || stale) ? "true" : "false"),
+                 now - pr.stamp_ms);
+        http_response(fd, 200, "OK", "application/json; charset=utf-8", body,
+                      false);
+        return 200;
+    }
+
+    bool gen = strcmp(ponly, "/v1/images/generations") == 0 ||
                strcmp(ponly, "/images/generations") == 0;
     bool edit = strcmp(ponly, "/v1/images/edits") == 0 ||
                 strcmp(ponly, "/images/edits") == 0;
     if (strcmp(req->method, "POST") != 0 || (!gen && !edit)) return -1;
+
+    /* Lazy open through the same one-model slot the switch uses. The first
+     * POST releases any resident text/realtime weights and maps the image
+     * pipeline — exactly what the settings switch does, but without making
+     * the H5 studio's first click fail with a 503. The video endpoint already
+     * behaves this way; images now match. srv_switch_image closes the swap
+     * gate, so a server that is mid-generation answers 503 instead of
+     * double-loading. */
+    if (!srv->h3) {
+        char imsg[512];
+        bool already = false;
+        int ist = srv_switch_image(srv, imsg, sizeof(imsg), &already);
+        if (ist != 200)
+            return h3_img_error(fd, ist == 409 ? 503 : ist, imsg);
+        CWICK_INFO("image", "model opened on demand: %s", srv->image_dir);
+    }
 
     /* A switch frees the image pipeline out from under a running render, so
      * admission and the in-flight count share gen_lock with the swap gate.
@@ -7899,6 +8179,566 @@ img_done:
     }
     pthread_mutex_unlock(&srv->gen_lock);
     return rc;
+}
+
+/* ---- /v1/videos --------------------------------------------------------
+ * OpenAI's video resource is a job: create, poll, then fetch the bytes. That
+ * shape is not a convenience here — one clip is tens of minutes of work, and
+ * holding the HTTP connection open for it would tie up a client thread and
+ * lose the job on any proxy timeout.
+ */
+
+static int64_t video_now(void) { return (int64_t)time(NULL); }
+
+static void video_job_json(char *buf, size_t cap, const video_job *j,
+                           bool detail) {
+    char *jp = cwick_json_stringify(j->prompt ? j->prompt : "");
+    char tail[1536];
+    tail[0] = 0;
+    /* The phase and step counters are the only way a polling client can tell
+     * that a 10%-stuck job is still sampling, so they belong in the detail
+     * view next to `progress`. */
+    if (detail && j->phase[0]) {
+        char *js = cwick_json_stringify(j->phase);
+        snprintf(tail, sizeof(tail),
+                 ",\"phase\":%s,\"steps_done\":%d,\"steps_total\":%d",
+                 js ? js : "\"\"", j->steps_done, j->steps_total);
+        free(js);
+    }
+    if (j->completed) {
+        size_t n = strlen(tail);
+        snprintf(tail + n, sizeof(tail) - n, ",\"completed_at\":%lld",
+                 (long long)j->completed);
+    }
+    if (detail && strcmp(j->status, "failed") == 0) {
+        char *je = cwick_json_stringify(j->error);
+        size_t n = strlen(tail);
+        snprintf(tail + n, sizeof(tail) - n,
+                 ",\"error\":{\"message\":%s,\"code\":\"video_failed\"}",
+                 je ? je : "null");
+        free(je);
+    }
+    if (detail && j->has_tim) {
+        size_t n = strlen(tail);
+        snprintf(tail + n, sizeof(tail) - n,
+                 ",\"cwick\":{\"total_ms\":%.1f,\"tokenize_ms\":%.1f,"
+                 "\"text_encode_ms\":%.1f,\"encode_ms\":%.1f,"
+                 "\"pack_ms\":%.1f,\"dit_ms\":%.1f,"
+                 "\"video_vae_ms\":%.1f,\"audio_vae_ms\":%.1f,\"mux_ms\":%.1f,"
+                 "\"load_ms\":%.1f,\"frames\":%lld,\"width\":%lld,\"height\":%lld,"
+                 "\"steps\":%lld,\"video_tokens\":%lld,\"audio_tokens\":%lld,"
+                 "\"audio_samples\":%lld,\"latent_t\":%lld,\"latent_h\":%lld,"
+                 "\"latent_w\":%lld,\"cached\":%d,"
+                 "\"spatial_corr\":%.3f,\"snr_db\":%.2f,"
+                 "\"suspect_noise\":%d}",
+                 j->tim.total_ms, j->tim.tokenize_ms, j->tim.text_encode_ms,
+                 j->tim.encode_ms, j->tim.pack_ms, j->tim.dit_ms,
+                 j->tim.vae_ms, j->tim.audio_vae_ms,
+                 j->tim.mux_ms, j->tim.load_ms,
+                 (long long)j->tim.frames, (long long)j->tim.width,
+                 (long long)j->tim.height, (long long)j->tim.steps,
+                 (long long)j->tim.video_tokens, (long long)j->tim.audio_tokens,
+                 (long long)j->tim.audio_samples, (long long)j->tim.latent_t,
+                 (long long)j->tim.latent_h, (long long)j->tim.latent_w,
+                 j->tim.cached, j->tim.spatial_corr, j->tim.snr_db,
+                 j->tim.suspect_noise);
+    }
+    if (detail && j->ref_image) {
+        char *jm = cwick_json_stringify(j->ref_mime[0] ? j->ref_mime : "image/*");
+        size_t n = strlen(tail);
+        const char *cond = "text_only";
+        if (j->ref_encoded) cond = "first_frame";
+        else if (!j->completed && strcmp(j->status, "failed") != 0)
+            cond = "pending";
+        snprintf(tail + n, sizeof(tail) - n,
+                 ",\"reference_image\":{\"mime\":%s,\"bytes\":%zu,"
+                 "\"conditioning\":\"%s\"}",
+                 jm ? jm : "\"image/*\"", j->ref_image_len, cond);
+        free(jm);
+    }
+    if (detail && j->variant[0]) {
+        char *jv = cwick_json_stringify(j->variant);
+        size_t n = strlen(tail);
+        snprintf(tail + n, sizeof(tail) - n, ",\"variant\":%s",
+                 jv ? jv : "\"\"");
+        free(jv);
+    }
+    snprintf(buf, cap,
+             "{\"id\":\"%s\",\"object\":\"video\",\"created_at\":%lld,"
+             "\"status\":\"%s\",\"progress\":%d,\"model\":\"%s\","
+             "\"prompt\":%s,\"size\":\"%dx%d\",\"seconds\":\"%d\","
+             "\"steps\":%d%s}",
+             j->id, (long long)j->created, j->status,
+             (int)(j->progress * 100.0 + 0.5), H3V_SERVED_ID,
+             jp ? jp : "\"\"", j->width, j->height, j->seconds,
+             j->steps, tail);
+    free(jp);
+}
+
+typedef struct {
+    server_ctx *srv;
+    int idx;
+    bool metric_started;
+    int last_pct;
+    char last_phase[32];
+} video_cb_ctx;
+
+/* Phase weights make the reported number monotone: text 0-5%, pack 5-10%,
+ * dit 10-80%, video VAE 80-92%, audio VAE 92-97%, mux 97-100%. */
+static void video_progress(void *p, const char *phase, int done, int total,
+                           double frac) {
+    video_cb_ctx *c = (video_cb_ctx *)p;
+    double base = 0.0, span = 0.05, x = frac;
+    if (strcmp(phase, H3V_PHASE_PACK) == 0)      { base = 0.05; span = 0.05; }
+    else if (strcmp(phase, H3V_PHASE_DIT) == 0) {
+        base = 0.10; span = 0.70;
+        /* `frac` carries whole-step + within-step (per-layer) progress. Using
+         * done/total alone froze the bar for the minutes a single layer takes. */
+        if (total > 0 && frac >= x) x = frac;
+    }
+    else if (strcmp(phase, H3V_PHASE_VIDEO) == 0) { base = 0.80; span = 0.12; }
+    else if (strcmp(phase, H3V_PHASE_AUDIO) == 0) { base = 0.92; span = 0.05; }
+    else if (strcmp(phase, H3V_PHASE_MUX) == 0)   { base = 0.97; span = 0.03; }
+    double pct = base + span * x;
+    if (pct > 1.0) pct = 1.0;
+
+    /* Publish the step denominator before the long DiT phase so a scrape can
+     * tell "sampling" from "stuck". `start` also counts the job once. */
+    if (strcmp(phase, H3V_PHASE_DIT) == 0 && total > 0) {
+        if (!c->metric_started) {
+            c->metric_started = true;
+            cwick_metrics_video_start(done, total);
+        } else {
+            cwick_metrics_video_step(done, total);
+        }
+    }
+
+    pthread_mutex_lock(&c->srv->vbook.lock);
+    video_job *j = &c->srv->vbook.jobs[c->idx];
+    if (j->used) {
+        snprintf(j->phase, sizeof(j->phase), "%s", phase);
+        j->steps_done = done;
+        j->steps_total = total;
+        j->progress = pct;
+        if (strcmp(j->status, "queued") == 0)
+            snprintf(j->status, sizeof(j->status), "in_progress");
+        pthread_mutex_unlock(&c->srv->vbook.lock);
+    } else {
+        pthread_mutex_unlock(&c->srv->vbook.lock);
+    }
+    /* The DiT loop reports once per layer; logging every callback would add
+     * 1,500 lines to a 30-step job. Log a phase change or a whole percent. */
+    int pct_i = (int)(pct * 100.0 + 0.5);
+    if (pct_i != c->last_pct || strcmp(phase, c->last_phase) != 0) {
+        c->last_pct = pct_i;
+        snprintf(c->last_phase, sizeof(c->last_phase), "%s", phase);
+        CWICK_INFO("video", "progress %s %d%% (%d/%d)", phase, pct_i,
+                   done, total);
+    }
+}
+
+static void *video_worker(void *arg) {
+    video_cb_ctx *c = (video_cb_ctx *)arg;
+    server_ctx *srv = c->srv;
+    int idx = c->idx;
+    video_job *j = &srv->vbook.jobs[idx];
+    h3v_model *m = srv->vid;
+    unsigned char *mp4 = NULL;
+    size_t len = 0;
+    h3v_timing tim;
+    memset(&tim, 0, sizeof(tim));
+    cwick_error e;
+    cwick_error_clear(&e);
+
+    /* Decode the optional reference image into RGB24 for first-frame
+     * conditioning. ImageIO sniffs PNG/JPEG from the bytes; h3_png_decode
+     * returns float [0,1] pixels which are quantised back to bytes. */
+    float *reff = NULL;
+    unsigned char *ref_rgb = NULL;
+    int rw = 0, rh = 0;
+    bool had_ref = false;
+    if (m && j->ref_image && j->ref_image_len) {
+        if (h3_png_decode(j->ref_image, j->ref_image_len, &reff, &rw, &rh, &e)) {
+            ref_rgb = (unsigned char *)malloc((size_t)rw * rh * 3);
+            if (ref_rgb) {
+                for (int i = 0; i < rw * rh * 3; i++) {
+                    float v = reff[i] * 255.0f;
+                    ref_rgb[i] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            }
+            free(reff);
+            had_ref = (ref_rgb != NULL);
+            CWICK_INFO("video", "reference image decoded: %dx%d -> RGB24 for "
+                       "first-frame conditioning", rw, rh);
+        } else {
+            CWICK_INFO("video", "reference image decode failed (%s); falling "
+                       "back to text-only", cwick_error_message(&e));
+            cwick_error_clear(&e);
+        }
+    }
+
+    bool ok = m && h3v_generate_variant_steps(m, j->variant, j->prompt,
+                                              ref_rgb, rw, rh,
+                                              j->width, j->height, j->seconds,
+                                              j->seed, j->steps,
+                                              video_progress, c, &mp4, &len, &tim, &e);
+    free(ref_rgb);
+
+    bool completed_ok = false;
+    pthread_mutex_lock(&srv->vbook.lock);
+    if (j->used) {
+        if (ok) {
+            completed_ok = true;
+            j->ref_encoded = had_ref;
+            j->mp4 = mp4;
+            j->mp4_len = len;
+            j->tim = tim;
+            j->has_tim = true;
+            j->progress = 1.0;
+            j->completed = video_now();
+            snprintf(j->phase, sizeof(j->phase), "done");
+            snprintf(j->status, sizeof(j->status), "completed");
+            CWICK_INFO("video", "job %s done: %zu bytes in %.1f ms", j->id,
+                       len, tim.total_ms);
+        } else {
+            snprintf(j->status, sizeof(j->status), "failed");
+            snprintf(j->error, sizeof(j->error), "%s",
+                     e.message[0] ? e.message : "video generation failed");
+            CWICK_INFO("video", "job %s failed: %s", j->id, j->error);
+            free(mp4);
+            mp4 = NULL;
+        }
+    } else {
+        free(mp4);
+    }
+    pthread_mutex_unlock(&srv->vbook.lock);
+
+    /* Publish the whole chain to /v1/metrics. The job detail only exists
+     * after completion and only for clients polling that particular id; a
+     * dashboard needs the stage split as counters and the last job's total. */
+    {
+        cwick_video_job_metrics vm;
+        memset(&vm, 0, sizeof(vm));
+        vm.total_s = tim.total_ms / 1000.0;
+        vm.text_s = tim.text_encode_ms / 1000.0;
+        vm.pack_s = tim.pack_ms / 1000.0;
+        vm.encode_s = tim.encode_ms / 1000.0;
+        vm.dit_s = tim.dit_ms / 1000.0;
+        vm.vae_s = tim.vae_ms / 1000.0;
+        vm.audio_vae_s = tim.audio_vae_ms / 1000.0;
+        vm.mux_s = tim.mux_ms / 1000.0;
+        vm.load_s = tim.load_ms / 1000.0;
+        vm.frames = tim.frames;
+        vm.bytes = (int64_t)len;
+        vm.steps = tim.steps;
+        vm.video_tokens = tim.video_tokens;
+        vm.audio_tokens = tim.audio_tokens;
+        vm.first_frame = completed_ok && had_ref;
+        vm.success = completed_ok;
+        vm.suspect_noise = tim.suspect_noise != 0;
+        cwick_metrics_video_observe(&vm);
+    }
+
+    /* Release the render slot so a model switch may proceed. */
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->vid_busy > 0) {
+        srv->vid_busy--;
+        pthread_cond_broadcast(&srv->gen_cv);
+    }
+    pthread_mutex_unlock(&srv->gen_lock);
+    free(c);
+    return NULL;
+}
+
+static int srv_video_route(server_ctx *srv, int fd, const http_req *req,
+                           const char *ponly) {
+    const char *idpart = NULL;
+    if (strncmp(ponly, "/v1/videos/", 11) == 0) idpart = ponly + 11;
+    else if (strncmp(ponly, "/videos/", 8) == 0) idpart = ponly + 8;
+    bool collection = strcmp(ponly, "/v1/videos") == 0 ||
+                      strcmp(ponly, "/videos") == 0;
+    if (!collection && !idpart) return -1;
+    if (collection && strcmp(req->method, "POST") != 0 &&
+        strcmp(req->method, "GET") != 0) return -1;
+
+    /* GET /v1/videos — the job list, newest entries included. */
+    if (collection && strcmp(req->method, "GET") == 0) {
+        char body[8192];
+        size_t off = 0;
+        off += (size_t)snprintf(body, sizeof(body),
+                                "{\"object\":\"list\",\"data\":[");
+        pthread_mutex_lock(&srv->vbook.lock);
+        bool first = true;
+        for (int i = 0; i < CWICK_VIDEO_JOBS; i++) {
+            video_job *j = &srv->vbook.jobs[i];
+            if (!j->used) continue;
+            char one[1400];
+            video_job_json(one, sizeof(one), j, false);
+            if (off + strlen(one) + 8 >= sizeof(body)) break;
+            off += (size_t)snprintf(body + off, sizeof(body) - off, "%s%s",
+                                    first ? "" : ",", one);
+            first = false;
+        }
+        pthread_mutex_unlock(&srv->vbook.lock);
+        snprintf(body + off, sizeof(body) - off, "]}");
+        http_response(fd, 200, "OK", "application/json; charset=utf-8", body,
+                      false);
+        return 200;
+    }
+
+    /* POST /v1/videos — create a job and return it immediately. */
+    if (collection) {
+        /* Lazy open through the same one-model slot the switch uses. The first
+         * POST releases any resident text/realtime/image weights — the DiT
+         * phase maps the 62 GiB transformer and would OOM alongside them — then
+         * loads the video pipeline. srv_switch_video closes the swap gate, so a
+         * server that is mid-generation answers 503 instead of double-loading. */
+        if (!srv->vid && srv->video_dir[0]) {
+            char vmsg[512];
+            bool already = false;
+            int vst = srv_switch_video(srv, vmsg, sizeof(vmsg), &already);
+            if (vst != 200)
+                return h3_img_error(fd, vst == 409 ? 503 : vst, vmsg);
+            CWICK_INFO("video", "model opened on demand: %s", srv->video_dir);
+        }
+        if (!srv->vid)
+            return h3_img_error(fd, 503,
+                "no video model loaded: pass --videos DIR to cwick serve "
+                "(or set CWICK_VIDEO_MODEL)");
+        if (!req->body_len)
+            return h3_img_error(fd, 400, "empty request body");
+        cwick_error je;
+        cwick_error_clear(&je);
+        json_value *root = cwick_json_parse(req->body, req->body_len, &je);
+        if (!root)
+            return h3_img_error(fd, 400, cwick_error_message(&je));
+
+        const char *prompt = cwick_json_str(cwick_json_get(root, "prompt"));
+        if (!prompt || !*prompt) {
+            cwick_json_free(root);
+            return h3_img_error(fd, 400, "prompt is required");
+        }
+        int w = (int)cwick_json_num(cwick_json_get(root, "width"), 1280);
+        int h = (int)cwick_json_num(cwick_json_get(root, "height"), 720);
+        const char *size = cwick_json_str(cwick_json_get(root, "size"));
+        if (size) {
+            long a = 0, b = 0;
+            if (sscanf(size, "%ldx%ld", &a, &b) == 2 && a > 0 && b > 0) {
+                w = (int)a;
+                h = (int)b;
+            }
+        }
+        /* OpenAI sends `seconds` as a string ("4"); accept a bare number too. */
+        json_value *secv = cwick_json_get(root, "seconds");
+        const char *secs = cwick_json_str(secv);
+        int seconds = (secs && *secs) ? atoi(secs)
+                                      : (int)cwick_json_num(secv, 4);
+        uint64_t seed = (uint64_t)cwick_json_num(cwick_json_get(root, "seed"), 0);
+        /* Optional sampling budget for a quick verification clip. 0 (the
+         * default) keeps the engine's 30-step schedule; values outside 1..30
+         * are clamped in the engine, so a cheap smoke run can ask for 2-4. */
+        int steps = (int)cwick_json_num(cwick_json_get(root, "steps"), 0);
+
+        /* Optional transformer variant. The video endpoint uses the omni-
+         * reference partition only; a first/last-frame checkpoint is not part
+         * of this API. Validate against what is actually on disk before
+         * queuing, so a typo fails the POST with 400 rather than failing the
+         * worker minutes later. */
+        char variant[24] = "";
+        const char *vreq = cwick_json_str(cwick_json_get(root, "variant"));
+        if (!vreq || !*vreq)
+            vreq = cwick_json_str(cwick_json_get(root, "model_variant"));
+        if (vreq && *vreq) {
+            const char *canon = h3v_model_resolve_variant(srv->vid, vreq);
+            if (!canon) {
+                /* vreq points into `root`; copy it before freeing the tree. */
+                char bad[64] = "";
+                snprintf(bad, sizeof(bad), "%s", vreq);
+                char avail[128] = "";
+                for (int vi = 0; vi < h3v_model_variant_count(srv->vid); vi++) {
+                    size_t n = strlen(avail);
+                    snprintf(avail + n, sizeof(avail) - n, "%s%s",
+                             vi ? ", " : "", h3v_model_variant_name(srv->vid, vi));
+                }
+                cwick_json_free(root);
+                char emsg[256];
+                snprintf(emsg, sizeof(emsg),
+                         "unknown video variant '%s' (available: %s)", bad, avail);
+                return h3_img_error(fd, 400, emsg);
+            }
+            snprintf(variant, sizeof(variant), "%s", canon);
+        }
+        CWICK_INFO("video", "job variant %s (default %s)",
+                   variant[0] ? variant : h3v_model_variant(srv->vid),
+                   h3v_model_variant(srv->vid));
+
+        /* Optional reference image (data URL or bare base64). The H5 studio
+         * sends the PNG it produced in step one here. The worker decodes it to
+         * RGB24 and the visual VAE encoder writes it into latent step 0, so a
+         * successful job reports conditioning:"first_frame"; only a failed
+         * image decode falls back to text_only. */
+        unsigned char *ref_img = NULL;
+        size_t ref_len = 0;
+        char ref_mime[24] = "image/*";
+        const char *img_field = cwick_json_str(cwick_json_get(root, "image"));
+        if (img_field && *img_field) {
+            const char *b64 = img_field;
+            if (strncmp(img_field, "data:", 5) == 0) {
+                const char *semi = strstr(img_field, ";base64,");
+                if (!semi) {
+                    cwick_json_free(root);
+                    return h3_img_error(fd, 400,
+                        "image data URL must use ;base64, separator");
+                }
+                size_t ml = (size_t)(semi - (img_field + 5));
+                if (ml >= sizeof(ref_mime)) ml = sizeof(ref_mime) - 1;
+                memcpy(ref_mime, img_field + 5, ml);
+                ref_mime[ml] = 0;
+                b64 = semi + 8;
+            }
+            ref_img = (unsigned char *)cwick_b64_decode(b64, strlen(b64), &ref_len);
+            bool png = ref_len >= 8 && memcmp(ref_img, "\x89PNG\r\n\x1a\n", 8) == 0;
+            bool jpg = ref_len >= 3 && ref_img[0] == 0xff && ref_img[1] == 0xd8 &&
+                       ref_img[2] == 0xff;
+            if (!ref_img || ref_len < 16 || (!png && !jpg)) {
+                free(ref_img);
+                cwick_json_free(root);
+                return h3_img_error(fd, 400,
+                    "image must be a base64 PNG or JPEG (data URL accepted)");
+            }
+            if (png && !strstr(ref_mime, "png")) snprintf(ref_mime, sizeof(ref_mime), "image/png");
+            if (jpg && !strstr(ref_mime, "jpeg") && !strstr(ref_mime, "jpg"))
+                snprintf(ref_mime, sizeof(ref_mime), "image/jpeg");
+            CWICK_INFO("video", "reference image: %s, %zu bytes (first-frame conditioning)",
+                       ref_mime, ref_len);
+        }
+
+        pthread_mutex_lock(&srv->gen_lock);
+        bool swap_busy = srv->swapping;
+        if (!swap_busy && srv->vid) srv->vid_busy++;
+        pthread_mutex_unlock(&srv->gen_lock);
+        if (swap_busy) {
+            free(ref_img);
+            cwick_json_free(root);
+            return h3_img_error(fd, 503,
+                "a model switch is in progress; retry shortly");
+        }
+
+        int idx = -1;
+        pthread_mutex_lock(&srv->vbook.lock);
+        for (int i = 0; i < CWICK_VIDEO_JOBS; i++)
+            if (!srv->vbook.jobs[i].used) { idx = i; break; }
+        if (idx < 0) {
+            pthread_mutex_unlock(&srv->vbook.lock);
+            pthread_mutex_lock(&srv->gen_lock);
+            if (srv->vid_busy > 0) srv->vid_busy--;
+            pthread_mutex_unlock(&srv->gen_lock);
+            free(ref_img);
+            cwick_json_free(root);
+            return h3_img_error(fd, 429,
+                "too many video jobs; wait for one to finish");
+        }
+        video_job *j = &srv->vbook.jobs[idx];
+        /* Recycle a completed slot: release what the previous clip kept. */
+        free(j->prompt);
+        free(j->mp4);
+        free(j->ref_image);
+        memset(j, 0, sizeof(*j));
+        j->used = true;
+        snprintf(j->id, sizeof(j->id), "video_%llu_%llu",
+                 (unsigned long long)video_now(),
+                 (unsigned long long)++srv->vbook.next_seq);
+        j->prompt = cwick_strdup(prompt);
+        snprintf(j->variant, sizeof(j->variant), "%s",
+                 variant[0] ? variant : h3v_model_variant(srv->vid));
+        j->ref_image = ref_img;
+        j->ref_image_len = ref_len;
+        snprintf(j->ref_mime, sizeof(j->ref_mime), "%s", ref_mime);
+        ref_img = NULL;              /* ownership moved to the job */
+        j->width = w;
+        j->height = h;
+        j->seconds = seconds;
+        j->steps = steps;
+        j->seed = seed;
+        j->created = video_now();
+        snprintf(j->status, sizeof(j->status), "queued");
+        snprintf(j->phase, sizeof(j->phase), "queued");
+        pthread_mutex_unlock(&srv->vbook.lock);
+        cwick_json_free(root);
+
+        video_cb_ctx *c = (video_cb_ctx *)cwick_xmalloc(sizeof(*c));
+        memset(c, 0, sizeof(*c));
+        c->srv = srv;
+        c->idx = idx;
+        c->last_pct = -1;
+        pthread_t th;
+        if (pthread_create(&th, NULL, video_worker, c) != 0) {
+            free(c);
+            pthread_mutex_lock(&srv->gen_lock);
+            if (srv->vid_busy > 0) srv->vid_busy--;
+            pthread_mutex_unlock(&srv->gen_lock);
+            pthread_mutex_lock(&srv->vbook.lock);
+            j->used = false;
+            free(j->prompt);
+            j->prompt = NULL;
+            free(j->ref_image);
+            j->ref_image = NULL;
+            pthread_mutex_unlock(&srv->vbook.lock);
+            return h3_img_error(fd, 500, "cannot start the video worker");
+        }
+        pthread_detach(th);
+
+        char body[1600];
+        pthread_mutex_lock(&srv->vbook.lock);
+        video_job_json(body, sizeof(body), j, false);
+        pthread_mutex_unlock(&srv->vbook.lock);
+        http_response(fd, 202, "Accepted", "application/json; charset=utf-8",
+                      body, false);
+        return 202;
+    }
+
+    /* /v1/videos/{id} and /v1/videos/{id}/content */
+    const char *slash = strchr(idpart, '/');
+    size_t idn = slash ? (size_t)(slash - idpart) : strlen(idpart);
+    char id[48];
+    if (idn == 0 || idn >= sizeof(id)) return -1;
+    memcpy(id, idpart, idn);
+    id[idn] = 0;
+    bool want_content = slash && strcmp(slash, "/content") == 0;
+    if (slash && !want_content) return -1;
+    if (strcmp(req->method, "GET") != 0) return -1;
+
+    pthread_mutex_lock(&srv->vbook.lock);
+    video_job *j = NULL;
+    for (int i = 0; i < CWICK_VIDEO_JOBS; i++)
+        if (srv->vbook.jobs[i].used &&
+            strcmp(srv->vbook.jobs[i].id, id) == 0) {
+            j = &srv->vbook.jobs[i];
+            break;
+        }
+    if (!j) {
+        pthread_mutex_unlock(&srv->vbook.lock);
+        return h3_img_error(fd, 404, "no such video");
+    }
+    if (want_content) {
+        if (!j->mp4 || !j->mp4_len) {
+            pthread_mutex_unlock(&srv->vbook.lock);
+            return h3_img_error(fd, 409, "video is not ready");
+        }
+        /* Copy under the lock: the next job may reuse this slot and free it. */
+        size_t len = j->mp4_len;
+        unsigned char *copy = cwick_xmalloc(len);
+        memcpy(copy, j->mp4, len);
+        pthread_mutex_unlock(&srv->vbook.lock);
+        http_response_bytes(fd, 200, "OK", "video/mp4", copy, len);
+        free(copy);
+        return 200;
+    }
+    char body[8192];
+    video_job_json(body, sizeof(body), j, true);
+    pthread_mutex_unlock(&srv->vbook.lock);
+    http_response(fd, 200, "OK", "application/json; charset=utf-8", body, false);
+    return 200;
 }
 
 static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
@@ -8146,6 +8986,16 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         }
     }
 
+    /* OpenAI video routes: a job is created here, polled by id, and its mp4
+     * fetched from /content. Same independence from the text engine as images. */
+    {
+        int code = srv_video_route(srv, fd, &req, ponly);
+        if (code >= 0) {
+            snprintf(detail, sizeof(detail), "video route -> %d", code);
+            DONE(code);
+        }
+    }
+
     /* Every local model this instance knows about. The resident one is first
      * (what an OpenAI client reading data[0] expects); each entry carries the
      * cwick extras — where its weights are and whether it is the one loaded —
@@ -8276,6 +9126,23 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
                           "application/json; charset=utf-8", body, false);
             snprintf(detail, sizeof(detail), "image model switch -> %d", ist);
             DONE(ist);
+        }
+        if (strcmp(wanted, H3V_SERVED_ID) == 0) {
+            char msg[512];
+            bool already = false;
+            int vst = srv_switch_video(srv, msg, sizeof(msg), &already);
+            char *jmsg = json_str_alloc(msg);
+            char body[1024];
+            snprintf(body, sizeof(body),
+                     "{\"status\":%s,\"model\":\"%s\",\"detail\":%s}",
+                     vst != 200 ? "\"error\"" :
+                       (already ? "\"already_resident\"" : "\"switched\""),
+                     H3V_SERVED_ID, jmsg ? jmsg : "\"\"");
+            free(jmsg);
+            http_response(fd, vst, status_text_for(vst),
+                          "application/json; charset=utf-8", body, false);
+            snprintf(detail, sizeof(detail), "video model switch -> %d", vst);
+            DONE(vst);
         }
 
         const cwick_model_entry *target = NULL;
@@ -9124,6 +9991,20 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
         }
     }
     {
+        /* Video pipeline directory (--videos / CWICK_VIDEO_MODEL). It is
+         * never opened at startup: 134 GiB of weights would compete with the
+         * resident text model, and the /v1/videos route loads and releases the
+         * transformer per job anyway. The directory is kept so the first job
+         * (or POST /v1/models/switch with MiniMax-H3) can open it on demand. */
+        const char *dir = (opt && opt->video_dir && *opt->video_dir)
+                        ? opt->video_dir : getenv("CWICK_VIDEO_MODEL");
+        if (dir && *dir) {
+            snprintf(srv.video_dir, sizeof(srv.video_dir), "%s", dir);
+            CWICK_INFO("init", "video %s registered: POST /v1/videos loads it "
+                       "on first use (one model at a time)", dir);
+        }
+    }
+    {
         /* A speech checkpoint is a resident model of its own: thinker + ear +
          * talker, no text engine. Opened here so the metrics registry and the
          * catalog below can name it. */
@@ -9198,6 +10079,7 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     srv.wake_w = -1;
     cwick_status terminal = CWICK_OK;
     pthread_mutex_init(&srv.gen_lock, NULL);
+    pthread_mutex_init(&srv.vbook.lock, NULL);
     pthread_mutex_init(&srv.pfx_mtx, NULL);
     pthread_mutex_init(&srv.client_mtx, NULL);
     pthread_cond_init(&srv.client_cv, NULL);

@@ -180,6 +180,19 @@ static _Atomic uint64_t m_rt_speech_tokens, m_rt_audio_tokens, m_rt_out_samples;
 static _Atomic uint64_t g_rt_last_turn_bits, g_rt_last_first_bits;
 static _Atomic uint64_t g_rt_last_audio_out_bits;
 
+/* Video jobs: cumulative stage seconds, last job's numbers for a dashboard,
+ * and the live DiT step count. The DiT phase dominates a clip by two orders
+ * of magnitude, so without `video_dit_steps_done` a scrape looks identical
+ * for 30 seconds and 30 minutes into the same job. */
+static _Atomic uint64_t m_video_jobs, m_video_succeeded, m_video_failed;
+static _Atomic uint64_t m_video_first_frame, m_video_suspect_noise;
+static _Atomic uint64_t m_video_text_bits, m_video_pack_bits, m_video_encode_bits;
+static _Atomic uint64_t m_video_dit_bits, m_video_vae_bits, m_video_avae_bits;
+static _Atomic uint64_t m_video_mux_bits, m_video_load_bits, m_video_total_bits;
+static _Atomic uint64_t m_video_frames, m_video_bytes;
+static _Atomic uint64_t m_video_video_tokens, m_video_audio_tokens;
+static _Atomic uint64_t g_video_dit_done, g_video_dit_total, g_video_last_total_bits;
+
 static _Atomic uint64_t m_expert_reads;
 static _Atomic uint64_t m_expert_bytes;
 
@@ -195,6 +208,8 @@ static _Atomic uint64_t g_expert_cap;
 static _Atomic uint64_t g_rss;
 static _Atomic uint64_t g_ceiling;
 static _Atomic uint64_t g_context_window;
+static _Atomic uint64_t g_model_weight_bytes, g_model_resident_bytes;
+static _Atomic uint64_t g_model_target_bytes, g_model_wired;
 static _Atomic uint64_t g_model_loaded;
 static _Atomic uint64_t g_started_ns;
 
@@ -319,6 +334,51 @@ void cwick_metrics_rt_observe(const cwick_rt_turn_metrics *m) {
                           memory_order_relaxed);
 }
 
+void cwick_metrics_video_start(int done, int total) {
+    atomic_store_explicit(&g_video_dit_done, done > 0 ? (uint64_t)done : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_video_dit_total, total > 0 ? (uint64_t)total : 0,
+                          memory_order_relaxed);
+}
+
+void cwick_metrics_video_step(int done, int total) {
+    if (done > 0)
+        atomic_store_explicit(&g_video_dit_done, (uint64_t)done,
+                              memory_order_relaxed);
+    if (total > 0)
+        atomic_store_explicit(&g_video_dit_total, (uint64_t)total,
+                              memory_order_relaxed);
+}
+
+void cwick_metrics_video_observe(const cwick_video_job_metrics *m) {
+    if (!m) return;
+    /* Count jobs at completion, not at DiT entry: a text-encode failure never
+     * reaches the sampler and would otherwise add to failed_total without
+     * adding to jobs_total. */
+    counter_add(&m_video_jobs, 1);
+    atomic_store_explicit(&g_video_dit_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_video_dit_total, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_video_last_total_bits, d2u(m->total_s),
+                          memory_order_relaxed);
+    if (m->success) counter_add(&m_video_succeeded, 1);
+    else counter_add(&m_video_failed, 1);
+    if (m->first_frame) counter_add(&m_video_first_frame, 1);
+    if (m->suspect_noise) counter_add(&m_video_suspect_noise, 1);
+    gauge_add(&m_video_text_bits, m->text_s);
+    gauge_add(&m_video_pack_bits, m->pack_s);
+    gauge_add(&m_video_encode_bits, m->encode_s);
+    gauge_add(&m_video_dit_bits, m->dit_s);
+    gauge_add(&m_video_vae_bits, m->vae_s);
+    gauge_add(&m_video_avae_bits, m->audio_vae_s);
+    gauge_add(&m_video_mux_bits, m->mux_s);
+    gauge_add(&m_video_load_bits, m->load_s);
+    gauge_add(&m_video_total_bits, m->total_s);
+    counter_add(&m_video_frames, m->frames);
+    counter_add(&m_video_bytes, m->bytes);
+    counter_add(&m_video_video_tokens, m->video_tokens);
+    counter_add(&m_video_audio_tokens, m->audio_tokens);
+}
+
 void cwick_metrics_request_finish(int64_t prompt_tokens, int64_t gen_tokens,
                                  double prefill_s, double decode_s,
                                  double e2e_s, double ttft_s,
@@ -416,6 +476,14 @@ double cwick_metrics_decode_step_mean_seconds(void) {
 
 void cwick_metrics_set_stream(const cwick_stream *s) { g_stream = s; }
 void cwick_metrics_set_memory_ceiling(uint64_t bytes) { g_ceiling = bytes; }
+void cwick_metrics_set_model_residency(uint64_t weight_bytes,
+                                       uint64_t resident_bytes,
+                                       uint64_t target_bytes, int wired) {
+    g_model_weight_bytes = weight_bytes;
+    g_model_resident_bytes = resident_bytes;
+    g_model_target_bytes = target_bytes;
+    g_model_wired = wired ? 1 : 0;
+}
 void cwick_metrics_set_context_window(int64_t tokens) {
     g_context_window = tokens > 0 ? (uint64_t)tokens : 0;
 }
@@ -728,6 +796,66 @@ char *cwick_metrics_render(size_t *out_len) {
                    turn > 0 ? out / turn : 0.0);
     }
 
+    /* ---- video generation jobs ---- */
+    emit_counter(&b, "cwick:video_jobs_total",
+                 "Video jobs that entered the sampling phase.",
+                 atomic_load_explicit(&m_video_jobs, memory_order_relaxed));
+    emit_counter(&b, "cwick:video_jobs_succeeded_total",
+                 "Video jobs that produced an mp4.",
+                 atomic_load_explicit(&m_video_succeeded, memory_order_relaxed));
+    emit_counter(&b, "cwick:video_jobs_failed_total",
+                 "Video jobs that failed after reaching the sampler.",
+                 atomic_load_explicit(&m_video_failed, memory_order_relaxed));
+    emit_counter(&b, "cwick:video_first_frame_jobs_total",
+                 "Jobs whose uploaded image was encoded into latent step 0.",
+                 atomic_load_explicit(&m_video_first_frame, memory_order_relaxed));
+    emit_counter(&b, "cwick:video_suspect_noise_jobs_total",
+                 "Jobs whose generated latent step stayed at white-noise-level "
+                 "spatial correlation despite producing an mp4. A non-zero "
+                 "value means the sampler, not the muxer, needs attention.",
+                 atomic_load_explicit(&m_video_suspect_noise, memory_order_relaxed));
+    emit_help_type(&b, "cwick:video_stage_seconds_total",
+                   "Wall seconds accumulated per pipeline stage across all "
+                   "finished jobs. `encode` is the reference-image VAE pass "
+                   "and is zero for text-only jobs.", "counter");
+    {
+        static const struct { const char *name; _Atomic uint64_t *p; } stage[] = {
+            { "text", &m_video_text_bits }, { "pack", &m_video_pack_bits },
+            { "encode", &m_video_encode_bits }, { "dit", &m_video_dit_bits },
+            { "vae", &m_video_vae_bits }, { "audio_vae", &m_video_avae_bits },
+            { "mux", &m_video_mux_bits }, { "load", &m_video_load_bits },
+            { "total", &m_video_total_bits },
+        };
+        for (size_t i = 0; i < sizeof(stage) / sizeof(stage[0]); i++)
+            buf_addf(&b, "cwick:video_stage_seconds_total{stage=\"%s\"} %.6g\n",
+                     stage[i].name, gauge_get(stage[i].p));
+    }
+    emit_gauge_i(&b, "cwick:video_dit_steps_done",
+                 "Sampling steps completed in the current job; 0 when idle.",
+                 atomic_load_explicit(&g_video_dit_done, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:video_dit_steps_total",
+                 "Sampling steps planned for the current job; 0 when idle.",
+                 atomic_load_explicit(&g_video_dit_total, memory_order_relaxed));
+    emit_gauge(&b, "cwick:video_last_total_seconds",
+               "Wall seconds of the most recent finished job.",
+               u2d(atomic_load_explicit(&g_video_last_total_bits,
+                                        memory_order_relaxed)));
+    emit_counter(&b, "cwick:video_frames_total",
+                 "Frames emitted by finished jobs.",
+                 atomic_load_explicit(&m_video_frames, memory_order_relaxed));
+    emit_counter(&b, "cwick:video_bytes_total",
+                 "Mp4 bytes produced by finished jobs.",
+                 atomic_load_explicit(&m_video_bytes, memory_order_relaxed));
+    emit_help_type(&b, "cwick:video_tokens_total",
+                   "Transformer tokens by kind, summed over finished jobs.",
+                   "counter");
+    buf_addf(&b, "cwick:video_tokens_total{kind=\"video\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_video_video_tokens,
+                                                      memory_order_relaxed));
+    buf_addf(&b, "cwick:video_tokens_total{kind=\"audio\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_video_audio_tokens,
+                                                      memory_order_relaxed));
+
     /* ---- gauges ---- */
     uint64_t used = atomic_load_explicit(&g_expert_used, memory_order_relaxed);
     uint64_t cap = atomic_load_explicit(&g_expert_cap, memory_order_relaxed);
@@ -753,6 +881,19 @@ char *cwick_metrics_render(size_t *out_len) {
                  "RAM). 0 means nothing is steered: no expert cache exists to "
                  "budget because the whole checkpoint is resident and wired.",
                  atomic_load_explicit(&g_ceiling, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:model_weight_bytes",
+                 "Weight bytes of the heaviest model stage currently mapped.",
+                 atomic_load_explicit(&g_model_weight_bytes, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:model_resident_bytes",
+                 "Weight bytes faulted in and (when wired) pinned for the "
+                 "heaviest stage.",
+                 atomic_load_explicit(&g_model_resident_bytes, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:model_target_bytes",
+                 "Memory ceiling applied to the residency decision.",
+                 atomic_load_explicit(&g_model_target_bytes, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:model_wired",
+                 "1 when the heaviest stage is wired against compression/swap.",
+                 atomic_load_explicit(&g_model_wired, memory_order_relaxed));
     emit_gauge_i(&b, "cwick:context_window_tokens",
                  "Configured KV context window in tokens.",
                  atomic_load_explicit(&g_context_window, memory_order_relaxed));

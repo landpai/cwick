@@ -24,7 +24,8 @@
     ws: null, connected: false, connecting: false,
     micOn: false, vad: true, responding: false, speaking: false,
     voice: 'vivian_zh',
-    captureCtx: null, playCtx: null, stream: null, proc: null, srcNode: null,
+    captureCtx: null, playCtx: null, playDest: null, botAudio: null,
+    stream: null, proc: null, srcNode: null,
     captureRate: 48000,
     playhead: 0, active: [],
     turn: null,            /* assistant turn being received */
@@ -120,14 +121,33 @@
     var AC = window.AudioContext || window.webkitAudioContext;
     try { S.playCtx = new AC({ sampleRate: OUT_RATE }); }
     catch (e) { S.playCtx = new AC(); }
+    /* Render the reply into a media element instead of straight to
+     * ctx.destination. The browser's echo canceller tracks media-element
+     * playback as its reference signal, so the bot's own voice is subtracted
+     * from the mic and cannot fire server VAD on itself -- the self-barge-in
+     * that cancelled a reply before any audio reached the speaker. Genuine
+     * user barge-in still interrupts: only the echo is removed. */
+    S.playDest = S.playCtx.createMediaStreamDestination();
+    var el = document.createElement('audio');
+    el.autoplay = true; el.playsInline = true; el.style.display = 'none';
+    el.srcObject = S.playDest.stream;
+    document.body.appendChild(el);
+    S.botAudio = el;
+  }
+  function kickPlayback() {
+    if (S.botAudio && S.botAudio.paused) {
+      var p = S.botAudio.play();
+      if (p && p.catch) p.catch(function () {});
+    }
   }
   function playDelta(f32) {
     ensurePlayCtx();
     if (S.playCtx.state === 'suspended') S.playCtx.resume();
+    kickPlayback();
     var buf = S.playCtx.createBuffer(1, f32.length, OUT_RATE);
     buf.copyToChannel(f32, 0);
     var src = S.playCtx.createBufferSource();
-    src.buffer = buf; src.connect(S.playCtx.destination);
+    src.buffer = buf; src.connect(S.playDest);
     var startAt = Math.max(S.playCtx.currentTime + 0.03, S.playhead);
     src.start(startAt);
     S.playhead = startAt + buf.duration;
@@ -153,13 +173,14 @@
     flushPlayback();
     ensurePlayCtx();
     if (S.playCtx.state === 'suspended') S.playCtx.resume();
+    kickPlayback();
     var total = 0; t.pcm.forEach(function (c) { total += c.length; });
     var all = new Float32Array(total), off = 0;
     t.pcm.forEach(function (c) { all.set(c, off); off += c.length; });
     var buf = S.playCtx.createBuffer(1, all.length, OUT_RATE);
     buf.copyToChannel(all, 0);
     var src = S.playCtx.createBufferSource();
-    src.buffer = buf; src.connect(S.playCtx.destination);
+    src.buffer = buf; src.connect(S.playDest);
     S.playhead = S.playCtx.currentTime + buf.duration;
     src.start();
     S.speaking = true; setOrb();
@@ -656,6 +677,7 @@
     document.addEventListener('pointerdown', function warm() {
       ensurePlayCtx();
       if (S.playCtx && S.playCtx.state === 'suspended') S.playCtx.resume();
+      kickPlayback();
       document.removeEventListener('pointerdown', warm);
     }, { once: true });
   }

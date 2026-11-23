@@ -160,6 +160,43 @@ cwick_status cwick_mem_plan_build(uint64_t host_bytes, uint64_t resident_bytes,
                                 uint64_t streamed_bytes,
                                 cwick_mem_plan *out, cwick_error *err);
 
+/* ------------------------------------------------------------------ */
+/* Per-model residency fit                                              */
+/* ------------------------------------------------------------------ */
+/* Decide how one *stage* of a model should be held, from this machine's
+ * RAM and the CLI policy. This is the shared decision behind both the expert
+ * planner and the video pipeline: a stage whose weights fit under the
+ * ceiling is faulted in once and wired (no-swap mode), so the VM can neither
+ * compress nor page the pages a tight inner loop re-reads; a stage that does
+ * not fit is left as a lazy mapping and read from SSD on demand.
+ *
+ * `weight_bytes` is the mapped weight size of this stage. `runtime_bytes` is
+ * the scratch it needs while resident (KV / KDA / staging arenas); pass 0
+ * when the caller accounts for it separately. `reserve_bytes` is headroom the
+ * caller wants kept free for transient allocations (0 = use a machine-derived
+ * default of host/16).
+ *
+ * Result: `resident_bytes` is what should be made wired-resident and
+ * `streamed_bytes` is what stays a demand-paged mapping. `fits` is true only
+ * when the *whole* stage (weights + runtime + reserve) is under the ceiling;
+ * in no-swap mode only a fitting stage is safe to wire — wiring a stage that
+ * is over budget would force the OS to compress or swap something else. */
+typedef struct {
+    uint64_t host_bytes;
+    uint64_t target_bytes;      /* ceiling actually applied (host fraction / limit) */
+    uint64_t weight_bytes;
+    uint64_t runtime_bytes;
+    uint64_t reserve_bytes;
+    uint64_t resident_bytes;    /* weights to fault in and wire */
+    uint64_t streamed_bytes;    /* weights left as lazy / SSD-backed mapping */
+    bool fits;                  /* whole stage fits under the ceiling */
+    bool wire;                  /* wire resident_bytes (no-swap mode && fits) */
+    bool limited_by_ram;        /* ceiling smaller than weights + runtime */
+} cwick_model_fit;
+
+void cwick_mem_fit_model(uint64_t weight_bytes, uint64_t runtime_bytes,
+                         uint64_t reserve_bytes, cwick_model_fit *out);
+
 /* Convenience: bytes -> GiB, used by every budget line we print. Returning a
  * double (rather than a formatted string) keeps the logger lock-free. */
 double cwick_gib(uint64_t bytes);

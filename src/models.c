@@ -83,6 +83,14 @@ bool cwick_model_served_alias(const char *root, char *out, size_t cap) {
         {"DeepSeek-V4.1-Flash-1017", "deepSeek-v4.1-flash-1017"},
         {"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash"},
         {"Sophon-Realtime-32B-Tag", "Sophon-Realtime-32B-Tag"},
+        /* The Qwen3.5 hybrid's config.json carries a training-run artifact as
+         * its inner model_type ("qwen3_5_text") — that string is the kernel
+         * selector, not a name any client should have to guess. Its release
+         * directory is the name operators and goal.md already use; advertise
+         * that, so /v1/models and the completions API answer to the real
+         * checkpoint name instead of leaking the internal type tag. */
+        {"DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"},
     };
     if (!root || !*root || !out || cap == 0) return false;
     out[0] = '\0';

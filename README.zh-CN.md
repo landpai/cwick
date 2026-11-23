@@ -17,7 +17,7 @@
 | **GLM-5.3-flash** | ≈306 GiB，62 分片 | 45 层，288 路由专家，top-8，FP8-E4M3 | 最初的模型，≈320B 参数 |
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB，48 分片 | 40 层，384 路由专家 top-6，MLA + FP4 专家 + FP8 attention | 仍能进笔记本的最大一个 |
 | **MiniMax-M3.1-Flash** | ≈233 GiB，48 分片 | 60 层（3 层稠密），128 专家 top-4，NVFP4 专家 + FP8 稠密 | MoE 三者中占用最小 |
-| **Qwen3.5-9B** | ≈18 GiB，4 分片 | 32 层：24 层 Gated DeltaNet + 8 层 GQA，稠密 BF16，无专家 | 混合线性注意力；唯一稠密文本模型，整份常驻内存，也是最快的一个 |
+| **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic**（Qwen3.5-9B） | ≈18 GiB，4 分片 | 32 层：24 层 Gated DeltaNet + 8 层 GQA，稠密 BF16，无专家 | 混合线性注意力；唯一稠密文本模型，整份常驻内存，也是最快的一个 |
 | **MiniMax-H3-Image** | ≈190 GiB，两棵树 | Qwen3-VL 条件器 → 50 层 DiT → 分块 ViT VAE | 文生图与图像编辑，走 OpenAI 图像接口 |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64 层 FP8 thinker → talker → flow + HiFT，24 kHz | 全双工语音走 WebSocket，同一轮里边听边说 |
 
@@ -157,6 +157,9 @@ sh ./start.sh minimax          # MiniMax-M3.1-Flash，32K 上下文（KV 是 2.3
 sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 GiB 加载期即 wire 常驻）
 ```
 
+Qwen3.5 这个 checkpoint 对客户端暴露的名字是
+`DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic`——请求 `model` 字段填它，`GET /v1/models` 也报它。它内部的 `model_type` 标签（`qwen3_5` / `qwen3_5_text`）只用于选择内核，为兼容起见仍被接受，但不再是展示名。
+
 `start.sh` 同时传了 `--rt` 和 `--img`，把语音与图像管线注册成可热切换的目标；从设置面板（或 `POST /v1/models/switch`）选一个才让它常驻。文本模型常驻时两个图像接口和 WebSocket 语音接口返回 503，反之亦然——详见[图像与语音管线](#图像与语音管线)。
 
 `start.sh` 是推荐的入口：它打开了前缀缓存、web 控制台、局域网共享、模型目录和密码——这些一项一项都容易忘。不用脚本时，同一个服务是：
@@ -207,7 +210,7 @@ decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)
 
 `--verbose` 增加每步细节和内存预算；`--trace` 还会打印渲染后的 prompt、输出和每次工具调用（默认关闭：它会把用户内容打到 stdout）。`Ctrl+C` 任何时候都能干净停下——生成中则在下一个 token 处中断，在飞请求得到 503，快照落盘，最后一行会说明。
 
-`/v1/metrics` 用 vLLM 兼容的命名发布同一份状态，可以被抓取，也可以直接在**设置**标签页里看。
+`/v1/metrics` 用 vLLM 兼容的命名发布同一份状态，可以被抓取，也可以直接在**设置**标签页里看。视频任务额外发布 `cwick:video_stage_seconds_total{stage=...}`（text、pack、encode、dit、vae、audio_vae、mux、load、total）、用于实时采样进度条的 `cwick:video_dit_steps_done` / `_total`、任务/帧/字节计数器以及 `cwick:video_last_total_seconds`。`encode` 阶段是参考图的视觉 VAE 编码，纯文本任务保持为零。完成的任务在 `GET /v1/videos/{id}` 的 `cwick` 对象里返回同样的分阶段数据，其中 `encode_ms` 对应首帧条件注入。DiT 与视觉 VAE 也支持 `--backend metal`（BF16 / F32 张量核 GEMM 加分块注意力）；`CWICK_H3V_GPU=0` 可强制 CPU 路径做 A/B 对比。
 
 ### Web 控制台、模型库与应用市场
 

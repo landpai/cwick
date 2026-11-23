@@ -337,17 +337,25 @@ cwick_status cwick_safetensors_open(const char *root, cwick_safetensors *saf,
              * index at all. The index only enumerates shard *files* here --
              * tensor names come from each shard's own header -- so a one-entry
              * map is enough to open it the same way. */
+            /* `save_pretrained` also writes the unsplit weight file under the
+             * component's own name, so probe both spellings before giving up. */
+            static const char *single_names[2] = {"model.safetensors",
+                                                 "diffusion_pytorch_model.safetensors"};
+            const char *hit = NULL;
             char single[1152];
-            cwick_path_join(single, sizeof(single), root, "model.safetensors");
-            FILE *probe = fopen(single, "rb");
-            if (!probe) {
+            for (int i = 0; i < 2 && !hit; i++) {
+                cwick_path_join(single, sizeof(single), root, single_names[i]);
+                FILE *probe = fopen(single, "rb");
+                if (probe) { fclose(probe); hit = single_names[i]; }
+            }
+            if (!hit) {
                 cwick_error_set(err, CWICK_ERR_IO, "missing safetensors index %s",
                                 idxpath);
                 return CWICK_ERR_IO;
             }
-            fclose(probe);
-            const char *synth =
-                "{\"weight_map\":{\"model\":\"model.safetensors\"}}";
+            char synth[160];
+            snprintf(synth, sizeof(synth),
+                     "{\"weight_map\":{\"model\":\"%s\"}}", hit);
             len = strlen(synth);
             text = cwick_xmalloc(len + 1);
             memcpy(text, synth, len + 1);

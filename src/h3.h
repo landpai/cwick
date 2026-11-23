@@ -83,6 +83,19 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
                  unsigned char **out, size_t *out_len, h3_timing *tim,
                  cwick_error *err);
 
+/* Live render progress. A generation runs under the model lock, so at most
+ * one is in flight per process; the six phases and the DiT step counter are
+ * published through atomics for a polling client. `phase` is 0 idle, 1..6 for
+ * tokenize / text_encode / pack / dit / vae / png, and 7 for a finished
+ * render (cleared by the next call). `step`/`steps` are meaningful only in
+ * phase 4. `stamp_ms` is a monotonic clock value for staleness checks. */
+typedef struct {
+    int phase;
+    int step, steps;
+    double stamp_ms;
+} h3_progress;
+void h3_progress_get(h3_progress *out);
+
 /* PNG encoding for the API response. `rgb` is interleaved float [0,1]. */
 unsigned char *h3_png_encode(const float *rgb, int w, int h,
                              size_t *out_len, cwick_error *err);
@@ -107,5 +120,30 @@ bool h3_png_decode(const unsigned char *png, size_t len, float **rgb,
  * the unit tests drive it directly. */
 int h3_multipart_refs(const char *body, size_t body_len, const char *boundary,
                       const unsigned char **ptr, size_t *len, int max);
+
+/* Text conditioning without an image model.
+ *
+ * The video pipeline uses the same H3-Encoder (Qwen3-VL) the image pipeline
+ * does, but it must not depend on a MiniMax-H3-Image checkpoint being present:
+ * a server started with --videos only has the video root. This opens the
+ * encoder and tokenizer under `te_dir` / `tok_dir`, runs the prompt through the
+ * final hidden layer, and returns that activation in *hs (seq x 5120, caller
+ * frees with h3_text_cond_free). Nothing is cached: the encoder is read once
+ * per request, which is the same profile the image path has. */
+bool h3_text_cond_dir(const char *te_dir, const char *tok_dir,
+                      const char *prompt, float **hs, int64_t *seq,
+                      int64_t *tokens, cwick_error *err);
+/* Text conditioning with one image reference in the model's presentation:
+ * `Picture 1: <|vision_start|> <|image_pad|>... <|vision_end|>` followed by
+ * the prompt verbatim. `ref_rgb` is float RGB in [0,1]; the tower resizes it
+ * to its own input grid. Besides the hidden states this returns one modality
+ * tag per row (1 text, 0 vision) so the video denoiser can address its AdaLN
+ * table per row. Caller frees both with h3_text_cond_free(). */
+bool h3_text_cond_ref_dir(const char *te_dir, const char *tok_dir,
+                          const char *prompt,
+                          const float *ref_rgb, int ref_w, int ref_h,
+                          float **hs, int64_t *seq, float **tags,
+                          cwick_error *err);
+void h3_text_cond_free(float *hs);
 
 #endif /* CWICK_H3_H */

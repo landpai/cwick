@@ -8,8 +8,22 @@ This build exposes two OpenAI-shaped image endpoints backed by `MiniMax-H3-Image
 
 - `POST /v1/images/generations` (and `/images/generations`) — JSON in, `{"created":…,"data":[{"b64_json":"…"}]}` out.
 - `POST /v1/images/edits` (and `/images/edits`) — `multipart/form-data` with repeatable `image` parts; same response shape.
+- `GET /v1/images/progress` (and `/images/progress`) — live phase of the render in flight.
 
-Both add a `cwick` timing object to the response: `total_ms`, `tokenize_ms`, `text_encode_ms`, `pack_ms`, `dit_ms`, `vae_ms`, `png_ms`, `text_tokens`, `image_tokens`, `canvas_w/h`, `output_w/h`.
+Both POST endpoints open the image model on demand: if no pipeline is resident,
+the first request closes the swap gate, releases the current text/realtime
+model and maps `MiniMax-H3-Image`, exactly like `POST /v1/models/switch`. No
+manual switch is required. A concurrent switch answers 503 rather than
+double-loading.
+
+`GET /v1/images/progress` is answered before generation admission, so polling
+never queues behind the multi-minute job it watches. It returns
+`{"object":"image_progress","phase":P,"phase_name":"…","step":N,"steps":M,"idle":bool,"age_ms":…}`.
+Phases are 0 idle, 1 tokenize, 2 text_encode, 3 pack, 4 dit (`step`/`steps` is
+the DiT counter), 5 vae, 6 png, 7 done; `idle` is true at rest or when the
+snapshot is older than 10 s.
+
+Both POST endpoints add a `cwick` timing object to the response: `total_ms`, `tokenize_ms`, `text_encode_ms`, `pack_ms`, `dit_ms`, `vae_ms`, `png_ms`, `text_tokens`, `image_tokens`, `canvas_w/h`, `output_w/h`.
 
 Parameter constraints: `size` must be `WIDTHxHEIGHT`; `num_inference_steps` may be omitted or 6; `guidance_scale` may be omitted or 1; `negative_prompt` is rejected with 400; `response_format` must be `b64_json`.
 

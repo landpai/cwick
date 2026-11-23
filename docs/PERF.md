@@ -1199,3 +1199,78 @@ depth and chaining its own residual beyond that is out of distribution
 multi-depth drafter, which is not in the file.
 
 Prefill is still the CPU's at 71-80 tok/s.
+
+## MiniMax-H3 video, one-step smoke at 256x256
+
+Measured on the same M3 Max / 128 GiB machine with `--backend metal` active.
+The video pipeline is still CPU fp32 SGEMM: Metal is initialised and available,
+but no H3V DiT or VAE kernel is dispatched. `CWICK_H3V_STEPS=1` is a wiring
+knob, not a quality setting. First-frame-to-video, 64x64 reference, 256x256
+canvas, 102 frames, 4 s at 24 fps, seq 2267 (text 7 + audio 340 + video 1920):
+
+| stage | ms |
+|---|---:|
+| text encoder | 36,076 |
+| pack + reference VAE encode | 550 |
+| DiT, 1 step | 120,707 |
+| video VAE decode | 106,580 |
+| audio VAE decode | 5,089 |
+| H.264/AAC mux | 196 |
+| **total** | **269,355** |
+
+The first layer alone took 115 s of the DiT step; 1280x720 reaches seq 27,974
+and the same layer takes minutes, so the default 30 steps is not a usable
+minutes-scale setting on this checkpoint. Speeding this up needs a Metal path
+for the video DiT and VAE, not another scheduling tweak.
+
+First-frame conditioning is measurable, not just a log line. Decoding the
+output mp4 and comparing luma against the reference upscaled to 256x256, in
+pure C: frame 0 correlation **0.567** (R 0.509, G 0.567, B 0.784), frame 40
+correlation **−0.036**. The reference affects the first frame and then the DiT
+moves away from it, which is the intended behaviour.
+
+## Video DiT + VAE on Metal: same-machine A/B
+
+The video pipeline now has a Metal path for its two compute stages. One GEMM
+kernel stages BF16 tiles (DiT weights) and one stages F32 tiles (VAE weights);
+both accumulate in FP32 fragments. Flash attention is instantiated at 128-wide
+heads for the DiT and 64-wide heads for the VAE decoder. The activation is
+staged into the kernel's dtype — the same trade the released BF16 pipeline
+makes — and the checkpoint bytes are adopted as no-copy buffers.
+
+Same M3 Max / 128 GiB machine, 256x256, 4 s, 102 frames, 1-step i2v smoke,
+`--backend metal`. Same seed and reference frame, `CWICK_H3V_GPU=0` for the
+CPU run:
+
+| stage | CPU (ms) | Metal (ms) | ratio |
+|---|---:|---:|---:|
+| text encoder | 36,076 | 7,598 | 4.7x |
+| DiT step | 149,547 | 51,595 | 2.9x |
+| video VAE decode | 105,813 | 50,522 | 2.1x |
+| audio VAE decode | 5,381 | 5,072 | 1.1x |
+| H.264/AAC mux | 209 | 221 | — |
+| **total** | **269,355** | **168,201** | **1.6x** |
+
+The text stage is not on the new path: its 4.7x is first-touch page-cache
+variation between the two runs, not a code change. Counting only what changed,
+the DiT and video VAE together drop from 255 s to 102 s. The audio VAE stays
+on the CPU (GEMV shapes, ~5 s).
+
+The DiT phase timing includes a roughly 52 s one-off cost before the first
+block: opening the 62 GiB shard index and walking one byte per page so the
+no-copy Metal views are faulted in. The step itself is the 51.6 s figure.
+That cost is paid once per generation on both backends and amortises over the
+30 default steps.
+
+Output fidelity was checked on the decoded frames, not just on the kernel
+inputs. CPU and Metal frame 0 correlate **0.9989** pixel-wise (mean absolute
+channel difference 0.015/255); frame 40 correlates **0.9944**. First-frame
+conditioning is unchanged: frame 0 correlates **0.567** with the reference,
+frame 40 **−0.037**. Both clips decode as H.264 High 24 fps plus AAC-LC
+32 kHz stereo.
+
+`make h3vgpuprobe` compiles the production shader and compares all four
+kernels against CPU loops with no weights: F32 GEMM 1.9e-5, BF16 GEMM 7.8e-3,
+strided F32 GEMM 7.6e-6, 64-wide attention 2.3e-4, 128-wide attention 2.7e-4.
+`CWICK_H3V_GPU=0` is the A/B escape hatch; any unsupported shape falls back
+per call, so a clip is never blocked by the GPU path.

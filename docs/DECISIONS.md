@@ -4940,3 +4940,1210 @@ with pauses longer than `silence_duration_ms` is split several times and the
 rest is interpreted as barge-in; the same three commits and cancelled response
 appear with the legacy flag, so this is a harness property, not a regression.
 Use `--burst` when measuring a pre-recorded clip.
+
+## 84. The Qwen3.5 checkpoint answers to its release name, not its type tag
+
+The hybrid checkpoint's `config.json` carries two internal names: an outer
+`model_type=qwen3_5` and an inner `text_config.model_type=qwen3_5_text`. Both
+are kernel selectors — the loader unwraps `text_config` first, and `engine.c` /
+`server.c` branch on the `qwen3_5` prefix — so neither may be rewritten. But
+`cwick_model_served_alias()` derives the advertised API name from the directory
+basename, and the Qwen3.5 directory was the only release checkpoint missing
+from that table. It therefore fell back to the inner type tag: clients saw
+`qwen3_5_text` in `GET /v1/models`, in the `model` field they had to send, in
+`/v1/metrics` (`mi.model`) and in the startup log, while `start.sh` already
+accepted the real name as a launch argument. That mismatch — launch by release
+name, answer by type tag — was the bug.
+
+Fix: one entry in the table mapping the release directory
+`DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` to that same name as its served
+alias. `served_name()` (catalog), the metrics publisher (root-derived alias)
+and `validate_body()` (through `cur->alias`) now all report and accept the real
+name; `qwen3_5_text` and `qwen3_5` stay accepted as `model_id` / catalog id, so
+nothing that learned the old name breaks. The alias differs from those ids, so
+`cwick_models_list_add()` keeps it rather than blanking it as "no better name".
+Two assertions in `make test` pin both the directory lookup and the catalog
+entry; the suite is green at 749.
+
+## 85. A downloaded checkpoint is not the same as a loadable one
+
+The model-library tab called a completely downloaded checkpoint "Incomplete"
+(`hub.partial`) when its directory had no `config.json` and was not an image
+pipeline. `checkpoint_ready()` used those two markers as its only definition of
+"downloaded", so a payload that ships plain `.pt` / `.ckpt` weights — the SVC
+pipeline under `models/GiantAILab/YingMusic-SVC`, 2.03 GB in four files — was
+reported as unfinished even though it had zero `.incomplete` files. The
+download rule in `hub.c` is that `<target>.incomplete` is the *only* marker of
+an unfinished transfer: a file is renamed into place only once its size
+matches the listing. Every regular file in that directory had therefore
+finished downloading; only the "is this a text model" heuristic was wrong.
+
+Fix: `checkpoint_ready()` now also accepts a directory containing a recognised
+weight payload (`.safetensors`, `.bin`, `.pt`, `.ckpt`, `.pth`, `.gguf`,
+`.onnx`, `.npz`) when no `.incomplete` file is present. The reason text is no
+longer "config.json is not present yet" but "weights-only checkpoint (no
+config.json); not a cwick-loadable architecture". "Downloaded" and "loadable"
+stay separate facts: the card renders "Complete" plus the architecture-mismatch
+badge, and still offers no switch button (the checkpoint has no cwick kernel) —
+the same treatment `Ace-Step1.5` already received via its `config.json`.
+
+Measured on the live server: `GET /v1/hub/models` went from
+`complete=false, supported=false` to `complete=true, supported=false` for that
+one entry; the other seven models were byte-identical. `make test` stays green
+at 749.
+
+## 86. A hand-downloaded pipeline is invisible to the library scan
+
+`models/MiniMaxAI/MiniMax-H3/` holds a complete 498 GB diffusers pipeline
+(485 files) that the model-library tab never listed. Its files are intact and
+there is not a single `.incomplete`, so this was not a download-state problem
+like §85 — the directory never entered the inventory at all.
+
+The scan gate `looks_like_checkpoint()` accepted only three markers:
+`config.json`, the strict H3 *image* manifest (`_class_name` equal to
+`MiniMaxH3ImagePipeline` or `partition:"image"`), and the `.cwick-repo` marker
+that cwick's own downloader writes. A checkpoint downloaded by hand has no
+such marker, and this one's manifest says `MiniMaxH3ModularPipeline`, so both
+the owner directory and its child were skipped.
+
+Fix: `looks_like_checkpoint()` now also accepts any top-level
+`model_index.json`, independent of its class and of how the files arrived.
+The strict image manifest is still used for the `image` kind and for
+`supported`, so the modular pipeline is listed as complete but not loadable
+(`complete=true, supported=false`) rather than offered as a switchable image
+model. A half-downloaded pipeline has the index but no weight payload, so it
+stays visible as incomplete.
+
+Verified offline (no server started): a small probe calling
+`cwick_hub_models("./models")` reports nine entries with MiniMax-H3 present at
+498 GB / 485 files; `make test` is green at 755 (six new assertions).
+
+## 87. The H5 studio closes the loop from image to video
+
+App 3 (`apps/imagegen`) is a two-step H5 studio. Step one already called the
+two image endpoints; step two now takes the PNG from step one (or an uploaded
+image) plus a video prompt and calls the async `/v1/videos` resource, polling
+`GET /v1/videos/{id}` for the real `progress` field and streaming
+`GET /v1/videos/{id}/content` for download. Progress is server-driven, not a
+timer: the bar tracks the job's phase weights (text 0-5%, pack 5-10%, dit
+10-80%, video VAE 80-92%, audio VAE 92-97%, mux 97-100%).
+
+The sampler is text conditioned — the visual VAE has only a decoder, so there
+is no encoder to turn the reference image into an initial latent. Rather than
+pretend to do image-to-video, the app submits the image as an optional `image`
+field (data URL or bare base64) and the server validates it (PNG/JPEG magic),
+keeps the bytes with the job and reports `reference_image` with
+`conditioning:"text_only"` in the detail view. The source image is shrunk to a
+1024px JPEG in the browser first: a full 1536x2048 PNG data URL can exceed the
+server's 8 MiB request-body ceiling, and a reference does not need full
+resolution.
+
+The server recycles a video slot by freeing the previous `prompt`, `mp4` and
+`ref_image` before `memset`, which also fixes a pre-existing mp4 leak on job
+reuse. The `image` failure paths free the decoded bytes. `make test` stays
+green; embed rebuild reports the updated 22 blobs.
+
+## 88. First-frame-to-video needs the encoder we said did not exist
+
+Section 87 claimed the visual VAE had only a decoder. That was wrong. The
+shipped `FL2VA/video_vae/source/model.safetensors` contains all 116 `encoder.*`
+tensors, plus `quant_conv` and `post_quant_conv`: a causal 3D CNN with ch=128,
+`ch_mult=[1,2,2,4,4,8]`, two residual blocks per level and spatial strides
+`[2,2,2,2,1,1]`. The missing piece was the implementation, not the weights.
+
+`h3v_vae_encode()` in `h3v_vae.c` now turns one RGB24 frame into the 24-channel
+latent mean. The key reduction is temporal: with a single frame, causal padding
+puts `KT-1` zeros in front and only the last temporal kernel slice contributes,
+so every 3D convolution becomes a 2D convolution with kernel `w[:,:,KT-1,:,:]`.
+Convolutions run as im2col + sgemm; spatial pad is reflect for residual/conv
+blocks and a lower-only zero pad for strided downsamplers. GroupNorm(32, eps
+1e-6) is per-frame, followed by SiLU. `norm_out -> conv_out(48) -> quant_conv`
+yields the moments; the first 24 channels are the latent (eps=0 for a
+conditioning frame).
+
+Verification is pure C and does not trust the old numpy replay (whose conv
+helper padded the wrong axis and read only the zero frame, leaving just the
+bias). A hand-computed interior pixel of `conv_in` matched the C kernel to
+1.3e-7 once the bias was read from the right shard offset. End to end, encoding
+a structured 64x64 pattern and decoding the latent straight back through the
+already-verified ViT decoder gave an R-channel correlation of 0.9186 — an
+encoder that produced garbage could not reconstruct its input.
+
+Conditioning uses the existing video-token channel: no new DiT input exists.
+The reference is resized to the render canvas, encoded, and written into
+latent step 0; a packed copy of those rows is restored after every Euler
+update so the frame stays clean while the DiT keeps attending to it. The cache
+shortcut is disabled when a reference is present. The HTTP detail now reports
+`reference_image.conditioning` as `first_frame` when encoding succeeded and
+`text_only` only on decode failure. Both `h3vprobe` and `h3vencprobe` are
+plain C tools in `tools/` with Makefile targets.
+
+## 89. The mp4 muxer wrote no moov atom, and esds wrapped a descriptor in a descriptor
+
+The first end-to-end i2v clip could not be opened at all: ffprobe reported
+`moov atom not found` and `wrong sample count`. A pure-C box walker on the
+output showed why. `h3v_mp4_encode()` built `moov` as a buffer of *children* and
+then appended `moov.p` with `mb_put()` — there was never a box header for the
+atom itself, so `mvhd` and both `trak` boxes sat loose at top level. Separately
+`stsc` declared one chunk containing all samples while `stco` had one offset
+per sample (102 entries); ISO 14496-12 requires those counts to agree.
+
+Four fixes in `h3v_mp4.m`: emit `mb_box(&out, "moov", &moov)`, make stsc
+`samples_per_chunk = 1`, express `tkhd` duration in the movie timescale (it was
+using the media timescale, 24x too long), and correct two descriptor length
+fields in `esds`.
+
+Audio still failed after the box layout was fixed: `Audio object type 0`,
+`22050 Hz, 0 channels`. The AudioToolbox magic cookie is a complete ES
+descriptor with 7-bit expanded sizes, not the bare AudioSpecificConfig that
+belongs in `DecSpecificInfo`; we had nested the former inside the latter.
+`find_asc()` now walks ES -> DecoderConfig -> DecSpecificInfo and extracts the
+two-byte config (`12 90` for 32 kHz stereo AAC-LC). ffprobe then reports
+`AAC (LC), 32000 Hz, stereo` and both streams decode to exactly the expected
+sample counts (AAC output is padded to its 1024-sample packet boundary).
+
+Regression is cheap now: `make h3vmuxprobe` feeds synthetic pixels and PCM
+straight to the muxer, and `test_h3v_mp4` in the suite checks box coverage,
+stsc/stco agreement and the bare AAC-LC config in memory. Neither needs a
+checkpoint or a four-minute DiT pass.
+
+## 90. Video timings were only in the job detail, not in /v1/metrics
+
+A client polling `GET /v1/videos/{id}` saw a full `cwick` timing object after
+completion, but a Prometheus scrape saw no video metrics at all — the same
+blind spot that had made the 10%-stuck job look healthy. `metrics.{c,h}` now
+publishes `cwick:video_jobs_total`, `_succeeded_total`, `_failed_total`,
+`_first_frame_jobs_total`, cumulative `cwick:video_stage_seconds_total{stage=...}`
+(text, pack, encode, dit, vae, audio_vae, mux, load, total), live
+`cwick:video_dit_steps_done` / `_total`, `cwick:video_last_total_seconds`,
+frame/byte counters and `cwick:video_tokens_total{kind=...}`. The DiT gauges
+are set from the existing progress callback, so a scrape during a long sample
+distinguishes progress from a hang. `h3v_timing` gained `encode_ms` for the
+reference-image VAE pass; the job detail and the counters are measured by the
+same monotonic clock.
+
+## 91. First-frame conditioning verified on a playable clip
+
+Section 88's encoder numbers were tensor-level. The full i2v path was then run
+with the fixed muxer (§89) at 256x256 / 1 step and produced a 571,855-byte mp4
+that ffprobe reads as H.264 High 24 fps plus AAC-LC 32 kHz stereo, duration
+4.32 s. Decoding frame 0 and frame 40 and comparing luma against the 64x64
+reference upscaled in pure C gives correlations **0.567** and **−0.036**. The
+reference is therefore genuinely present in the first decoded frame and absent
+later, which is the behaviour the latent-step-0 injection is supposed to
+produce. Full stage timings are in PERF.md.
+
+## 92. Video DiT and VAE now have a Metal path; output stays byte-close to CPU
+
+Sections 89-91 fixed correctness and observability but left the video DiT and
+VAE on CPU fp32 SGEMM. `--backend metal` initialised a device that no video
+kernel ever used. This adds `h3v_gpu.{h,c,m}`: a BF16 tensor-core GEMM for the
+50 DiT blocks, an F32 tensor-core GEMM for the VAE's F32 checkpoints, and a
+tiled flash-attention kernel instantiated at 128 channels (DiT) and 64
+channels (VAE decoder). All share the same no-copy adoption used by the image
+transformer, so a 62 GiB shard is wrapped once rather than once per projection.
+
+Two kernel details mattered. Metal forbids threadgroup arrays in a non-kernel
+function, so the kernels declare the staging memory and pass it to the shared
+core. And the attention rescale maps a simdgroup's 8xHD output over 32 lanes as
+four blocks of HD/4: hard-coding the 128-wide layout made the 64-wide instance
+write garbage. The h3vgpuprobe tool caught both before any weights were loaded.
+
+The policy is per call: unsupported shapes, no device, or `CWICK_H3V_GPU=0`
+fall back to the existing CPU code, so the GPU can never block a clip.
+Measured on one machine, 256x256 / 1 step: total 269.4 s -> 168.2 s, DiT step
+149.5 s -> 51.6 s, video VAE 105.8 s -> 50.5 s. Decoded frames from the two
+paths correlate 0.9989 (frame 0) and 0.9944 (frame 40); first-frame conditioning
+still gives 0.567 against the reference at frame 0 and -0.037 at frame 40.
+Full table in PERF.md.
+
+## 93. Image endpoints open the model on demand and report real progress
+
+Application 3 (the two-step image + video wizard) had two usability gaps left
+after the video work. First, the image endpoints still required the operator to
+pre-switch to `MiniMax-H3-Image`: a cold POST answered 503 and the H5 studio
+showed a blocking "switch in settings first" confirm. The video endpoint had
+already solved this by loading its pipeline on first use, through the same
+one-model slot and swap gate the explicit switch uses. `srv_image_route` now
+does the same: if no image pipeline is resident it calls `srv_switch_image`,
+which closes the gate, releases the text/realtime weights, and maps the image
+checkpoint. A concurrent switch answers 503 instead of double-loading. The H5
+confirm was removed and the model pill now reads "load on first use".
+
+Second, the image progress panel was a fake timer (`6 + secs/30`) that filled
+up regardless of what the renderer was doing. The renderer already publishes a
+live snapshot (phases 0 idle, 1 tokenize, 2 text_encode, 3 pack, 4 dit with a
+step/steps counter, 5 vae, 6 png, 7 done); it just was not exposed. A new
+`GET /v1/images/progress` answers before admission with `phase`, `phase_name`,
+`step`, `steps`, `idle` and `age_ms`, so a poll never queues behind the ~40-minute
+job it is watching. The H5 app polls it once a second, weights DiT at 60% of
+the bar, and still fills the exact per-stage timings from the response's
+`cwick` object at the end. A failed or stale poll only leaves the last snapshot
+on screen; it cannot disturb the render.
+
+End-to-end on this machine with the rebuilt binary: a cold
+`POST /v1/images/generations` released the text model and loaded the image
+pipeline on demand, then returned a clean 400 for an empty prompt (no render
+started); `GET /v1/images/progress` reported `idle:true` at rest. `make test` passes and
+the served `app.js` is the rebuilt 33420-byte asset with three references to
+the real endpoint.
+
+## 94. A "black" video was white noise behind a valid mp4, and the dashboard called it success
+
+The log for `video_1795193877_1` and `/v1/metrics` agreed on the mechanics: the job
+finished, muxed 2,570,415 bytes, reported `video_jobs_succeeded_total 1` and
+`video_first_frame_jobs_total 1`. The total was 20,752.6 s, of which the DiT alone
+took 19,948.8 s across 30 steps (~665 s/step at 736x1280). Nothing in that data
+described the pixels. Pulling `GET /v1/videos/{id}/content` and reading frames back
+showed why it looked black: frame 0 held the recognizable conditioning image under
+a heavy tile grid, but frames 20 and 100 were high-frequency static (mean luma
+70-73, smoothness ratio ~0.53 versus ~0.75 for frame 0). Adjacent-frame
+correlation fell from +0.97 across the held frames to +0.77-0.80 deep in the clip
+— the generated latent was still noise, and the VAE faithfully decoded noise.
+
+The sampler's sign, timestep embedding and sigma-to-timestep mapping were checked
+against the image line, which produces good output with the same flow-matching
+family; they match. The concrete defect found was the audio shift: the checkpoint
+declares `sigma_shift_scales` video=12.0, audio=3.0 in `model_index.json`, but the
+sampler applied 12.0 to both streams, making the audio Euler step 4x too large.
+That does not explain the video frames, so it was fixed without claiming it did.
+
+Two things were added because a 5.7-hour generation cannot be the feedback loop:
+
+1. A CPU-only denoise signal, computed from the latent the pipeline already
+   holds. `spatial_corr` is the mean lag-1 horizontal autocorrelation of the
+   first generated latent step (the conditioning step is excluded); natural
+   decoded latents sit near 0.8, white noise near 0. `snr_db` is the generated
+   step's std over the clean step's std. Both land in `h3v_timing`, in the job
+   detail's `cwick` object, and `suspect_noise` adds a
+   `cwick:video_suspect_noise_jobs_total` counter so a noise clip is no longer
+   indistinguishable from a good one in a dashboard. The floor is provisional
+   (0.35, `CWICK_H3V_CORR_FLOOR` overrides it) until a known-good clip is
+   measured. `tools/h3vprobe` prints the same three numbers for direct A/B.
+2. Config-backed shifts: `h3v_model_open` reads `_minimax_h3.sigma_shift_scales`
+   (defaults 12.0/3.0), video and audio each step on their own sigma grid while
+   the single shared time embedder is unchanged, and `CWICK_H3V_VIDEO_SHIFT` /
+   `CWICK_H3V_AUDIO_SHIFT` permit A/B. `CWICK_H3V_REF_NOISE_AUG=<level>` also
+   exposes the image line's noise-augmented first-frame conditioning as an opt-in
+   lever; the default stays clean so existing output does not move until it is
+   measured.
+
+`make test` passes, including a new assertion for the suspect-noise counter, and
+`h3vprobe` builds. The open question is now measurable in one short probe instead
+of one long render: which DiT convention leaves the generated frames at noise
+level. No claim is made that the black screen is fully fixed by the shift change.
+
+## 95. Calibrating the noise floor and A/B-ing the DiT timestep convention
+
+The provisional 0.35 correlation floor in §94 needed real numbers. Two pure-C
+knobs were added to `h3vprobe` (no model reads, no Python):
+`CWICK_H3V_CORR_TRACE` prints the generated step's lag-1 latent correlation after
+every Euler update, and `CWICK_H3V_DIAG_MIX=<m>` / `CWICK_H3V_DIAG_TS=<t>` start
+from a known `m*noise + (1-m)*clean` mix and force one conditioning timestep, so
+the velocity's direction can be read in one step instead of one 30-step render.
+`h3v_timing.clean_corr` (the same correlation on the clean conditioning step)
+and `H3VPROBE_METAL=1` (force Metal to match `--backend metal`) were added to the
+probe as well.
+
+Calibration at 256x256, 2 steps: the VAE-encoded clean reference step measured
+0.769-0.814, pure/near noise measured -0.145 to 0.068. The 0.35 floor separates
+them cleanly and stays the default (`CWICK_H3V_CORR_FLOOR` still overrides it).
+
+A one-step probe at sigma=0.9 appeared to show the checkpoint wants `t=sigma`:
+`ts=0.1` (the code's `1-sigma`) drove corr 0.068 -> 0.025 while `ts=0.9` drove it
+0.068 -> 0.290. That was a false lead — the forced `dt=0.9` is a giant step and
+the latent std exploded from 0.947 to 2.042, past the clean anchor, so it measured
+an out-of-distribution overshoot rather than a convention. Two matched full 8-step
+runs settled it: `t=1-sigma` (the original) ended at corr 0.360 (`ok`), `t=sigma`
+at 0.288 (`suspect`). The change was reverted; the default stays `t=1-sigma`,
+matching the image line. `CWICK_H3V_TS=sigma` keeps the alternative for a test at
+>=4 MP, where the checkpoint is actually in distribution — at 256x256 it returns
+textured noise by design, so a short run cannot judge denoising quality at all.
+
+What is now established: the noise floor is calibrated; the audio shift was a
+real bug (checkpoint declares 3.0, code applied 12.0) and is fixed via config;
+and a noise clip can no longer masquerade as `succeeded`. The 30-step black
+screen's root cause is still open. The remaining suspects are the shift=12 grid
+back-loading nearly all denoising into the last step, and the reference-level
+difference (the image line conditions reference rows at their own 0.999 timestep
+with a `0.999*clean + 0.001*noise` latent; the video line uses a pure-clean latent
+and one shared timestep). Both need a >=4 MP A/B to confirm; no fix is claimed.
+
+## 96. The denoise signal was reading the wrong tensor plane; layout fixed and re-measured
+
+The noise-floor calibration and the timestep A/B in §95 were built on a broken
+reader. `vlat` is `[C][T][H][W]` — `h3v_pack3d()` indexes it as
+`((c*lt + t)*lh + y)*lw + x`, and the VAE decoder gathers a cell's 24 channels
+with the same stride. But `h3v_lat_step_stats()` computed its plane as
+`t*VD_LATENT*lh*lw` (a `[T][C][H][W]` assumption), so for t=1 it measured a mix
+of channel 0's late time steps and channel 1's early ones, not the first
+generated frame. The reference injection had the mirror bug: it `memcpy`'d the
+encoder's contiguous `[C][H][W]` output into the front of `vlat`, which in
+`[C][T][H][W]` scatters the 24 channels down channel 0's time axis instead of
+placing them all at t=0. Frame 0 still looked partly right because the packed
+reference rows were restored after every Euler step, but the DiT's first step
+conditioned on a corrupted t=0 latent.
+
+Both are fixed in `src/h3v.c`. The reference frame is assembled in encoder
+layout, scattered channel-by-channel to `vlat` t=0, and packed from that same
+buffer; the stats function takes `lt` and strides `(c*lt + t)*lh*lw`. A weight-
+free `h3v_layout_selftest()` in `h3v_internal.h` checks that a smooth plane at
+t=0 reads high, a t=1 plane reads low, and pack/unpack round-trips exactly;
+`make test` asserts it.
+
+Re-measured at 256x256, 4 s, seed 42, Metal, 8 steps (all four runs matched):
+
+| config | final spatial_corr | clean_corr | snr_db | suspect |
+| --- | --- | --- | --- | --- |
+| default (t=1-sigma, shift 12, clean ref) | 0.247 | 0.848 | +0.63 | yes |
+| `REF_NOISE_AUG=0.999` | 0.247 | 0.848 | +0.63 | yes |
+| `VIDEO_SHIFT=3` | 0.145 | 0.848 | +0.91 | yes |
+| both | 0.145 | 0.848 | +0.91 | yes |
+
+The corrected trace starts at corr -0.003 (true white noise) and rises
+monotonically to 0.247; the old trace's 0.404 start was a cross-channel read.
+`clean_corr=0.848` is the real smooth reference. The 0.35 floor still separates
+clean from noise and is unchanged. Reference noise augmentation is a no-op at
+0.999 — that is ~0.1% noise over a clean latent, and the image line's actual
+mechanism is a separate 0.999 timestep, which this checkpoint cannot express:
+its `adaln_proj.linear.weight` is `[96768, 2688]` = 18 rows = 6 vectors x 3
+modalities, with no timestep axis. Lowering the video shift to 3 spreads the
+denoising across steps (step 3 corr 0.072 vs 0.007 at shift 12) but ends lower
+at 8 steps (0.145 vs 0.247). All four remain under the floor at 256x256, which
+the checkpoint treats as out of distribution (>=4 MP is the supported size), so
+no conclusion about 30-step quality is drawn here. The 30-step black screen's
+root cause is still open; the layout fix removes a real defect but does not by
+itself prove the fault is gone.
+
+## 97. Both FL2VA and Ref2VA are selectable per request
+
+The shipped MiniMax-H3 root contains two complete partitions, `FL2VA/` and
+`Ref2VA/`, each with a 62 GiB `transformer/`. Their DiT configs and all 538
+weight keys are identical, and the visual VAE, audio VAE and text encoder are
+byte-identical (`FL2VA/video_vae/source/model.safetensors` and the Ref2VA copy
+hash the same, as do the text-encoder indexes). Only the trained transformer
+weights differ: FL2VA is first/last-frame-to-video+audio, Ref2VA is omni-
+reference-to-video+audio. The old `h3v_model_open()` picked the first directory
+that existed — FL2VA on a full download — and offered no way to reach Ref2VA,
+so half the checkpoint was unusable through `/v1/videos`.
+
+`h3v_model_open()` now enumerates every usable variant (a variant counts only
+if its `transformer/` actually holds shards), records each canonical name with
+its DiT directory, and picks a default from `CWICK_H3V_VARIANT` or the first
+found. `h3v_generate_variant()` pins one partition for a job; the shared VAE
+and text encoder stay mapped. Because all generation already runs under the
+model mutex and each job opens and closes its own DiT shards, only one 62 GiB
+transformer is resident at a time and the two variants never contend.
+
+`POST /v1/videos` accepts `variant` (alias `model_variant`), validates it
+before queuing (HTTP 400 with the available names on a typo), and reports the
+canonical value in the job detail next to `reference_image`. stdout logs the
+chosen variant and the exact shard path at DiT open. `tools/h3vprobe.c` takes
+`H3VPROBE_VARIANT` for the same path. A pure-C `h3v_variant_selftest()` covers
+case-insensitive name matching and is asserted by `make test`.
+
+End-to-end, `--backend metal`, 256x256, 4 s, 2 steps, seed 42, same
+`input/sample.png` (1152x1536) and `input/sample_video.txt` prompt for both:
+
+| variant | status | DiT shards opened | conditioning | total_ms | dit_ms | spatial_corr | suspect |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FL2VA | completed | `FL2VA/transformer` | first_frame | 285894 | 165533 | 0.376 | 0 |
+| Ref2VA | completed | `Ref2VA/transformer` | first_frame | 256562 | 127090 | 0.360 | 0 |
+
+Both downloads produced a valid H.264 + AAC mp4 (559228 vs 568343 bytes,
+different hashes), first-frame conditioning succeeded, and `suspect_noise=0`
+for both. `/v1/metrics` read `video_jobs_total 2`, `succeeded_total 2`,
+`failed_total 0`, `first_frame_jobs_total 2`, `suspect_noise_jobs_total 0`.
+The two step smoke test proves both partitions load and run on this machine;
+it does not make a 30-step quality claim (256x256 is below the checkpoint's
+supported size).
+
+## 98. The video VAE was decoding an un-normalised latent
+
+`vae/config.json` ships 24 per-channel `latents_mean` / `latents_std` values.
+The transformer samples in that normalised space, but the video path ignored
+both tables: `h3v_vae_encode()` returned the `quant_conv` output raw, and
+`h3v_vae_decode()` fed the sampled latent straight into the folded
+`post_quant_conv` + `x_embedder`. `h3v_internal.h` even documented the decoder
+input as "already de-normalised by the caller", but no caller did it. The
+per-channel error is large — std spans 0.45-3.28 and mean spans -1.37-1.07 —
+so the 36-block ViT decoded a picture unrelated to the sampled clip, and the
+conditioning frame written into latent step 0 was equally wrong for the DiT.
+
+Fix, all in `src/h3v_vae.c`: the two tables, `vl_lat_norm()` on the encoder
+output (raw -> normalised, so a reference frame lands in the same space the
+noise lives in) and `vl_lat_denorm()` on the decoder input (normalised -> raw)
+before the tile loop. `h3v_latnorm_selftest()` checks the round-trip and that a
+zero latent maps exactly onto the per-channel mean; `make test` asserts it.
+
+Three measurements separate this from the older "black screen" theory:
+
+* encode -> decode at 256x320, no DiT: R-channel correlation **0.8762** and the
+  reconstruction is a recognisable portrait. Before the fix the same latent
+  decoded into a 16-pixel colour lattice.
+* a constant (zero) latent decodes to a smooth field, so the decoder and its
+  tiling are healthy; the lattice came from the values, not the tiling.
+* the end-to-end frame 0 (the held reference step) went from a flat grid to a
+  clear person silhouette.
+
+End-to-end on this machine, `--backend metal`, `input/sample.png` (1152x1536)
+plus the `input/sample_video.txt` prompt, 768x1024, **4 steps**, seed 42,
+FL2VA: completed in 2,953,739 ms (DiT 2,241,221 ms, video VAE 678,956 ms),
+`spatial_corr 0.309`, `suspect_noise 1`, 2,923,218-byte mp4. Frame 0 carries the
+silhouette, frames 40/100 decay to the lattice again. Four steps are not a
+quality verdict: with `shift=12` the sigma grid is 1.0, 0.973, 0.923, 0.8, 0, so
+the last Euler step is 0.8 wide and does almost all of the denoising in one
+unconditional jump.
+
+Two probe results bound the remaining work:
+
+* timestep convention is correct. A known mix of 0.9*noise + 0.1*clean with one
+  step at sigma=0.9 moved `spatial_corr` 0.008 -> 0.334 under `t=1-sigma` and
+  0.008 -> -0.042 under `t=sigma`.
+* the Euler direction is not settled. At a small step (dt=0.1 and 0.2) the
+  *minus* direction moves toward the clean anchor (corr 0.216 -> 0.289, std
+  0.699 -> 0.886 at dt=0.2) while plus degrades it (0.216 -> 0.146), but a
+  same-size/same-step end-to-end A/B at 4 steps prefers plus (0.300 vs 0.277).
+  At 4 steps the 0.8-wide final step dominates and overshoot masks direction, so
+  the end-to-end test cannot decide. Default stays `plus` (measured winner);
+  `CWICK_H3V_SIGN=minus` exposes the other direction for a 30-step A/B. A
+  30-step 768p run is ~5 hours on this machine and is the next measurement, not
+  a guess.
+
+Probe-only knobs added for that A/B: `CWICK_H3V_DIAG_DT` (shrink the forced
+step) and `CWICK_H3V_SIGN`; `tools/h3vencprobe` now takes `H3VPROBE_W/H` so the
+encoder can be exercised at the render size instead of a fixed 64x64.
+
+## 99. The DiT read release-layout tensors in converted-layout order
+
+The transformer shards keep the release tensor names and layout. Two reorder
+steps that the reference loader performs are not implicit in the bytes:
+
+* a fused QKV weight row is `head0: q|k|v, head1: q|k|v, ...`. Splitting the
+  output into three contiguous thirds means head *h*'s query was head 0's key
+  and so on: every attention head mixed the wrong streams.
+* `mlp.fc1` emits `[gate | value]`, while the SwiGLU read `[value | gate]`, so
+  the activation was applied to the value and multiplied by the raw gate.
+
+Fix in `src/h3v.c`: `h3v_split_qkv()` scatters the raw output on the CPU path,
+and a new `gemm_bf16_qkv` Metal kernel permutes the weight rows while loading
+the tile, so the GPU path writes q/k/v straight into three planes with no
+extra pass. SwiGLU now takes the gate from the first half. Both the 50-block
+stack and the two token-refiner blocks use the same projection layout.
+`CWICK_H3V_LEGACY_LAYOUT=1` restores the old decoding for an A/B.
+
+Same-input A/B (256x256, one step, DIAG_MIX 0.6, dt 0.1, seed 42, Metal):
+
+| signal | old layout | fixed |
+| --- | --- | --- |
+| cos(velocity, data-ward reference) | -0.142 | **+0.954** |
+| best scale for the reference field | -0.042 | 0.919 |
+| \|velocity\| | 206.73 | 679.06 |
+| MLP block 0 output rms | 86.32 | 13.98 |
+| residual rms, block 49 | 22497 | 7570 |
+| generated-step `spatial_corr` | 0.338 SUSPECT NOISE | **0.501 ok** |
+
+The fused kernel is bit-identical to the host-side scatter: both report
+`|v| 679.0618`, `cos 0.954`, `corr 0.501`. `h3vgpuprobe` covers the new
+pipeline.
+
+End-to-end on this machine, `--backend metal`, `input/sample.png` plus
+`input/sample_video.txt`, 256x256, 4 steps, seed 42: the DiT ended at
+`spatial_corr 0.927` (`suspect_noise 0`), the mux wrote a 609,140-byte mp4 in
+384.1 s total (text 70.1 s, DiT 244.8 s, video VAE 63.2 s, audio VAE 4.3 s).
+Decoded frames 20, 60 and 100 show the reference person instead of the
+lattice/static that the same prompt produced before this fix. Four steps at
+256x256 are only a correctness check — the 768p / 30-step quality run is a
+separate measurement.
+
+The same four-step input at 768x1024 also cleared the floor: `spatial_corr
+0.963`, `clean_corr 0.929`, `snr_db 2.56`, `suspect_noise 0`, a 1,249,044-byte
+mp4 in 3,008.3 s total (text 63.3 s, DiT 2,282.4 s, video VAE 650.4 s, audio
+VAE 4.4 s, mux 0.4 s). Where the original clip was a green lattice in every
+sampled frame, frames 60 and 100 are a clean, moving person; frame 20 still
+shows a one-sided lattice seam and frame 0 a horizontal band, so the temporal
+VAE boundary is a separate remaining artefact. The 30-step quality run at this
+size is still outstanding.
+
+## §100 Quick-verify preset in the image + video app
+
+The H5 studio (app 3) already exposed the two-step image -> video flow and the
+server accepts a 256x256 canvas and a 4-second clip (the engine rounds both to
+its 32-pixel canvas multiple and to whole 17-frame clips). What it could not do
+was shorten the sampling: the DiT budget was fixed at 30 steps, reachable only
+through a process-wide environment variable, so even the smallest canvas took
+tens of minutes — not a quick verification.
+
+`POST /v1/videos` now accepts an optional `steps` integer. `h3v_generate_variant_steps()`
+carries it per job and clamps it to [1, `H3V_SAMPLE_STEPS`=30]; the old
+`h3v_generate_variant()` keeps its signature and passes 0 (engine default).
+This also closes a latent bug: the environment variable used to accept 1..256
+while the sigma/timestep scratch arrays are sized for exactly 30, so a value
+above 30 wrote past them. Both paths are now bounded by the same ceiling. The
+job object reports the requested `steps`, and the completed `cwick` object still
+reports the actual steps used. Default behaviour (no field, or 0) is unchanged.
+
+The app's step-2 panel gains a 256x256 / 320x320 canvas option, a step counter
+and a one-click "quick verify" preset (256x256, 4 s, 4 steps). On this machine
+that 256^2 / 4-step path produced a clean, moving person in 384.1 s (§99),
+which is the measurement the preset is built around. The full 30-step schedule
+remains the default for quality renders.
+
+## §101 Memory-aware residency for the video pipeline
+
+The text/model lines already route their weight stages through the shared
+memory budget (`--mem-fraction`, default 80% of host RAM; `--max-memory`;
+no-swap wiring). The video line did not. Its DiT (61.73 GiB) was demand-mapped
+on every request and unmapped on exit — never wired — so the VM was free to
+compress or page the very pages the 30-step sampling loop re-reads on every
+step. Its two VAEs were mapped for the process but also left unwired.
+
+`cwick_mem_fit_model()` is now the shared decision for a single weight stage:
+given the stage's mapped bytes, its runtime scratch and a reserve, it compares
+the whole total against the ceiling and, in no-swap mode, elects to fault in
+and wire only when the stage fits. An over-budget stage is deliberately left
+as a lazy, SSD-backed mapping — wiring part of an over-budget stage would only
+push something else into the compressor. The video line calls it right after
+each safetensors open: the two VAEs at model load (resident for the process)
+and the DiT at generation time (resident for one sampling pass; `close()`
+unwires automatically). `CWICK_H3V_WIRE=0/1` overrides the decision for an A/B.
+
+The two 62 GiB stages are kept staggered on purpose. The text encoder is mapped
+only during phase 1 and released before the DiT is mapped in phase 3; wiring
+both at once would peak at 134 GiB, above the 102.4 GiB ceiling, and force
+exactly the swap this avoids. The text encoder is a read-once streaming access,
+so leaving it lazy is both correct and cheaper than wiring it.
+
+Four gauges expose the decision: `cwick:model_weight_bytes`,
+`cwick:model_resident_bytes`, `cwick:model_target_bytes`, `cwick:model_wired`.
+
+Measurement (same machine, Metal, 256x256 / 1 step, resident path):
+VAE 9.70 GiB + audio VAE 0.56 GiB + DiT 61.73 GiB all logged `wire resident`
+under a 102.40 GiB ceiling (80% of 128 GiB host), ~72 GiB wired in total. The
+kernel never reported a wiring failure. The decisive no-swap evidence is the
+page counter, not the `swapused` level: `Swapouts` went 137479946 -> 137479946
+(delta **0**) across the whole run, and `swapused` actually fell from 6052 to
+5916 MiB. `Compressions` rose by 0.009% of its since-boot value. A 2.1 GiB
+`swapused` rise seen in an earlier run was global noise from other processes,
+not the model's wired pages: with `mlock` succeeding those pages cannot be
+paged. `denoise check` reported spatial corr 0.955 (floor 0.35). `make test`
+and `make h3vprobe` pass.
+
+## §102 The video endpoint uses Ref2VA only
+
+Section 97 made both checkpoint partitions reachable, which was the right way
+to find out what each one does. `POST /v1/videos` takes a prompt plus an
+optional image and asks for a generated clip; that is the omni-reference
+workflow, so Ref2VA is the transformer that matches the endpoint. The
+first/last-frame partition belongs to a different request shape and was only
+ever the default because it sorts first in the download. In this build
+`h3v_model_open()` discovers only `Ref2VA/` (or a flat copy of it), the default
+is that single variant, and a `variant` naming the first/last-frame partition
+is rejected with HTTP 400 before a job is queued. Its shards are never probed
+or mapped. This removes the accidental quality A/B from the endpoint without
+changing the shared VAE, text encoder, job model or progress API.
+
+## §103 Ref2VA reference presentation and reference geometry
+
+Selecting Ref2VA exposed two places where the pipeline still used the
+first/last-frame request shape:
+
+1. The image was encoded at the generated canvas and entered the sequence only
+   as latent rows. In the omni-reference workflow a picture is also part of
+   the text presentation (`Picture 1: <vision block>` before the prompt), and
+   the vision-token rows carry the video modality tag for AdaLN. The new
+   `h3_text_cond_ref_dir()` in the text-encoder helper builds that
+   presentation with the same vision tower the image path uses and returns
+   the per-row tags. `CWICK_H3V_REF_PRESENT=0` restores the bare prompt.
+2. An image reference is encoded at its own resolution; it does not inherit
+   the generated canvas. `CWICK_H3V_REF_EDGE` (32..6272, unset = canvas) scales
+   the reference's short edge before encoding, derives its own latent grid and
+   packed-row count, and gives the condition rows their own spatial rotary
+   grid. An image reference also advances the shared audio/video rotary clock
+   (32..6272 is set by `H3V_REF_EDGE_MAX`, deliberately separate from the
+   generated-canvas cap `H3V_MAX_SIZE`=2560 (2K): an earlier build clamped
+   REF_EDGE to the canvas cap and silently fell back for an explicit 2048;
+   the two are now split, so 2048 encodes a 1152x1536 reference as 2048x2720).
+   The canvas cap itself was raised from 1280 to 2560 (under 4K): app 3's
+   `vsize` gains 1600x900 / 1920x1080 / 2560x1440 and `sizeHint` follows; the
+   image path's `H3_MAX_SIZE` is already 6272 (past 4K) and needed no change.
+   The size arithmetic lives in `h3v_ref_encode_size()` shared by production
+   and `make test`, which covers 2048, the unset fallback, out-of-range, plus
+   2560 admitted / 3840 refused. DiT rows grow roughly quadratically with the
+   canvas, so a 2K full 30-step job takes hours; the UI steers users to the
+   4-step verification preset first.
+   by one slot, which was previously missing. `CWICK_H3V_CONDROWS=0` and an
+   explicit edge are not combined: the legacy target-t0 layout needs the
+   reference grid to equal the target grid.
+
+Neither knob changes checkpoint precision, the sampler, or the job/HTTP model.
+
+Endpoint measurement before the new presentation was exercised (`--backend
+metal`, 256x256, 4 s, 30 steps, seed 42, `input/sample.png` plus
+`input/sample_video.txt`, POST `/v1/videos` with `variant:Ref2VA`): completed
+in 1,342,128 ms total (text 58,397 ms, DiT 1,232,712 ms, video VAE 45,123 ms,
+audio VAE 3,906 ms), 102 frames, 612 KiB mp4, `spatial_corr 0.899`,
+`snr_db 0.17`, `suspect_noise 0`. `cwick:host_swapouts_total` stayed at
+137485839 across the run while 66.28 GiB of weights were wired under the
+102.40 GiB ceiling. Sampled frames 0/20/60/100 show the seated subject in the
+cream fuzzy coat and beret, frame 100 turns as the prompt asks, and the old
+horizontal band on frame 0 is gone. The remaining defect is texture: heavy
+grain and intermittent green speckles on the coat, with soft focus throughout.
+That is the target of the four-step A/B below.
+
+Matched four-step A/B (`--backend metal`, 256x256, 4 s, seed 42, same prompt,
+same RGB reference, 4 sampling steps):
+
+| run | text tokens | sequence rows | total_ms | dit_ms | spatial_corr | clean_corr | snr_db |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `REF_PRESENT=0`, canvas reference | 34 | 2358 | 321737 | 202266 | 0.891 | 0.885 | -0.60 |
+| `REF_PRESENT=1`, canvas reference | 1417 | 3741 | 514776 | 342490 | 0.905 | 0.877 | -0.36 |
+| `REF_PRESENT=1`, `REF_EDGE=512` (336 condition rows) | 1417 | 4013 | 522574 | 356200 | 0.921 | 0.905 | -0.17 |
+
+All three produced 102-frame mp4s with `suspect_noise 0`. The vision
+presentation costs ~60 s of extra text encoding and ~140 s of DiT over four
+steps, but frames 20/60/100 are visibly smoother and the face, short hair,
+beret and cream coat read closer to the reference; the bare-prompt run is a
+larger, blurrier face with more colour speckle. Encoding the reference at a
+512 short edge instead of the canvas raises the three correlation figures
+again but is only a marginal visual change at 256x256, so it stays opt-in.
+The presentation is therefore the new default.
+
+The same 30-step endpoint run was repeated with the presentation enabled:
+2,145,126 ms total (text 111,825 ms, DiT 1,981,593 ms, video VAE 45,705 ms,
+audio VAE 3,849 ms), 102 frames, 596 KiB mp4, `spatial_corr 0.814`,
+`snr_db -0.52`, `suspect_noise 0`. Frames 0/20/60/100 show the same face,
+beret and cream coat without the green speckles of the earlier run, though the
+framing is a closer crop and the texture is still soft at 256x256. The lower
+`spatial_corr` is not a quality verdict: that gauge measures horizontal
+adjacency inside the latent, not sharpness or reference similarity. Wired
+weight bytes stayed at 66.28 GiB; `cwick:host_swapouts_total` rose by 988 host
+pages (16 MiB) over the whole session while other processes ran, far too small
+and too scattered to be the mlocked model pages. Neither 30-step run should be
+read as a 768p quality claim: 256x256 is the checkbox smoke test.
+
+## §104 QuickTime black frames came from a malformed avcC, not the generator
+
+A 256x256 / 30-step Ref2VA mp4 looked correct when decoded by ffmpeg
+(clear, moving person in extracted frames) but opened as a black window in
+QuickTime. That split pointed at the decoder path, not DiT or VAE output: the
+generators had already been fixed in §99 and §103.
+
+A small probe using AVFoundation — the decode stack QuickTime itself uses —
+reproduced the failure deterministically: `AVAssetReader` returned
+`AVFoundationErrorDomain -11821 Cannot Decode`, underlying OSStatus `-12137`,
+on the first sample of every cwick mp4. The same files decode fine in ffmpeg
+because ffmpeg rebuilds missing parameter sets from the in-band SPS/PPS NALs
+VideoToolbox writes before each IDR; a strict `h264_mp4toannexb` conversion
+that trusts only the container header failed with `Global extradata truncated,
+corrupted stream or invalid MP4/AVCC bitstream`.
+
+The root cause was in `build_avcc()` in `h3v_mp4.m`. The format-description
+API returns one flat list of parameter sets (SPS followed by PPS, two entries
+for this encoder). The code wrote that list count into avcC's
+`numOfSequenceParameterSets` and then emitted the flat list, omitting the
+separate `numOfPictureParameterSets` field entirely. The resulting record was
+`01 64 00 14 ff e2 000a<SPS> 0004<PPS>`: it claimed two SPS units, fed the PPS
+as the second SPS, and left the PPS-count byte absent. ISO/IEC 14496-15
+requires two separate runs — numOfSPS + SPS units, then numOfPPS + PPS units.
+Strict parsers reject the malformed record and render black; lenient ones
+recover from the in-band NALs.
+
+`build_avcc()` now classifies each parameter set by its NAL type (7 = SPS,
+8 = PPS), collects them into two arrays, and emits both runs with the correct
+counts. The fixed record is `01 64 00 14 ff e1 000c<SPS> 01 0004<PPS>`.
+
+Verification used a synthetic colour ramp through `tools/h3vmuxprobe`, so the
+muxer is exercised in seconds without minutes of DiT/VAE work:
+
+- avcC bytes now carry `e1` (one SPS) and a trailing `01` PPS count;
+- the AVFoundation probe decodes the first frame (`OK 64x64 mean_luma=87.07`)
+  where the old files returned `Cannot Decode`;
+- strict `h264_mp4toannexb` conversion of the container header succeeds.
+
+This fix is the precondition for app 3's inline preview and download: a
+visually correct file that QuickTime or Safari refuses to decode is a black
+player to the user. The app's own copy was also brought in line with the
+current video semantics: the reference-image checkbox no longer calls the
+field `reference_image` (the wire field is `image`) and no longer claims the
+image replaces the first-frame latent — Ref2VA folds it into the text
+condition as Picture 1 (§103). The job's `variant` is now surfaced in the
+progress panel so the Ref2VA default is visible end to end.
+
+A real generation confirmed the muxer fix outside the synthetic probe: job
+`video_1795373529_1` (256x256, 4 s, 4 steps, `sample.png` reference, Ref2VA
+default) completed in 488.2 s (text 69.1, DiT 356.7, video VAE 56.1, audio VAE
+4.1, mux 0.3) and produced 615,030 bytes / 102 frames. Its avcC is
+`01 64 00 14 ff e1 000a<SPS> 01 00 04<PPS>`; the AVFoundation probe returns
+`OK 256x256 mean_luma=156.36` where the pre-fix files returned `Cannot Decode`,
+strict Annex-B conversion succeeds, and extracted frames show the referenced
+woman, beret and coat with no black frame and no green grid seam. Softness at
+256p with 4 steps is a resolution/step-count limit, not a decode failure.
+
+## §105 Host memory pressure during video jobs: per-stage residency without a shared budget
+
+The 30-step 256x256 Ref2VA job ran DiT at 200–241 s/step (216072, 206066,
+201178, 199627, 227345, 241420 ms for steps 1–6), 2.4x slower than the 89.2
+s/step of the preceding 4-step job — same canvas, same sequence length (3677
+rows), same wired DiT (61.73 GiB). Host metrics collected through `/v1/metrics`
+explained the gap:
+
+- at the 02:51:49 boot, swap was 4.28 / 5.00 GiB and
+  `host_compressions_total` = 2226116165;
+- at the 03:28:15 boot, after both video jobs, swap was 6.61 / 8.00 GiB
+  (macOS grew the swap file 5 -> 8 GiB) and compressions = 2279810266;
+- that is **+2.33 GiB swap and +53.7M compressions during the two video jobs**;
+- the transient unmap log shows the DiT-sampling RSS peak was 73.92 GiB
+  (`RSS 73.92 -> 12.20 GiB` when the transformer closed);
+- at idle with only the root model resident (`process_footprint_bytes` =
+  28.5 GiB), a 5-second scrape showed zero compressions/swapouts delta — the
+  pressure is created by the video job, not by the idle server.
+
+Root cause. `cwick_mem_fit_model()` evaluates a single stage at a time against
+the 102.40 GiB (80% of 128 GiB) ceiling and has no cross-stage accumulator.
+The video line calls it once per stage, so each stage independently reports
+"fits under budget" and is wired. `h3v_model_open()` wires the video VAE
+(9.70 GiB) and audio VAE (0.56 GiB) at model-open and holds them for the whole
+model lifetime; `h3v_generate()` then opens and wires the DiT (61.73 GiB) on
+top for sampling. The concurrent mlocked set is therefore ~72 GiB (73.92 GiB
+RSS peak), not one stage at a time. Wired pages cannot be compressed or
+paged, so the pressure is shifted onto every other process on the host: the
+global compressor and swap file climb. Non-wired scratch (attention buffers,
+Metal arena temporaries) faults inside `waitUntilCompleted`, which is the
+likely source of the 2.4x step-time regression. This is an association, not a
+strict A/B: the two jobs ran back-to-back in one process, so accumulated
+system state is a confounder.
+
+A later job confirmed the extreme end of this curve: `video_1795375995_1`
+(736x1280, 30 steps, seq 29357 = 8x the 256p case) ran DiT at 731656 ms on
+step 11 rising monotonically to 788257 ms on step 30 — 6.3 h total, and
+~13 min/step versus 89 s/step for a 4-step 256p clip. The per-step drift
+within one run, with identical weights and rows, is the signature of a
+page/compression fault rate climbing as system pressure builds.
+
+Proposed fix, consistent with the goal constraints (no pruning, no precision
+loss, Metal, 80% budget, no swap): make VAE residency lazy — fault in the
+video/audio VAE at phases 4/5 and unwire them afterwards, so DiT sampling
+holds only 61.73 GiB (peak 73.92 -> ~63 GiB); add an `already_resident_bytes`
+accumulator to `cwick_mem_fit_model()` and one ledger shared by all live video
+stages; treat the 80% ceiling as a global budget across stages, not a
+per-stage test. Verify with a 4-step A/B comparing RSS peak, compression delta
+and DiT s/step before promoting any default. Not yet applied — diagnosis only.
+
+## §106 Blocky video at large canvases came from too-small VAE decode tiles
+
+A 736x1280 / 30-step Ref2VA clip (`video_1795375995_1`, sample.png reference)
+opened correctly in QuickTime after §104 but looked blocky: faces read cleanly
+while clothing and outlines carried a regular grid. This was not the black
+frame, not a decode failure and not undersampling — the job ran all 30 steps.
+
+Evidence, in order:
+
+- ffprobe: 736x1280, H.264 High, yuv420p, 4.71 Mb/s, 102 frames. avcC was
+  already the valid §104 form (`ff e1 ... 01 00 04`), and the AVFoundation
+  probe returned `OK 736x1280 mean_luma=63.89`; strict Annex-B conversion
+  passed. So the container and decoder were fine.
+- The job was an outlier on time: DiT ran 731656 -> 788257 ms per step (6.3 h
+  total) because the canvas produced 27600 video rows / seq 29357 (8x the
+  256p case) under the §105 residency pressure. Slowness and blockiness are
+  separate symptoms; only the latter is addressed here.
+- Extracted frames had a gradient-energy peak at lag 16 px (one latent cell,
+  `16` pixels per cell) and at lag 192 px (one VAE decode tile). Horizontal
+  tile boundaries at x=160/320/480/640 showed 2.4-3.6x the neighbouring
+  gradient. That periodicity points at the VAE decoder, not the DiT.
+- `tools/h3vencprobe` at 736x1280 round-trips a smooth ramp straight through
+  the VAE with no DiT at all. The reconstruction reproduced the seams: mean
+  boundary/non-boundary gradient ratio 4.14x horizontally, 5.33x vertically.
+  Decoding a **constant zero latent** also produced a 16 px cell texture and a
+  tile-period step, confirming the artefact is introduced by the decoder's
+  tiling, not by the sampled latent content.
+
+Root cause. The video VAE decoder cuts the latent into 12x12-cell tiles with
+a 2-cell overlap. Its rotary tables use tile-local coordinates
+(`2*(i+0.5)/n - 1`), so each tile spans the full [-1,1] range and adjacent
+tiles predict the same row with different phases. A 2-cell (32 px) linear
+cross-fade cannot hide that discontinuity; the boundary leaks as a 192 px
+grid. 256p has a 16x16 latent and is effectively one tile, which is why the
+problem was invisible in every earlier 256p test.
+
+A first attempt rewrote the stitch to mirror the image VAE's validated
+`_stitch_tiles` (whole-row raw buffer, in-band bidirectional blend, trim far
+edges, quantise last). It was rejected by measurement: round-trip correlation
+stayed 0.9913, boundary ratios did not improve (one variant made x seams much
+worse at 35x), so the change was fully reverted. Shifting blend weights was
+not the fix; the tile geometry itself was.
+
+The working fix is to enlarge the tile. `H3V_VAE_TILE_CELLS` 12 -> 48 and
+`H3V_VAE_TILE_OVERLAP` 2 -> 8, both overridable at runtime with
+`CWICK_H3V_VAE_TILE=N` (overlap becomes N/6). Measured on the same 736x1280
+smooth-ramp round trip:
+
+| tile cells | seam ratio x | seam ratio y | R corr | decode time |
+|---|---|---|---|---|
+| 12 (old) | 4.48 | 5.33 | 0.9913 | 56.0 s |
+| 24 | 1.89 | 6.50 | 0.9928 | 42.1 s |
+| 48 (new) | 0.00 | 1.61 | 0.9937 | 31.8 s |
+
+Larger tiles also decode faster (fewer overlapping passes) and keep the
+attention sequence small enough for an 80x46 latent. After recompiling with
+the new default, the boundary gradient at x=640 / y=640 was 0.63 / 0.71
+versus 4-10 before. No weights, precision or sampler steps changed.
+
+The end-to-end 736x1280 / 4-step clip has since completed
+(`/tmp/h3vprobe/fix736.mp4`, 102 frames / 4.25 s, 2.46 MB). The sampler
+reported `spatial corr 0.979 / clean corr 0.981 / snr -0.07 dB /
+suspect_noise 0`; six extracted frames (n=0/20/40/60/80/101) show three
+separate outcomes:
+
+- The 192 px tile seam is gone. A frame-for-frame comparison against the
+  earlier tile=12 / 30-step clip shows the horizontal bars at
+  x=160/320/480/640 no longer appear. The tile geometry fix holds
+  end-to-end, not just on the smooth-ramp round trip.
+- A fine 16 px checker/dot texture still covers the whole frame. Magnified
+  crops show a regular cell-and-triangle pattern on skin, hair and clothing
+  alike. This is the decoder's cell-level artefact already reproduced by
+  decoding a constant-zero latent; enlarging the tile does not address it.
+  §106 fixes the large tile grid only.
+- The 4-step clip is visibly softer than the 30-step one: fabric weave and
+  facial detail no longer resolve. That is undersampling, independent of
+  the tile change.
+
+Identity is partly preserved (same long-haired, smiling subject with a
+gentle head turn across the clip) but the reference outfit is not:
+`sample.png` is a cream fuzzy coat / slip dress / knee boots, while the
+generated frames show a plain dark turtleneck. Four steps carry too little
+reference detail through the text-presentation path. No black frames,
+green blocks or one-sided grids remained.
+
+Conclusion: on a 736x1280 canvas, sharpness is now limited by sampler steps
+and the VAE's intrinsic 16 px cell texture, not by tile seams. More steps
+are the only in-pipeline lever for detail, at the measured ~6 h cost. The
+run also re-confirmed §105 live: free pages fell to ~27k (436 MiB) with swap
+at 5.6/7.2 GiB; DiT took 752-813 s per step and the VAE decode 979.7 s
+(4307 s total).
+
+## §107 256x256/30-step clip: QuickTime softness is a resolution ceiling, and the §105 step-time cause was misattributed
+
+The clip `output/cwick-video-video_1795406010_1.mp4` is 256x256 / 102
+frames / 4.25 s / 30 steps, Ref2VA with `sample.png` as reference and
+`sample_video.txt` as prompt, served through `/v1/videos` under Metal.
+
+Container is not the cause. avcC is the valid §104 form
+(`01 64 00 14 ff e1 00 0a<SPS> 01 00 04<PPS>`: one SPS, one PPS), H.264 High
+plus AAC 32 kHz stereo, packet DTS runs 0..101000 monotonically at 24 fps,
+and a full decode produced no frame errors. Any softness seen in QuickTime
+is the generated image, not muxing, avcC or timestamps.
+
+Six extracted frames (n=0/20/40/60/80/101): identity and wardrobe now match
+the reference (cream fuzzy coat, slip dress, beret) — the 30-step run carries
+reference detail that the earlier 4-step clip dropped (§106). No tile seams,
+green blocks or black frames. A mild 16 px cell texture remains on face and
+background and the whole frame is soft. Both are expected at this canvas:
+256x256 is the minimum verification canvas and maps through the VAE's 16x
+spatial compression to a 16x16 latent, so the decoder's intrinsic cell
+texture (§106, reproduced by decoding a zero latent) occupies a large
+fraction of every displayed pixel, and any full-screen playback upscales
+256x256. This is a resolution ceiling, not a regression: no sampler or
+wiring change makes a 16x16 latent render like an 80x46 one.
+
+Log and metrics: text 112110.5 ms (1417 tokens after Ref2VA presentation),
+DiT 30 steps at 60-63 s/step = 1979.5 s, denoise `spatial corr 0.847`,
+`gen/ref std -0.74 dB => ok`, video VAE 54114.3 ms, audio VAE 3951.9 ms,
+mux 200.9 ms, 2196.4 s total. Peak RSS was 73.52 GiB (unmapped
+`73.52 -> 11.79 GiB`) with the same wired set as §105 — VAE 9.70 GiB and
+audio VAE 0.56 GiB held from model-open, DiT 61.73 GiB during sampling.
+At job end free pages were 4.8M (95% free), swap 3930/5120 MiB, compressor
+339 MiB: no host memory pressure. The serve log recorded 2096 `/v1/metrics`
+scrapes, all HTTP 200 at 25133 bytes; the process had stopped by the time
+of this analysis, so no live scrape was available.
+
+**Correction to §105.** The same 256x256/30-step shape, same 3677 rows, same
+61.73 GiB wired DiT and the same 73.52 GiB RSS peak now ran at 60-63 s/step,
+versus the 200-241 s/step recorded in §105. The wired set was identical; what
+differed was host swap/compression pressure. The §105 step-time regression
+was a function of system-wide pressure, not of the VAEs being wired early.
+The proposed lazy-VAE-residency fix is therefore not supported by this
+comparison and was **not applied**. Keep the existing residency model; to
+protect step time, finish or clean up other swap-heavy work before a long
+video job instead.
+
+Practical takeaway: 256x256 is a correctness/speed smoke test, not a quality
+setting. For detail, raise the canvas — at low host pressure it is far from
+the 6.3 h outlier in §105. For speed, lower the step count, but at 4 steps
+the reference wardrobe is lost (§106). The 16 px cell texture is intrinsic
+to the VAE decoder and is not tunable from the sampler.
+
+## §108 QuickTime "frame skipping" was a temporal VAE seam, not a container fault
+
+A 544x960 / 30-step Ref2VA clip (`video_1795410431_1`, 102 frames, 4.25 s)
+looked like it skipped frames in QuickTime. Three independent checks ruled
+out the container: the packet table has one stts entry with a uniform
+1000/24000 s step and strictly increasing dts; avcC carries one SPS and one
+PPS; and an AVFoundation AssetReader decoded all 102 frames with a single
+interval value of 0.041667 s and zero abnormal gaps. The `non monotonically
+increasing dts` warnings from `ffmpeg -f null` come from the null muxer
+re-encoding the decoded stream, not from the source file. Nothing is wrong
+with timestamps, keyframe placement (IDR at 0/48/95), or MP4 boxes.
+
+The jumps are in the pixels. Measuring mean absolute difference between
+consecutive decoded frames (median 4.52) shows a clean periodic impulse: the
+transitions into frames 20, 40, 60, 80 and 100 average **21.34**, 2-14x every
+other bucket, with the immediately preceding frame at 1-4. Smaller peaks sit
+at frames divisible by 4 (9-11.6). The period is exactly 20 frames = 5 latent
+steps = one temporal chunk; the 4-frame peaks are individual latent steps.
+
+Root cause: the decoder geometry folds 17 pixel frames into 5 latent steps
+(17n+5 pixel frames <-> 5n+2 latent frames). Adjacent latent chunks overlap
+by 2 latent steps, and a correct decode decodes that overlap and linearly
+cross-fades the shared frames. The decoder in this engine decodes all latent
+steps in one pass and cross-fades only the spatial tiles; there is no temporal
+overlap decode and no temporal cross-fade. Each 20-frame boundary is therefore
+a hard cut, which reads as a visible jump every ~0.83 s. Frame count 102 is
+also not on the checkpoint's legal 17n+5 grid (nearest: 90 or 107).
+
+Fix direction (not applied): decode each chunk with a 2-latent overlap and
+blend the shared frames, mirroring the spatial tile stitch. This changes the
+VAE decode loop and intersects the spatial tiling, so it needs its own A/B
+and regression before landing. A cheap mitigation is to request a legal frame
+count, which removes the extra truncation but not the hard-cut seams.
+
+Log/metrics: text 112.1 s, DiT 30 steps at 363-409 s/step = 11093.8 s, video
+VAE 465.0 s, audio VAE 3.9 s, mux 0.3 s, 11678.2 s total. Denoise was healthy
+(`spatial corr 0.901`, `gen/ref std -0.43 dB => ok`). The 6x step time versus
+the 256x256 run in §107 is the expected cost of ~4.2x the transformer rows
+(15300 vs 3677): attention grows quadratically. Host was at 95% free with
+swap 3691/5120 MiB before and after, so no memory pressure was involved.
+
+## §109 Temporal VAE overlap + cross-fade removed the chunk-boundary hard cut
+
+§108 traced the QuickTime "frame skip" to the visual VAE decoding all latent
+steps in one pass with no temporal overlap, leaving a hard cut at every 5-step
+chunk boundary. The training rule folds 17 pixel frames into 5 latent steps
+and drops 3 tail latents per encoded chunk, so a correct decode re-decodes a
+2-latent overlap and linearly blends the shared 5 frames; rope is
+length-normalised over the chunk's own 7 latents. The whole-clip decode did
+neither.
+
+Fix: `h3v_vae_decode` now walks the clip in 5-step chunks with a 2-step
+overlap. Each chunk decodes 7 latents with local rope, contributes 17 main
+frames taken from decoded frames [3,20), and blends its first 5 frames with
+the previous chunk's 5-frame tail at weights 1->0 / 0->1. The buffer holds
+17*chunks+5 frames and the mux keeps the first 17*chunks, so every muxed frame
+now comes from a cross-faded main chunk. `lt<=5` and
+`CWICK_H3V_TEMPORAL_XFADE=0` keep the whole-clip path for the reference-frame
+round trip and for A/B. Spatial tiling and its own cross-fade are unchanged
+and run inside each chunk.
+
+A/B on the same latent (256x256, 1 step, seed 42, Metal, only the switch
+differs): boundary MAE 5.358 -> 4.212 (-21%), single-frame peak 6.05 -> 4.69
+(-23%), 5-frame energy 11.57 -> 8.40 (-27%). The old one-frame impulse (5.43
+into frame 20, then 0.43 into 21) becomes a 5-frame ramp (4.57, 2.48, 0.34
+into frames 17/18/19). Denoise was identical (`spatial corr 0.987` in both)
+and the contact sheet shows no new spatial seams, black frames or block
+artifacts. VAE decode rose 39.2 -> 53.1 s (+35%) for the redundant overlap
+work. Total wall time is not comparable across the two runs: the DiT stage
+varied 126.5 -> 85.7 s independently of this switch.
+
+The blend's first weight is 1 by the training rule, so the first shared frame
+still jumps ~4.5; that residual is the sampler's own 5-step boundary, not a
+VAE seam. Removing it would need more overlap latents than the checkpoint was
+trained with. `make test` PASS.
+
+## §110 First real 30-step clip after the temporal cross-fade fix
+
+The 256x256 / 30-step Ref2VA clip `video_1795424360_1` (102 frames, 4.25 s,
+24 fps) is the first full-quality clip produced after §109 landed. It was
+checked for the two symptoms reported earlier: timeline jumps and blocky
+texture.
+
+Container is clean. stts has one entry, pts==dts runs 0..101000 in steps of
+1000, avcC carries one SPS and one PPS, and an AVFoundation AssetReader
+decoded all 102 frames at a single 0.041667 s interval with zero abnormal
+gaps. The `non monotonically increasing dts` line from `ffmpeg -f null` is the
+null muxer re-encoding, as in §108.
+
+The frame-to-frame MAE (median 4.46) shows none of the old 20-frame impulse:
+the transitions into frames 20/40/60/80/100 are 3.17/3.76/7.48/6.51/2.66
+(mean 4.72), and the global maximum is 12.53 at frame 83. Against the
+pre-fix 256x256 clip (same 30 steps, different seed), boundary mean fell
+20.08 -> 4.72 (-76%) and the max fell 33.17 -> 12.53 (-62%). The two largest
+luminance changes (dL 8.77/8.43 at frames 85/84) coincide with the subject
+turning from front to profile, which the prompt asks for; no consecutive
+frames are duplicates (min MAE > 0.5). Contact sheets show no black frames,
+green blocks, grid seams, ghosting or frozen frames, and the fur coat and
+facial features are clearly resolved at native size.
+
+This is the first evidence that the §109 path holds at real sampler quality,
+not just on the 1-step A/B: cross-fade removed the periodic jump without
+adding spatial seams or new blur. The clip does differ in composition from
+the pre-fix one (different seed), so the overall sharpness gain is not
+attributed to the switch — only the boundary-impulse change is.
+
+Log/metrics: text 84.45 s, DiT 30 steps at 60-67 s/step = 1971.1 s, video VAE
+63.77 s, audio VAE 3.97 s, mux 0.26 s, 2125.73 s total. Denoise healthy
+(`spatial corr 0.847`, `gen/ref std -0.74 dB => ok`). Video VAE rose from
+54.1 s (§107) to 63.77 s, the expected cost of decoding the 2-latent overlap.
+Counters: 1 job, 1 succeeded, 0 failed, 0 suspect noise; resident 66.28 GiB,
+wired, RSS peak 73.97 GiB. Host swap was 8.06/9.00 GiB at startup and fell
+to 6.4/7.5 GiB at the end — a high boot-time baseline, but step time stayed
+at the healthy 60-63 s level, again confirming §107: step-time regressions
+track pressure *during* a job, not the absolute swap level.
+
+## §111 Why the face is soft at 256x256, and what can actually move it
+
+The same 256x256 / 30-step clip in §110 was checked specifically for a soft
+face. The blur is resolution, not a defect in sampling, the cross-fade, or
+the muxer. Three independent facts locate it.
+
+1. Output grid. The VAE compresses space 16x, so a 256x256 canvas is only a
+   16x16 latent. The face occupies roughly a 4x4 patch of that grid; there is
+   no detail in the latent to recover. Laplacian variance over the same
+   face-sized crop is 3991 on the reference downscaled to 256 but 1730-2547
+   across the generated frames — about half the high-frequency energy before
+   generation even starts, and the decoder cannot invent the rest.
+
+2. Reference conditioning rows. The first-frame latent path encodes the
+   reference at the *generated canvas* unless `CWICK_H3V_REF_EDGE` is set.
+   The log is explicit: `reference image encoded: 256x256 RGB -> 1x24 latent
+   (16x16)`, while the same image arrives as 768x1024 RGB. The identity
+   signal that path can carry is capped at 16x16 latents.
+
+3. Text presentation is already high-resolution and is not the bottleneck.
+   `h3_text_cond_ref_dir` runs the reference through the vision tower at a
+   1024 short edge (`h3_vision_size` -> `h3_bound_edge(1024,1024)`), giving
+   1417 text tokens. This is why identity and the fur coat still match the
+   reference: the structure comes from the high-res presentation, while the
+   per-pixel softness comes from the 16x16 output grid.
+
+The face comparison confirms the form: facial structure, eye count and
+expression are all correct, with no mosaic or ghosting — it is uniformly
+soft, which is what a 16x16 grid reconstructed to 256 pixels looks like. Frame-to-frame MAE (§110) and
+cross-fade A/B (§109) already ruled out temporal seams as a cause.
+
+Optimization boundary under the goal.md constraints: no sharpening filter,
+no super-resolution model, no precision or pruning changes are applied. The
+only in-engine lever that raises reference-detail transfer is
+`CWICK_H3V_REF_EDGE=N`, which scales the conditioning rows to the
+reference's own short edge instead of the canvas; it is a process-level
+env var and needs a service restart. The checkpoint presents references at a
+2048 short edge, and this build admits the full `H3V_REF_EDGE_MAX` (6272),
+so `CWICK_H3V_REF_EDGE=2048` reproduces the released presentation (e.g. a
+1152x1536 reference becomes 2048x2720) instead of being clamped to the
+generated-canvas cap (now 2560, and independent of the reference range).
+A larger short edge adds conditioning rows and DiT time grows
+roughly quadratically; at 2048 the transient VAE-encode buffers are ~46 GiB and
+must be budgeted together with the resident weights under 80% / no-swap.
+The real fix for face detail is still a larger canvas (512x512 gives a 32x32
+latent, ~4x the detail capacity), at the same roughly quadratic DiT cost.
+A controlled A/B of `REF_EDGE` was not run here: the service holds the resident
+model and a second DiT instance would breach the 80% / no-swap budget; only
+the weight-free size arithmetic was unit-tested (`make test` passes).
+
+## §112 App 3 binds both canvas sizes through one shared size-pair table
+
+App 3 (`apps/imagegen`) already uploaded face/outfit/pose references, called
+both image endpoints, polled the async video job, and offered a quick-verify
+preset. The remaining gap was that step 1's `size` and step 2's `size` were
+independent: a 1536x2048 portrait render could be handed to a 1280x720 video
+request, so the conditioning image and the generated frames did not share a
+framing.
+
+Both steps now read one `SIZE_PAIRS` table in `apps/imagegen/app.js`. Each row
+carries an image canvas and an aspect-ratio-matched video canvas; every video
+size is an exact multiple of `H3V_CANVAS_MULTIPLE` (32) inside 256..2560 and
+every image size is inside 256..6272 (`H3_MIN_SIZE`/`H3_MAX_SIZE`). The seven
+rows are 256x256→256x256 (quick verify), 1024x1024→1024x1024,
+1536x2048→768x1024, 1024x1536→768x1152, 2048x1536→1280x960,
+2048x1152→1024x576 and 2560x1440→2560x1440 (the 2K upper bound from §102).
+Choosing a row in step 1 mirrors the video size into step 2 and updates a
+visible pair hint; entering step 2 from a generated image re-asserts the pair
+in case the video select was changed by hand. The quick-verify button now sets
+both canvases plus 4 s and 4 steps in one click, so the minimum canvas and
+shortest clip are available to both steps at once.
+
+Manual video sizes remain in a separate `optgroup` labelled "extended canvas
+(not paired)", so the larger canvases stayed reachable; selecting one clears
+the pairing and the hint states that explicitly. No server code changed: the
+image endpoints accept any `WxH` in their range and `/v1/videos` keeps Ref2VA
+as the only variant. `make src/webui_embed.c && make cwick` refreshes the
+embedded UI; `make test` adds two assertions that the shared table and both
+select groups reach the binary, and `node --check` validates the JS. No render
+was run here: the service holds resident weights and a second instance would
+breach the 80% / no-swap budget.
+
+## §113 Symmetric video teardown in the image and realtime switches
+
+Log evidence from a session that mixed image edits with a video clip: switching
+to the image model left the video VAEs resident, so the 61.74 GiB image DiT
+stacked on the 10.26 GiB video side for a ~72 GiB RSS. At 18:58:07 loading the
+video DiT back logged `could not wire 4.81 GiB ... (Resource temporarily
+unavailable)` — `mlock` returning EAGAIN — and the first sampling step took
+171.9 s against a 60–67 s healthy value. `cwick_mem_lock_range` logs only the
+first failure, so 4.81 GiB is a lower bound. The "wire resident ... fits under
+budget" line just above it reports the *attempted* byte count, not the pinned
+bytes; do not read it as success.
+
+Root cause: `srv_switch_model` and `srv_switch_video` released all three
+other weight banks, but `srv_switch_image` released only text and realtime and
+`srv_switch_realtime` only text and image. A video pipeline therefore survived
+a switch away from it. `swap_gate_open` already refuses when `vid_busy` is
+non-zero, so no clip is reading the shards when the switch tears them down.
+
+Both switches now call `srv_release_video_model()` before opening the incoming
+checkpoint, and include `H3V_SERVED_ID` in the "releasing" log line. The four
+switch paths are now symmetric: each releases the other three banks.
+`make cwick` is clean and `make test` passes; no render was run for an A/B
+because the service holds resident weights.
+
+## §114 B frames without ctts made QuickTime show frames out of order
+
+A 256x256 / 30-step clip (`video_1795432400_1`) looked unstable in QuickTime:
+the picture jumped instead of flowing. ffmpeg extracted the same jumps, so
+the encoder/container was at fault, not the player or the H.264 bitrate
+(1.0 Mbps at 256x256 is ample). Frame-level probe of the shipped MP4 showed
+56 B / 43 P / 3 I frames with non-monotonic presentation stamps
+(0, 3000, 2000, 4000, 1000...), two duplicate tail timestamps and no `ctts`
+box; the muxer assumed `AllowFrameReordering=0` meant no B frames and stamped
+every sample's PTS equal to its DTS. Disabling output reordering does not stop
+VideoToolbox from *coding* B frames.
+
+Root fix: pin the encoder to Baseline (`kVTProfileLevel_H264_Baseline_AutoLevel`,
+avcC profile 0x42), which forbids B frames, and additionally emit a `ctts`
+table from each sample's `CMSampleBufferGetPresentationTimeStamp` as a guard
+(all offsets are zero in a B-free stream, which is legal). The muxer now writes
+`ctts` for the video track only.
+
+`h3vmuxprobe` A/B at 60 frames: before = 43 B frames, unsorted PTS, 58 unique
+display timestamps; after = 0 B frames, 60 unique PTS, strictly monotonic
+0/1000/2000... . At 256x256/30 frames: 1 I + 29 P, 30 unique sorted PTS.
+`make test` adds assertions that avcC reports Baseline and all ctts offsets are
+zero. The running service was started with the old binary, so a restart is
+required for new clips to use the fix; the existing MP4 cannot be repaired by
+remuxing because its B frames are already in the bitstream.
+
+## §115 stss marking every frame sync made QuickTime ghost P frames
+
+A 256x256 / 30-step clip (`video_1795439347_1`) looked correct when decoded
+with ffmpeg but ghosted in QuickTime. §114's B-frame fix was confirmed active
+on this file: Baseline (avcC 0x42), 3 I / 99 P, no B frames, and 102 unique
+monotonic PTS with zero ctts offsets. The remaining difference was the sync
+table: stss listed all 102 samples as random-access points although only three
+were IDR.
+
+Root cause: `avcc_first_nal_type()` inspected only the first NAL of each AVCC
+sample, but VideoToolbox prefixes each IDR access unit with an SEI (type 6),
+placing the IDR slice (type 5) second. No sample tested positive, and
+`put_stbl`'s fallback (`n ? n : n_samples`) then marked every sample sync.
+QuickTime trusts stss and restarts decode at each advertised sync point;
+starting at a P frame with no reference leaves the previous picture behind as
+a ghost. ffmpeg ignores stss, which is why frame extraction looked fine.
+
+Fix: `avcc_has_idr()` scans every NAL in the sample for type 5; the stss
+fallback now marks only the first sample when no IDR is present, never all.
+`h3vmuxprobe` at 102 frames: sync count 102 -> 3, at samples 1/49/97 (the
+keyint=48 IDRs), matching the bitstream. `make test` adds two assertions that
+stss lists only IDR samples and does not advertise P frames as random-access
+points. As in §114, the running service predates this binary; new clips need a
+restart, and an existing MP4 cannot be repaired by remuxing alone because the
+wrong sync table is already written (a clean remux with the fixed muxer from
+the elementary streams would be needed).

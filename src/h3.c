@@ -22,6 +22,7 @@
 #include <ImageIO/ImageIO.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +82,32 @@
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 static double h3_ms(void) { return (double)cwick_prof_ns() / 1e6; }
+
+/* Live progress published for the polling HTTP client. Phase 0 means idle;
+ * 1..6 are tokenize, text_encode, pack, dit, vae, png; 7 is a finished render.
+ * The stamp is a monotonic ms value so a client can tell a stale snapshot from
+ * one that is still advancing while a long DiT step produces no new phase. */
+static _Atomic int g_h3_phase;
+static _Atomic int g_h3_step;
+static _Atomic int g_h3_steps;
+static _Atomic uint64_t g_h3_stamp;
+
+static void h3_progress_pub(int phase, int step, int steps) {
+    atomic_store_explicit(&g_h3_step, step, memory_order_relaxed);
+    atomic_store_explicit(&g_h3_steps, steps, memory_order_relaxed);
+    atomic_store_explicit(&g_h3_phase, phase, memory_order_release);
+    atomic_store_explicit(&g_h3_stamp, cwick_prof_ns(), memory_order_release);
+}
+
+void h3_progress_get(h3_progress *out) {
+    if (!out) return;
+    int phase = atomic_load_explicit(&g_h3_phase, memory_order_acquire);
+    out->step = atomic_load_explicit(&g_h3_step, memory_order_relaxed);
+    out->steps = atomic_load_explicit(&g_h3_steps, memory_order_relaxed);
+    out->stamp_ms = (double)atomic_load_explicit(&g_h3_stamp,
+                                                memory_order_relaxed) / 1e6;
+    out->phase = phase;
+}
 
 static float h3_clamp(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
@@ -1309,6 +1336,72 @@ static void h3_text_free(h3_text *t) {
     free(t->buf); free(t->hs50); free(t->tags);
     t->buf = t->hs50 = t->tags = NULL;
 }
+
+/* Text conditioning for a caller that owns no image checkpoint. The video
+ * pipeline needs the same H3-Encoder output but is started from a --videos
+ * root that has no MiniMax-H3-Image files in it, so it cannot borrow an
+ * h3_model. This opens the encoder and tokenizer on their own, runs the
+ * prompt through the final hidden layer and hands back a copy. The encoder is
+ * closed again before returning: it is read once per request either way, and
+ * keeping 62 GiB mapped between requests would compete with the transformer. */
+bool h3_text_cond_dir(const char *te_dir, const char *tok_dir,
+                      const char *prompt, float **hs, int64_t *seq,
+                      int64_t *tokens, cwick_error *err) {
+    if (!te_dir || !*te_dir || !tok_dir || !*tok_dir) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "text conditioning needs a text encoder and a tokenizer directory");
+        return false;
+    }
+    if (!prompt || !*prompt) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT, "prompt is required");
+        return false;
+    }
+    h3_model m;
+    memset(&m, 0, sizeof(m));
+    pthread_mutex_init(&m.lock, NULL);
+    uint32_t *ids = NULL;
+    h3_text txt;
+    memset(&txt, 0, sizeof(txt));
+    bool ok = false;
+
+    if (cwick_safetensors_open(te_dir, &m.te, err) != CWICK_OK) goto done;
+    m.te_open = 1;
+    {
+        cwick_model_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        snprintf(spec.model_type, sizeof(spec.model_type), "%s", "qwen3_vl");
+        if (cwick_tokenizer_load(tok_dir, &spec, &m.tok, err) != CWICK_OK) goto done;
+    }
+    {
+        int64_t n = 0;
+        if (cwick_tokenizer_encode(m.tok, prompt, &ids, &n, err) != CWICK_OK) goto done;
+        if (n <= 0) {
+            cwick_error_set(err, CWICK_ERR_ARGUMENT, "prompt produced no tokens");
+            goto done;
+        }
+        if (n > 32768) n = 32768;
+        if (!h3_text_encode(&m, ids, n, NULL, &txt, err)) goto done;
+    }
+    {
+        int64_t elems = txt.seq * TE_HIDDEN;
+        float *out = h3_f32(elems);
+        memcpy(out, txt.hs50, (size_t)elems * sizeof(float));
+        *hs = out;
+        if (seq) *seq = txt.seq;
+        if (tokens) *tokens = txt.seq;
+        ok = true;
+    }
+
+done:
+    free(ids);
+    h3_text_free(&txt);
+    if (m.te_open) cwick_safetensors_close(&m.te);
+    if (m.tok) cwick_tokenizer_free(m.tok);
+    pthread_mutex_destroy(&m.lock);
+    return ok;
+}
+
+void h3_text_cond_free(float *hs) { free(hs); }
 
 /* ------------------------------------------------------------------ */
 /* DiT: one packed sequence, full self-attention, no cross-attention.  */
@@ -3047,6 +3140,92 @@ static bool h3_present_build(h3_model *m, const char *prompt,
     return true;
 }
 
+/* Text conditioning for the video path with one image reference. The video
+ * encoder is the same Qwen3-VL stack the image path uses, so the presentation
+ * and the tower output must be built the same way: a `Picture 1` block in
+ * front of the prompt, with the vision rows tagged as video. This opens the
+ * encoder for one request, as h3_text_cond_dir() does, and returns a copy of
+ * the hidden states together with the per-row tags. */
+bool h3_text_cond_ref_dir(const char *te_dir, const char *tok_dir,
+                          const char *prompt,
+                          const float *ref_rgb, int ref_w, int ref_h,
+                          float **hs, int64_t *seq, float **tags,
+                          cwick_error *err) {
+    if (!te_dir || !*te_dir || !tok_dir || !*tok_dir || !ref_rgb ||
+        ref_w <= 0 || ref_h <= 0 || !prompt || !*prompt) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "reference text conditioning needs an encoder, a tokenizer, a prompt and RGB pixels");
+        return false;
+    }
+    if (hs) *hs = NULL;
+    if (tags) *tags = NULL;
+    if (seq) *seq = 0;
+
+    h3_model m;
+    memset(&m, 0, sizeof(m));
+    pthread_mutex_init(&m.lock, NULL);
+    h3_text txt;
+    memset(&txt, 0, sizeof(txt));
+    h3_present pres;
+    memset(&pres, 0, sizeof(pres));
+    float *vis = NULL, *out = NULL, *outtags = NULL;
+    bool ok = false;
+
+    if (cwick_safetensors_open(te_dir, &m.te, err) != CWICK_OK) goto done;
+    m.te_open = 1;
+    {
+        cwick_model_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        snprintf(spec.model_type, sizeof(spec.model_type), "%s", "qwen3_vl");
+        if (cwick_tokenizer_load(tok_dir, &spec, &m.tok, err) != CWICK_OK) goto done;
+    }
+    {
+        int tw = 0, th = 0;
+        h3_vision_size(ref_w, ref_h, &tw, &th);
+        vis = h3_f32((int64_t)tw * th * 3);
+        if (tw == ref_w && th == ref_h)
+            memcpy(vis, ref_rgb, (size_t)tw * th * 3 * sizeof(float));
+        else
+            h3_resize_lanczos(ref_rgb, ref_w, ref_h, vis, tw, th);
+        const float *rv[1] = { vis };
+        int rw[1] = { tw }, rh[1] = { th };
+        if (!h3_present_build(&m, prompt, rv, rw, rh, 1, &pres, err)) goto done;
+    }
+    {
+        h3_cond cond;
+        memset(&cond, 0, sizeof(cond));
+        cond.types = pres.types;
+        cond.tags = pres.tags;
+        cond.vis = pres.vis;
+        cond.ds[0] = pres.ds[0];
+        cond.ds[1] = pres.ds[1];
+        cond.ds[2] = pres.ds[2];
+        cond.grids = pres.grids;
+        cond.nvis = pres.nvis;
+        cond.nblocks = pres.nblocks;
+        if (!h3_text_encode(&m, pres.ids, pres.n, &cond, &txt, err)) goto done;
+    }
+    out = h3_f32((int64_t)txt.seq * TE_HIDDEN);
+    memcpy(out, txt.hs50, (size_t)txt.seq * TE_HIDDEN * sizeof(float));
+    outtags = h3_f32(txt.seq);
+    memcpy(outtags, pres.tags, (size_t)txt.seq * sizeof(float));
+    if (hs) *hs = out; else free(out);
+    out = NULL;
+    if (tags) *tags = outtags; else free(outtags);
+    outtags = NULL;
+    if (seq) *seq = txt.seq;
+    ok = true;
+
+done:
+    free(vis); free(out); free(outtags);
+    h3_present_free(&pres);
+    h3_text_free(&txt);
+    if (m.te_open) cwick_safetensors_close(&m.te);
+    if (m.tok) cwick_tokenizer_free(m.tok);
+    pthread_mutex_destroy(&m.lock);
+    return ok;
+}
+
 bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
                  const unsigned char **ref_png, const size_t *ref_len, int n_ref,
                  unsigned char **out, size_t *out_len, h3_timing *tim,
@@ -3200,6 +3379,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
     memset(&t, 0, sizeof(t));
     if (tim) *tim = t;
     double t0 = h3_ms();
+    h3_progress_pub(0, 0, 0);
 
     pthread_mutex_lock(&m->lock);
 
@@ -3257,6 +3437,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
     }
     t.tokenize_ms = h3_ms() - a;
     t.text_tokens = nids;
+    h3_progress_pub(1, 0, 0);
     CWICK_INFO("image", "phase 1/6 tokenize: %lld token%s in %.1f ms",
                (long long)nids, nids == 1 ? "" : "s", t.tokenize_ms);
     if (n_ref > 0) {
@@ -3291,6 +3472,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
         }
     }
     t.text_encode_ms = h3_ms() - a;
+    h3_progress_pub(2, 0, 0);
     {
         int64_t nv = pres.nvis;   /* read before h3_present_free below */
         CWICK_INFO("image", "phase 2/6 text-encode: %.1f ms, %lld vision token(s)",
@@ -3455,6 +3637,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
     t.image_tokens = nrows;
     t.canvas_w = cw; t.canvas_h = ch;
     t.output_w = w;  t.output_h = h;
+    h3_progress_pub(3, 0, 0);
     CWICK_INFO("image", "phase 3/6 pack: %lld image rows on %lldx%lld canvas "
                "(%d reference block%s), %.1f ms",
                (long long)nrows, (long long)cw, (long long)ch, nrefblk,
@@ -3479,6 +3662,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
             fclose(f);
         }
     }
+    h3_progress_pub(4, 0, lat_given ? 0 : H3_STEPS);
     CWICK_INFO("image", "phase 4/6 dit: %d steps on %lld packed rows "
                "(seq %lld), canvas %dx%d",
                lat_given ? 0 : H3_STEPS,
@@ -3499,6 +3683,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
         for (int64_t i = nrefrows * DIT_PATCH_DIM; i < img.rows * DIT_PATCH_DIM; i++)
             img.img[i] += dt * vel[i];
         free(vel);
+        h3_progress_pub(4, s + 1, H3_STEPS);
         CWICK_INFO("image", "  dit step %d/%d: %.1f ms (elapsed %.1f ms)",
                    s + 1, H3_STEPS, h3_ms() - step_ms, h3_ms() - a);
     }
@@ -3529,6 +3714,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
         return false;
     }
     t.vae_ms = h3_ms() - a;
+    h3_progress_pub(5, 0, 0);
     CWICK_INFO("image", "phase 5/6 vae: %lldx%lld decoded in %.1f ms",
                (long long)cw, (long long)ch, t.vae_ms);
     h3_dump("c_rgb", rgb, (int64_t)cw * ch * 3);
@@ -3547,6 +3733,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
     a = h3_ms();
     *out = h3_png_encode(fit, ow, oh, out_len, err);
     t.png_ms = h3_ms() - a;
+    h3_progress_pub(6, 0, 0);
     CWICK_INFO("image", "phase 6/6 png: %dx%d output in %.1f ms",
                ow, oh, t.png_ms);
     free(fit);
@@ -3555,6 +3742,7 @@ bool h3_generate(h3_model *m, const char *prompt, int w, int h, uint64_t seed,
     free(ref_aw); free(ref_ah);
     free(dbg_png);
     pthread_mutex_unlock(&m->lock);
+    h3_progress_pub(7, 0, 0);
     if (!*out) return false;
 
     t.total_ms = h3_ms() - t0;
@@ -3567,5 +3755,6 @@ unlock_fail:
     free(ref_aw); free(ref_ah);
     free(dbg_png);
     pthread_mutex_unlock(&m->lock);
+    h3_progress_pub(7, 0, 0);
     return false;
 }

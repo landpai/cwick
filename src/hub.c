@@ -17,6 +17,7 @@
 
 #include "cwick.h"
 #include "h3.h"
+#include "h3v.h"
 #include "json.h"
 #include "log.h"
 #include "models.h"
@@ -392,12 +393,126 @@ static bool h3_pipeline_complete(const char *dir) {
     return cwick_file_exists(p);
 }
 
+/* The video checkpoint (MiniMax-H3 FL2VA/Ref2VA) is a pipeline directory too.
+ * The modular download carries a top-level model_index.json whose class is
+ * MiniMaxH3ModularPipeline; a single-variant or flattened copy carries
+ * MiniMaxH3Pipeline with a fl2va/ref2va partition marker. Recognising it keeps
+ * the library from filing finished video weights as an unsupported text model. */
+static bool h3v_pipeline_manifest(const char *dir) {
+    char path[HUB_PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/model_index.json", dir) >=
+        (int)sizeof(path)) return false;
+    char *text = NULL;
+    size_t n = 0;
+    if (cwick_read_file(path, &text, &n) != 0 || !text || !n) {
+        free(text);
+        return false;
+    }
+    cwick_error err;
+    cwick_error_clear(&err);
+    json_value *j = cwick_json_parse(text, n, &err);
+    free(text);
+    if (!j) return false;
+    const char *cls = cwick_json_str(cwick_json_get(j, "_class_name"));
+    json_value *h3 = cwick_json_get(j, "_minimax_h3");
+    const char *part = NULL;
+    if (h3 && h3->kind == JSON_OBJECT)
+        part = cwick_json_str(cwick_json_get(h3, "partition"));
+    bool ok = (cls && (strcmp(cls, "MiniMaxH3ModularPipeline") == 0 ||
+                       strcmp(cls, "MiniMaxH3Pipeline") == 0)) ||
+              (part && (strcmp(part, "fl2va") == 0 ||
+                        strcmp(part, "ref2va") == 0));
+    cwick_json_free(j);
+    return ok;
+}
+
+/* Completeness mirrors h3v_model_open: a FL2VA/Ref2VA subdir (or the flattened
+ * root) must hold transformer, text_encoder, tokenizer and both VAEs. */
+static bool h3v_pipeline_complete(const char *dir) {
+    if (!h3v_pipeline_manifest(dir)) return false;
+    char base[HUB_PATH_MAX], sub[HUB_PATH_MAX], p[HUB_PATH_MAX];
+    if (snprintf(sub, sizeof(sub), "%s/FL2VA", dir) < (int)sizeof(sub) &&
+        cwick_dir_exists(sub))
+        snprintf(base, sizeof(base), "%s", sub);
+    else if (snprintf(sub, sizeof(sub), "%s/Ref2VA", dir) < (int)sizeof(sub) &&
+             cwick_dir_exists(sub))
+        snprintf(base, sizeof(base), "%s", sub);
+    else
+        snprintf(base, sizeof(base), "%s", dir);
+    static const char *const subs[] = {
+        "transformer", "text_encoder", "tokenizer"
+    };
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        if (snprintf(p, sizeof(p), "%s/%s", base, subs[i]) >= (int)sizeof(p) ||
+            !cwick_dir_exists(p)) return false;
+    }
+    bool vae =
+        (snprintf(p, sizeof(p), "%s/video_vae", base) < (int)sizeof(p) &&
+         cwick_dir_exists(p)) ||
+        (snprintf(p, sizeof(p), "%s/vae", base) < (int)sizeof(p) &&
+         cwick_dir_exists(p)) ||
+        (snprintf(p, sizeof(p), "%s/vae", dir) < (int)sizeof(p) &&
+         cwick_dir_exists(p));
+    bool avae =
+        (snprintf(p, sizeof(p), "%s/audio_vae", base) < (int)sizeof(p) &&
+         cwick_dir_exists(p)) ||
+        (snprintf(p, sizeof(p), "%s/audio_vae", dir) < (int)sizeof(p) &&
+         cwick_dir_exists(p));
+    return vae && avae;
+}
+
+/* A checkpoint does not need a config.json to be completely downloaded:
+ * SVC and audio pipelines ship plain .pt / .ckpt payloads with no text-model
+ * config. The .incomplete rule above still guarantees that every regular
+ * file present finished downloading, so a recognised weight payload is
+ * enough to call the directory "downloaded". Whether cwick can actually
+ * load it is a separate question, reported by `supported`. */
+static bool dir_has_model_weights(const char *dir, int depth) {
+    if (depth > 4) return false;
+    static const char *const ext[] = {
+        ".safetensors", ".bin", ".pt", ".ckpt", ".pth", ".gguf", ".onnx", ".npz"
+    };
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    bool found = false;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char p[HUB_PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, de->d_name) >= (int)sizeof(p))
+            continue;
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (dir_has_model_weights(p, depth + 1)) { found = true; break; }
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t n = strlen(de->d_name);
+        if (n >= 11 && strcmp(de->d_name + n - 11, ".incomplete") == 0)
+            continue;
+        for (size_t i = 0; i < sizeof(ext) / sizeof(ext[0]); i++) {
+            size_t m = strlen(ext[i]);
+            if (n >= m && strcmp(de->d_name + n - m, ext[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (found) break;
+    }
+    closedir(d);
+    return found;
+}
+
 static bool checkpoint_ready(const char *dir, int files, int partials) {
     if (partials > 0 || files == 0) return false;
     char cfg[HUB_PATH_MAX];
     if (snprintf(cfg, sizeof(cfg), "%s/config.json", dir) < (int)sizeof(cfg) &&
         cwick_file_exists(cfg)) return true;
-    return h3_pipeline_complete(dir);
+    if (h3_pipeline_complete(dir)) return true;
+    if (h3v_pipeline_complete(dir)) return true;
+    return dir_has_model_weights(dir, 0);
 }
 
 static void dir_stats(const char *dir, int64_t *bytes, int *files,
@@ -443,6 +558,7 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     snprintf(cfg, sizeof(cfg), "%s/config.json", dir);
     bool has_config = cwick_file_exists(cfg);
     bool image = !has_config && h3_pipeline_manifest(dir);
+    bool video = !has_config && !image && h3v_pipeline_manifest(dir);
     bool complete = checkpoint_ready(dir, files, partials);
     /* "Downloaded" and "loadable" are different facts: the library happily
      * fetches any repository, but only architectures with kernels can become
@@ -451,8 +567,10 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     char why[192] = "";
     bool supported = false;
     if (has_config) supported = cwick_model_root_supported(dir, why, sizeof(why));
-    else if (image) supported = true;
-    else snprintf(why, sizeof(why), "config.json is not present yet");
+    else if (image || video) supported = true;
+    else snprintf(why, sizeof(why),
+                  "weights-only checkpoint (no config.json); "
+                  "not a cwick-loadable architecture");
 
     if (!*first) hb_puts(out, ",");
     *first = false;
@@ -465,10 +583,13 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
             (long long)bytes, files, (long long)partial_bytes, partials,
             complete ? "true" : "false", partials > 0 ? "true" : "false",
             supported ? "true" : "false");
-    hb_json_str(out, image ? "image" : "text");
+    hb_json_str(out, image ? "image" : video ? "video" : "text");
     if (image) {
         hb_puts(out, ",\"served_id\":");
         hb_json_str(out, H3_SERVED_ID);
+    } else if (video) {
+        hb_puts(out, ",\"served_id\":");
+        hb_json_str(out, H3V_SERVED_ID);
     }
     if (!supported) {
         hb_puts(out, ",\"unsupported_reason\":");
@@ -477,14 +598,29 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     hb_puts(out, "}");
 }
 
-/* A directory that is itself a checkpoint has config.json; one that is still
- * downloading only has the .cwick-repo marker. Anything else at the first
- * level is an owner container, and its children are the checkpoints. */
+/* A diffusers pipeline carries a top-level model_index.json. Its class need
+ * not be one this build has kernels for: recognising the manifest as a
+ * checkpoint keeps the directory in the inventory, while `supported` there
+ * still says whether cwick can actually load it. A half-downloaded pipeline
+ * has the index but no weight payload, so it is listed as incomplete instead
+ * of disappearing. */
+static bool pipeline_manifest(const char *dir) {
+    char p[HUB_PATH_MAX];
+    if (snprintf(p, sizeof(p), "%s/model_index.json", dir) >= (int)sizeof(p))
+        return false;
+    return cwick_file_exists(p);
+}
+
+/* A directory that is itself a checkpoint has config.json or a pipeline
+ * manifest; one that is still downloading only has the .cwick-repo marker.
+ * Anything else at the first level is an owner container, and its children
+ * are the checkpoints. */
 static bool looks_like_checkpoint(const char *dir) {
     char p[HUB_PATH_MAX];
     snprintf(p, sizeof(p), "%s/config.json", dir);
     if (cwick_file_exists(p)) return true;
     if (h3_pipeline_manifest(dir)) return true;
+    if (pipeline_manifest(dir)) return true;
     snprintf(p, sizeof(p), "%s/.cwick-repo", dir);
     return cwick_file_exists(p) ? true : false;
 }

@@ -3770,3 +3770,869 @@ realtime 的输入 VAD 原来只有一个 RMS 阈值：超过就起音，低于�
 `tools/rtws --vad` 会播完成品录音再补静音。停顿超过 `silence_duration_ms` 的
 音频会被切几次，其余部分被当成插话；用 legacy 标志跑得到同样的三次提交和
 取消，所以这是 harness 的性质，不是回归。测成品音频请用 `--burst`。
+
+## 84. Qwen3.5 checkpoint 用发布名应答，不用类型标签
+
+这个混合架构 checkpoint 的 `config.json` 里有两个内部名字：外层
+`model_type=qwen3_5`、内层 `text_config.model_type=qwen3_5_text`。它们都是内核
+选择器——loader 先解包 `text_config`，`engine.c` / `server.c` 按 `qwen3_5` 前缀
+分支——所以两个都不能改。但 `cwick_model_served_alias()` 是从目录名派生对外
+API 名的，而 Qwen3.5 目录是唯一没进那张表的发布 checkpoint，于是对外名回退到
+了内层类型标签：客户端在 `GET /v1/models`、必须填的 `model` 字段、`/v1/metrics`
+（`mi.model`）和启动日志里看到的都是 `qwen3_5_text`，而 `start.sh` 早就接受真实
+名作启动参数。这种「按发布名启动、按类型标签应答」的错位就是问题。
+
+修法：在表里加一条，把发布目录 `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic`
+映射成同名的对外 alias。`served_name()`（catalog）、metrics 发布（从目录派生
+alias）、`validate_body()`（经 `cur->alias`）现在都报告并接受真实名；`qwen3_5_text`
+和 `qwen3_5` 仍作为 `model_id` / catalog id 被接受，学过旧名的客户端不会坏。
+alias 与这两个 id 都不同，所以 `cwick_models_list_add()` 会保留它，而不是当成
+「没有更好的名字」清空。`make test` 里两条断言固定了目录查表与 catalog entry
+两个环节，全套 749 条通过。
+
+## 85. 下载完整与可加载是两件事
+
+模型列表 tab 会把一个已经下完的 checkpoint 显示成「未下载完」（`hub.partial`）——只要它的目录里没有 `config.json`，又不是图像 pipeline。`checkpoint_ready()` 把这两个标记当成「已下载」的唯一定义，所以一个只带 `.pt` / `.ckpt` 权重的载荷（`models/GiantAILab/YingMusic-SVC` 下的 SVC pipeline，四个文件共 2.03 GB）即使一个 `.incomplete` 都没有，也被报成未完成。`hub.c` 的下载规则是：`<target>.incomplete` 是未传完的**唯一**标记，文件大小与清单一致后才会 rename 到位。因此该目录里每个普通文件都已经下完，错的只是「这是不是文本模型」这条启发式规则。
+
+修法：`checkpoint_ready()` 在没有 `.incomplete` 的前提下，也接受包含已知权重载荷（`.safetensors`、`.bin`、`.pt`、`.ckpt`、`.pth`、`.gguf`、`.onnx`、`.npz`）的目录。原因文案从「config.json is not present yet」改为「weights-only checkpoint (no config.json); not a cwick-loadable architecture」。「已下载」和「可加载」仍是两件事：卡片显示「完整」+ 架构不匹配徽章，依然没有切换按钮（该 checkpoint 没有 cwick 内核），和 `Ace-Step1.5` 靠 `config.json` 走的路径一致。
+
+实测：在线服务上 `GET /v1/hub/models` 中这一条从 `complete=false, supported=false` 变成 `complete=true, supported=false`，其余七个模型逐字段不变。`make test` 保持 749 条全绿。
+
+## 86. 手动下载的 pipeline 在模型库扫描中不可见
+
+`models/MiniMaxAI/MiniMax-H3/` 是一份完整下载的 498 GB diffusers pipeline（485 个文件），但模型列表 tab 从来不显示它。文件完好、一个 `.incomplete` 都没有，所以这不是 §85 那种下载状态问题——这个目录根本没进清单。
+
+扫描入口 `looks_like_checkpoint()` 只认三种标记：`config.json`、严格的 H3 **图像** manifest（`_class_name` 为 `MiniMaxH3ImagePipeline` 或 `partition:"image"`），以及 cwick 自带下载器写的 `.cwick-repo`。手动下载的 checkpoint 没有最后这个标记，而这份的 manifest 写的是 `MiniMaxH3ModularPipeline`，于是 owner 目录和它的子目录都被跳过。
+
+修法：`looks_like_checkpoint()` 现在也接受任意顶层 `model_index.json`，不限制 class、不问文件怎么来的。严格图像 manifest 仍用于 `kind=image` 和 `supported` 判定，所以这个 modular pipeline 显示为「完整但不可加载」（`complete=true, supported=false`），而不是被当成可切换的图像模型。下载到一半的 pipeline 有 index 但没权重载荷，仍会作为未完成显示。
+
+离线验证（未启动服务）：探针调用 `cwick_hub_models("./models")` 返回 9 条，MiniMax-H3 在列、498 GB / 485 文件；`make test` 755 条全绿（新增 6 条断言）。
+
+## 87. H5 工作室把图像到视频的闭环接通
+
+应用 3（`apps/imagegen`）是两步 H5 工作室。第一步调用两个图像接口；第二步把第一步生成的 PNG（或上传的图片）连同视频提示词交给异步的 `/v1/videos`，轮询 `GET /v1/videos/{id}` 取真实的 `progress` 字段，再用 `GET /v1/videos/{id}/content` 在线播放与下载。进度由服务端驱动而非本地计时器：进度条跟随任务各阶段权重（文本 0-5%、打包 5-10%、DiT 10-80%、视频 VAE 80-92%、音频 VAE 92-97%、合成 97-100%）。
+
+采样器是文本条件的——视觉 VAE 只有 decoder，没有把参考图编码成初始 latent 的 encoder。所以没有假装做了图生视频：应用把图像作为可选 `image` 字段（data URL 或裸 base64）提交，服务端校验（PNG/JPEG 魔数）、随任务保存字节，并在详情里回显 `reference_image`，其中 `conditioning:"text_only"` 如实标注。源图先在浏览器里缩成 1024px 的 JPEG：完整的 1536×2048 PNG data URL 可能超过服务端 8 MiB 请求体上限，而参考图并不需要原始分辨率。
+
+服务端回收视频槽位时，在 `memset` 前释放上一条任务的 `prompt`、`mp4` 和 `ref_image`，顺带修掉了任务复用时 mp4 的既有泄漏；`image` 的各条失败路径也释放了解码字节。`make test` 保持全绿；embed 重建报告更新后的 22 个 blob。
+
+## 88. 真正的图生视频需要那个我们说并不存在的 encoder
+
+第 87 节说视觉 VAE 只有 decoder，这是错的。随模型分发的
+`FL2VA/video_vae/source/model.safetensors` 里有全部 116 个 `encoder.*` 张量，
+以及 `quant_conv` 和 `post_quant_conv`：一个因果 3D CNN，ch=128、
+`ch_mult=[1,2,2,4,4,8]`、每层两个残差块、空间步长 `[2,2,2,2,1,1]`。缺的是
+实现，不是权重。
+
+`h3v_vae.c` 里的 `h3v_vae_encode()` 现在把一帧 RGB24 变成 24 通道 latent
+均值。关键是时间维退化：单帧时因果填充在前面补 `KT-1` 个零，只有最后一个
+时间核切片有贡献，于是每个 3D 卷积都化成核为 `w[:,:,KT-1,:,:]` 的 2D 卷积。
+卷积走 im2col + sgemm；残差块与 conv 用 reflect 填充，带步长的下采样用只在
+远端补零的 (0,1,0,1)。GroupNorm(32, eps 1e-6) 逐帧计算，后接 SiLU。
+`norm_out -> conv_out(48) -> quant_conv` 得到 moments，前 24 通道即 latent
+（条件帧取 eps=0）。
+
+验证全程纯 C，不信任旧的 numpy 重放——它的卷积辅助函数填错了轴，只读到零帧，
+结果只剩 bias。用正确的 shard 偏移读出 bias 后，手算 `conv_in` 的一个内部像素
+与 C 核吻合到 1.3e-7。端到端上，把结构化的 64×64 图案编码后再直接送进已验证
+的 ViT decoder 解码，重建图 R 通道相关度 0.9186——输出若是乱码不可能重建出
+输入。
+
+条件注入复用已有的 video token 通道（DiT 没有新的输入口）。参考图缩放到渲染
+画布后编码，写进 latent 第 0 步；每步 Euler 更新后把这段 packed 行重置回去，
+使首帧保持干净而 DiT 每步都在注意它。有参考图时禁用缓存捷径。HTTP 详情里的
+`reference_image.conditioning` 在编码成功时报告 `first_frame`，只有解码失败
+才回退 `text_only`。`h3vprobe` 与 `h3vencprobe` 都是 `tools/` 下的纯 C 工具，
+各有 Makefile 目标。
+
+## 89. 封装器根本没写 moov，esds 又把描述符套进了描述符
+
+第一段端到端 i2v 视频完全打不开：ffprobe 报 `moov atom not found` 和
+`wrong sample count`。用纯 C 的 box 遍历器看输出才明白：`h3v_mp4_encode()`
+把 `moov` 构造成一个装着子 box 的缓冲区，最后却用 `mb_put(&out, moov.p, ...)`
+直接追加内容——atom 自己的头从来没写过，于是 `mvhd` 和两个 `trak` 裸放在顶层。
+另一个问题是 `stsc` 声明「一个 chunk 装下所有样本」，`stco` 却按每样本一个偏移
+写了 102 条；ISO 14496-12 要求两者计数一致。
+
+`h3v_mp4.m` 四处修复：改用 `mb_box(&out, "moov", &moov)`；stsc 的
+`samples_per_chunk` 改为 1；`tkhd` 的时长改用电影时间刻度（原来用媒体时间刻度，
+长了 24 倍）；修正 `esds` 两个描述符长度字段。
+
+box 修好后音频仍然失败：`Audio object type 0`、`22050 Hz, 0 channels`。
+AudioToolbox 的 magic cookie 是一个完整的 ES 描述符（7 位变长长度），不是
+`DecSpecificInfo` 里该放的裸 AudioSpecificConfig；我们把前者塞进了后者。
+`find_asc()` 现在沿 ES → DecoderConfig → DecSpecificInfo 找到两字节配置
+（32 kHz 立体声 AAC-LC 是 `12 90`）。之后 ffprobe 正确报 `AAC (LC), 32000 Hz,
+stereo`，两条流都能解码到预期样本数（AAC 输出按 1024 样本包边界补齐）。
+
+回归现在很便宜：`make h3vmuxprobe` 把合成像素和 PCM 直接送进封装器；测试套件里的
+`test_h3v_mp4` 在内存中检查 box 覆盖、stsc/stco 一致性和裸 AAC-LC 配置。两者都不
+需要权重，也不需要四分钟的 DiT。
+
+## 90. 视频计时只在任务详情里，/v1/metrics 里没有
+
+轮询 `GET /v1/videos/{id}` 的客户端在完成后能看到完整的 `cwick` 计时对象，但
+Prometheus 抓取里一个视频指标都没有——和那个卡在 10% 却看起来健康的任务是同一
+种盲区。`metrics.{c,h}` 现在发布 `cwick:video_jobs_total`、`_succeeded_total`、
+`_failed_total`、`_first_frame_jobs_total`、累计的
+`cwick:video_stage_seconds_total{stage=...}`（text、pack、encode、dit、vae、
+audio_vae、mux、load、total）、实时的 `cwick:video_dit_steps_done` / `_total`、
+`cwick:video_last_total_seconds`、帧数/字节数计数器以及
+`cwick:video_tokens_total{kind=...}`。DiT gauge 直接由已有的进度回调写入，所以
+长采样期间抓取能区分「在推进」和「卡死」。`h3v_timing` 新增 `encode_ms` 记录参考图
+VAE 编码；任务详情和计数器用同一个单调时钟测量。
+
+## 91. 在可播放的视频上验证了首帧条件注入
+
+第 88 节的 encoder 数字还只是张量层面。之后用修好的封装器（第 89 节）以
+256x256 / 1 步跑通完整 i2v，产出 571,855 字节的 mp4；ffprobe 识别为 H.264 High
+24 fps 加 AAC-LC 32 kHz 立体声，时长 4.32 秒。把第 0 帧和第 40 帧解码出来，与
+放大后的 64x64 参考图用纯 C 比较亮度，相关度分别是 **0.567** 和 **−0.036**。
+参考图确实出现在第一帧，之后消失——正是 latent 第 0 步注入应有的行为。完整阶段
+耗时见 PERF.zh-CN.md。
+
+## 92. 视频 DiT 与 VAE 补上 Metal 路径，输出仍与 CPU 高度一致
+
+第 89–91 节修复了正确性和可观测性，但视频 DiT 与 VAE 仍走 CPU fp32 SGEMM；
+`--backend metal` 虽然初始化了设备，却没有视频内核用它。现在新增
+`h3v_gpu.{h,c,m}`：50 层 DiT 用 BF16 张量核 GEMM，VAE 的 F32 权重用 F32 张量核
+GEMM，分块 flash attention 分别实例化为 128 通道（DiT）和 64 通道（VAE 解码器）。
+它们沿用图像变换器的零拷贝页采用方式，62 GiB 分片只包一次，而不是每个投影包一次。
+
+两个内核细节很关键。Metal 不允许在非 kernel 函数里声明 threadgroup 数组，所以由
+kernel 声明暂存内存再传给公共核心。注意力的归一化要把一个 simdgroup 的 8xHD 输出
+按每块 HD/4 映射到 32 个 lane：照搬 128 宽的布局会让 64 宽实例写出乱码。
+h3vgpuprobe 工具在加载任何权重之前就抓到了这两处问题。
+
+策略是逐次判断：形状不支持、没有设备或 `CWICK_H3V_GPU=0` 都回退到原有 CPU 代码，
+GPU 路径永远不会卡住视频生成。同机 256x256 / 1 步实测：总耗时 269.4 s → 168.2 s，
+DiT 单步 149.5 s → 51.6 s，视频 VAE 105.8 s → 50.5 s。两条路径解码后的帧相关度
+为 0.9989（第 0 帧）和 0.9944（第 40 帧）；首帧条件注入依旧是第 0 帧对参考图
+0.567、第 40 帧 −0.037。完整表格见 PERF.zh-CN.md。
+
+## 93. 图像接口按需装载模型并上报真实进度
+
+视频线完成后，应用 3（图像 + 视频两步向导）还剩两个易用性缺口。其一，图像接口
+仍要求操作者先手动切到 `MiniMax-H3-Image`：冷启动的首次 POST 返回 503，H5 界面
+弹出「请先在设置里切换」的阻塞确认。视频接口早已通过首次使用时装载管线解决了
+这个问题——走的是与显式切换同一个单模型槽位与交换门。`srv_image_route` 现在照此
+处理：若没有常驻图像管线，就调用 `srv_switch_image`，关闭交换门、释放文本/实时
+权重、映射图像 checkpoint；并发切换返回 503 而不是双重装载。H5 的确认框已去掉，
+模型状态标签改为「按需加载 · 首次生成自动热切换」。
+
+其二，图像进度条是假计时（`6 + secs/30`），不管渲染在做什么都会涨满。渲染器其实
+已经在发布实时快照（阶段 0 idle、1 tokenize、2 text_encode、3 pack、4 dit 带
+step/steps 计数、5 vae、6 png、7 done），只是没有暴露出来。新增的
+`GET /v1/images/progress` 在准入之前应答，返回 `phase`、`phase_name`、`step`、
+`steps`、`idle`、`age_ms`，所以轮询永远不会排在那个人工约 40 分钟的任务后面。
+H5 应用每秒轮询一次，把 DiT 计为进度条的 60%，结束时仍从响应的 `cwick` 对象填入
+精确的各阶段耗时。轮询失败或过期只会让屏幕停在最后的快照上，不影响渲染。
+
+本机用重编译后的二进制端到端验证：冷启动的 `POST /v1/images/generations`
+自动释放文本模型并按需装载图像管线，随后对空 prompt 返回干净的 400（未启动渲染）；
+`GET /v1/images/progress` 在静止时上报 `idle:true`。`make test` 通过，服务的 `app.js` 是重编译后的 33420 字节版本，
+含三处对真实端点的引用。
+
+## 94. "黑屏"其实是有效 mp4 里的白噪声，而监控把它记成了成功
+
+`video_1795193877_1` 的日志与 `/v1/metrics` 在机械层面完全一致：任务完成、封装出
+2,570,415 字节、上报 `video_jobs_succeeded_total 1` 和 `video_first_frame_jobs_total 1`。
+总耗时 20,752.6 s，其中 DiT 在 30 步里占了 19,948.8 s（736x1280 下每步约 665 s）。
+这些数据没有一处描述像素本身。取 `GET /v1/videos/{id}/content` 回读帧之后才看清
+为什么看起来是黑屏：第 0 帧还留着可辨认的条件图像，只是压着很重的分块网格；
+第 20、100 帧却是高频静态噪声（平均亮度 70-73，平滑度比约 0.53，而第 0 帧约 0.75）。
+相邻帧相关从保持区间的 +0.97 掉到片段深处的 +0.77-0.80——生成的 latent 仍是噪声，
+VAE 只是忠实地把噪声解码了出来。
+
+采样器的符号、timestep 嵌入和 sigma 到 timestep 的映射都与图像线逐项核对过；
+图像线用同一套流匹配能产出正常结果，这几处一致。查到的具体缺陷是音频 shift：
+checkpoint 在 `model_index.json` 的 `sigma_shift_scales` 里声明视频 12.0、音频 3.0，
+但采样器对两条流都用 12.0，使音频的欧拉步长大了 4 倍。这解释不了视频帧，所以修它
+时没有宣称它解决了黑屏。
+
+由于一次生成要 5.7 小时，不可能拿它当反馈回路，于是加了两样东西：
+
+1. 纯 CPU 的去噪信号，取自管线本来就持有的 latent。`spatial_corr` 是第一个生成
+   latent 步（排除条件步）的横向 lag-1 自相关均值；自然解码的 latent 约 0.8，
+   白噪声约 0。`snr_db` 是生成步与干净步的标准差之比。两者都进 `h3v_timing`、
+   任务详情的 `cwick` 对象，并由 `suspect_noise` 新增
+   `cwick:video_suspect_noise_jobs_total` 计数器，这样噪声片段在监控里不再与好片段
+   无法区分。门限是暂定的（0.35，可用 `CWICK_H3V_CORR_FLOOR` 覆盖），等测过一段
+   已知正常的片段再定。`tools/h3vprobe` 直接打印同样三个数，便于直接 A/B。
+2. 配置驱动的 shift：`h3v_model_open` 读取 `_minimax_h3.sigma_shift_scales`
+   （缺省 12.0/3.0），视频与音频各按自己的 sigma 网格步进，唯一的共享时间嵌入层
+   不变；`CWICK_H3V_VIDEO_SHIFT` / `CWICK_H3V_AUDIO_SHIFT` 可在不重编译下 A/B。
+   `CWICK_H3V_REF_NOISE_AUG=<level>` 还把图像线的带噪声首帧条件暴露成可选杠杆；
+   缺省仍是干净首帧，在测过之前不改动既有输出。
+
+`make test` 通过（含新增的 suspect-noise 计数器断言），`h3vprobe` 构建通过。
+悬而未决的问题现在可以用一次短探针测量，而不必等一次长渲染：究竟是哪一处 DiT
+约定让生成帧停在噪声水平。这里不宣称 shift 的修改已经彻底修复黑屏。
+
+## 95. 标定噪声门限并对 DiT timestep 约定做 A/B
+
+§94 里暂定的 0.35 相关门限需要实测数字。给 `h3vprobe` 加了两个纯 C 旋钮（不额外读模型、不用
+Python）：`CWICK_H3V_CORR_TRACE` 在每次欧拉更新后打印生成步的 latent lag-1 自相关；
+`CWICK_H3V_DIAG_MIX=<m>` / `CWICK_H3V_DIAG_TS=<t>` 从已知的
+`m*noise + (1-m)*clean` 混合出发并强制一个条件 timestep，于是一步就能读出速度方向，
+不必等 30 步渲染。`h3v_timing.clean_corr`（干净条件步上的同样自相关）和
+`H3VPROBE_METAL=1`（probe 强制 Metal 以匹配 `--backend metal`）也一并加入。
+
+256x256、2 步标定：VAE 编码的干净参考步测得 0.769-0.814，纯/近噪声测得 -0.145 到 0.068。
+0.35 门限能干净分开，保留为缺省（`CWICK_H3V_CORR_FLOOR` 仍可覆盖）。
+
+sigma=0.9 的单步探针一度显示 checkpoint 要 `t=sigma`：`ts=0.1`（代码的 `1-sigma`）
+把 corr 从 0.068 推到 0.025，`ts=0.9` 推到 0.290。这是假象 —— 强制的 `dt=0.9` 是巨步，
+latent std 从 0.947 爆到 2.042、越过干净锚，测的是分布外 overshoot，不是约定信号。
+两次同配置的完整 8 步定论：`t=1-sigma`（原行为）最终 corr 0.360（`ok`），`t=sigma`
+为 0.288（`suspect`）。改动已回退，缺省保持 `t=1-sigma`，与图像线一致。
+`CWICK_H3V_TS=sigma` 保留该备选，供在 >=4 MP（checkpoint 真正在分布内）下再测 —— 
+256x256 下它按设计就返回纹理噪声，短生成根本无法判断去噪质量。
+
+现已确认：噪声门限已标定；音频 shift 是真 bug（checkpoint 声明 3.0，代码用 12.0），
+已按配置修复；噪声片段不再能冒充 `succeeded`。30 步黑屏的根因仍未定论。剩余嫌疑是
+shift=12 网格把几乎全部去噪压在末步，以及参考帧级别差异（图像线把参考行放在自己的
+0.999 timestep、latent 用 `0.999*clean + 0.001*noise`；视频线用纯 clean latent 和单一
+共享 timestep）。两者都需要 >=4 MP 的 A/B 才能确认，这里不宣称已修复。
+
+## 96. 去噪信号读错了张量平面：修正布局后重测
+
+§95 的噪声门限标定和 timestep A/B 建立在一个坏掉的读取器上。`vlat` 的布局是
+`[C][T][H][W]` —— `h3v_pack3d()` 用 `((c*lt + t)*lh + y)*lw + x` 索引它，VAE 解码器
+也用同样的步长取一个 cell 的 24 个通道。但 `h3v_lat_step_stats()` 把平面算成
+`t*VD_LATENT*lh*lw`（这是 `[T][C][H][W]` 的假设），所以 t=1 时它测到的是通道 0 的
+后段时间步与通道 1 的前段时间步的混合，而不是第一个生成帧。参考帧注入有镜像的
+bug：它把编码器连续的 `[C][H][W]` 输出 `memcpy` 到 `vlat` 开头，在 `[C][T][H][W]`
+里这会把 24 个通道撒到通道 0 的时间轴上，而不是全部放在 t=0。首帧看着仍 partially
+正确，是因为每个 Euler 步后都会恢复打包好的参考行；但 DiT 第一步是在被破坏的
+t=0 latent 上做条件。
+
+两处都已在 `src/h3v.c` 修复。参考帧先按编码器布局组装，再逐通道散布到 `vlat`
+的 t=0，并从同一块 buffer 打包；统计函数接收 `lt` 并按 `(c*lt + t)*lh*lw` 步长读取。
+`h3v_internal.h` 里新增不依赖权重的 `h3v_layout_selftest()`：检查 t=0 平滑平面读数高、
+t=1 平面读数低、pack/unpack 精确往返；`make test` 会断言它。
+
+在 256x256、4 秒、seed 42、Metal、8 步下重测（四组配置完全一致）：
+
+| 配置 | 最终 spatial_corr | clean_corr | snr_db | suspect |
+| --- | --- | --- | --- | --- |
+| 默认（t=1-sigma, shift 12, 纯 clean 参考） | 0.247 | 0.848 | +0.63 | 是 |
+| `REF_NOISE_AUG=0.999` | 0.247 | 0.848 | +0.63 | 是 |
+| `VIDEO_SHIFT=3` | 0.145 | 0.848 | +0.91 | 是 |
+| 两者都开 | 0.145 | 0.848 | +0.91 | 是 |
+
+修正后的 trace 从 corr -0.003（真正的白噪声）起步，单调升到 0.247；旧 trace 的
+0.404 起点是跨通道误读。`clean_corr=0.848` 才是平滑参考帧的真实值。0.35 门限仍能
+分开干净与噪声，保持不变。参考噪声增强在 0.999 上是 no-op —— 那只是在干净 latent
+上叠约 0.1% 噪声；图像线真正的机制是独立的 0.999 timestep，而这个 checkpoint 表达
+不了：`adaln_proj.linear.weight` 形状是 `[96768, 2688]` = 18 行 = 6 向量 x 3 模态，
+没有 timestep 轴。把视频 shift 降到 3 会把去噪摊到各步（第 3 步 corr 0.072，
+shift 12 是 0.007），但 8 步末值更低（0.145 对 0.247）。四组在 256x256 都低于门限，
+而该尺寸属于 checkpoint 的分布外（支持尺寸 >=4 MP），所以这里不对 30 步质量下结论。
+30 步黑屏的根因仍未定论；布局修复去掉了一个真实缺陷，但本身不证明故障已消失。
+
+## 97. FL2VA 与 Ref2VA 都支持按请求选择
+
+MiniMax-H3 下载包根目录含两个完整分区 `FL2VA/` 与 `Ref2VA/`，各有一个 62 GiB
+的 `transformer/`。两者的 DiT 配置和全部 538 个权重键相同，视觉 VAE、音频 VAE
+与文本编码器逐字节相同（`FL2VA/video_vae/source/model.safetensors` 与 Ref2VA
+的副本哈希一致，文本编码器索引也一致）。只有训练出的 transformer 权重不同：
+FL2VA 是首帧/尾帧转视频+音频，Ref2VA 是全模态参考转视频+音频。旧的
+`h3v_model_open()` 取第一个存在的目录（完整下载包里就是 FL2VA），没有任何途径
+访问 Ref2VA，于是一半 checkpoint 在 `/v1/videos` 上无法使用。
+
+现在 `h3v_model_open()` 枚举所有可用变体（只有当其 `transformer/` 确实含分片时
+才算可用），记录每个规范名及其 DiT 目录，并从 `CWICK_H3V_VARIANT` 或第一个找到
+的项中挑默认值。`h3v_generate_variant()` 为每个任务固定一个分区；共享的 VAE 与
+文本编码器保持映射。因为所有生成本就在模型锁下进行、且每个任务各自打开并关闭
+DiT 分片，同一时刻只有一个 62 GiB transformer 常驻，两个变体不会争用。
+
+`POST /v1/videos` 接受 `variant`（别名 `model_variant`），在入队前校验（拼错时
+HTTP 400 并列出可用名字），并在任务详情的 `reference_image` 旁回报规范值。
+stdout 在 DiT 打开处记录所选变体与确切分片路径。`tools/h3vprobe.c` 用
+`H3VPROBE_VARIANT` 走同一条路径。纯 C 的 `h3v_variant_selftest()` 覆盖大小写
+不敏感的名字匹配，`make test` 会断言。
+
+端到端测试：`--backend metal`、256x256、4 秒、2 步、seed 42，两次使用同一个
+`input/sample.png`（1152x1536）与 `input/sample_video.txt` prompt：
+
+| 变体 | 状态 | 打开的 DiT 分片 | 条件 | total_ms | dit_ms | spatial_corr | suspect |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FL2VA | completed | `FL2VA/transformer` | first_frame | 285894 | 165533 | 0.376 | 0 |
+| Ref2VA | completed | `Ref2VA/transformer` | first_frame | 256562 | 127090 | 0.360 | 0 |
+
+两次都产出合法的 H.264 + AAC mp4（559228 对 568343 字节，哈希不同），首帧条件
+均成功，`suspect_noise=0`。`/v1/metrics` 读到 `video_jobs_total 2`、
+`succeeded_total 2`、`failed_total 0`、`first_frame_jobs_total 2`、
+`suspect_noise_jobs_total 0`。两步冒烟测试只证明两个分区都能在这台机器上加载
+并运行，不对 30 步质量下结论（256x256 低于 checkpoint 支持的尺寸）。
+
+## 98. 视频 VAE 一直在解码未归一化的 latent
+
+`vae/config.json` 带有 24 通道的 `latents_mean` / `latents_std`。Transformer 在
+这个归一化空间里采样，但视频链路把两张表都忽略了：`h3v_vae_encode()` 直接返回
+`quant_conv` 的原始输出，`h3v_vae_decode()` 把采样得到的 latent 直接送进折叠后的
+`post_quant_conv` + `x_embedder`。`h3v_internal.h` 甚至写着「already
+de-normalised by the caller」，但没有任何调用方做这一步。逐通道误差很大——std
+范围 0.45-3.28、mean 范围 -1.37-1.07——36 层 ViT 解出来的画面对应不上采样结果，
+写进 latent step 0 的参考帧对 DiT 也同样是错的。
+
+修法都在 `src/h3v_vae.c`：两张表 + `vl_lat_norm()`（编码输出 raw -> 归一化，让
+参考帧与噪声处在同一空间）与 `vl_lat_denorm()`（解码输入 归一化 -> raw，在分块
+之前做一次）。`h3v_latnorm_selftest()` 校验往返误差，以及零 latent 必须正好落在
+逐通道均值上，已进 `make test`。
+
+三组实测把这件事与旧的「黑屏」结论区分开：
+
+* 256x320 的编码->解码往返（不过 DiT）：R 通道相关 **0.8762**，重建是清晰人像；
+  修复前同一 latent 解出来是 16 像素彩色网格。
+* 常量（全零）latent 解码为平滑色场，说明解码器与分块本身正常；网格来自数值，
+  不是分块。
+* 端到端第 0 帧（被钉住的参考步）从平板网格变成了清晰人形轮廓。
+
+本机端到端，`--backend metal`，`input/sample.png`（1152x1536）+ 
+`input/sample_video.txt` 提示词，768x1024、**4 步**、seed 42、FL2VA：完成耗时
+2,953,739 ms（DiT 2,241,221 ms、视频 VAE 678,956 ms），`spatial_corr 0.309`、
+`suspect_noise 1`、mp4 2,923,218 字节。第 0 帧有人形，第 40/100 帧又退化为网格。
+4 步不构成质量结论：`shift=12` 下 sigma 网格是 1.0、0.973、0.923、0.8、0，最后
+一步宽 0.8，几乎全部去噪都挤在这一次无条件跳步里。
+
+两组探针界定了剩余工作：
+
+* timestep 约定是对的。已知混合 0.9*噪声 + 0.1*干净、在 sigma=0.9 走一步：
+  `t=1-sigma` 把 `spatial_corr` 从 0.008 推到 0.334，`t=sigma` 推到 -0.042。
+* 欧拉方向尚未定论。小步长（dt=0.1、0.2）下**减号**朝干净锚移动（dt=0.2 时
+  corr 0.216 -> 0.289、std 0.699 -> 0.886），加号反而降（0.216 -> 0.146）；但
+  同尺寸同步数的 4 步端到端 A/B 更偏加号（0.300 对 0.277）。4 步被 0.8 宽的末步
+  主导，过冲会掩盖方向，端到端测不出来。默认保留实测胜出的 `plus`；
+  `CWICK_H3V_SIGN=minus` 暴露另一方向，供 30 步 A/B 使用。本机 768p、30 步约 5
+  小时，这是下一次测量，不是猜测。
+
+为这次 A/B 新增的探针旋钮：`CWICK_H3V_DIAG_DT`（缩小强制步长）、
+`CWICK_H3V_SIGN`；`tools/h3vencprobe` 支持 `H3VPROBE_W/H`，可以在渲染尺寸而不是
+固定 64x64 下驱动编码器。
+
+## 99. DiT 按转换后布局读取了原始权重
+
+transformer 分片保留的是原始张量名与布局，参考加载器做的两次重排并不会隐含在字节里：
+
+* 融合 QKV 的权重行是 `head0: q|k|v, head1: q|k|v, ...`。把输出直接切成三个连续块后，
+  第 h 个头的查询 actual 上来自第 0 个头的键，以此类推：每个注意力头都在混合错误的流。
+* `mlp.fc1` 输出的是 `[gate | value]`，而 SwiGLU 按 `[value | gate]` 解读，结果把激活施加
+  在 value 上，又乘了未激活的 gate。
+
+修复在 `src/h3v.c`：CPU 路径用 `h3v_split_qkv()` 把原始输出散开；Metal 路径新增
+`gemm_bf16_qkv` 内核，在装载 tile 时对权重行做置换，直接把 q/k/v 写进三个平面，
+不再多一遍拷贝。SwiGLU 改从前半取 gate。50 层 block 和 2 层 token refiner 用的是
+同一种投影布局。`CWICK_H3V_LEGACY_LAYOUT=1` 可恢复旧解读做对照。
+
+同输入 A/B（256x256、1 步、DIAG_MIX 0.6、dt 0.1、seed 42、Metal）：
+
+| 信号 | 旧布局 | 修正后 |
+| --- | --- | --- |
+| cos(速度, data-ward 参考方向) | -0.142 | **+0.954** |
+| 参考场最佳缩放 | -0.042 | 0.919 |
+| \|速度\| | 206.73 | 679.06 |
+| 第 0 层 MLP 输出 rms | 86.32 | 13.98 |
+| 第 49 层残差 rms | 22497 | 7570 |
+| 生成步 `spatial_corr` | 0.338 判为噪声 | **0.501 正常** |
+
+融合内核与主机散开逐位一致，两边都给出 `|v| 679.0618`、`cos 0.954`、`corr 0.501`；
+`h3vgpuprobe` 已覆盖新管线。
+
+本机端到端验证：`--backend metal`，`input/sample.png` + `input/sample_video.txt`，
+256x256、4 步、seed 42，DiT 结束时 `spatial_corr 0.927`（`suspect_noise 0`），
+609,140 字节 mp4，全程 384.1 s（文本 70.1 s、DiT 244.8 s、视频 VAE 63.2 s、音频 VAE 4.3 s）。
+解出的第 20、60、100 帧是参考人物，不再是修复前同一 prompt 的格子/雪花。256x256、
+4 步只做正确性判定；768p / 30 步的质量数据仍需单独测量。
+
+同样 4 步、768x1024 也越过了门限：`spatial_corr 0.963`、`clean_corr 0.929`、
+`snr_db 2.56`、`suspect_noise 0`，mp4 1,249,044 字节，全程 3,008.3 s（文本 63.3 s、
+DiT 2,282.4 s、视频 VAE 650.4 s、音频 VAE 4.4 s、封装 0.4 s）。原视频抽帧全是绿色格子，
+修复后第 60、100 帧是清晰且在动的人物；第 20 帧仍有单侧格子接缝、第 0 帧有横向条带，
+这是时间维 VAE 边界的独立遗留问题。768p / 30 步的质量测量仍未做。
+
+## §100 图像+视频应用的快速验证档
+
+H5 工作室（应用 3）此前已具备两步「图像 → 视频」流程，服务端也接受 256×256 画布和
+4 秒片段（引擎会把两者分别向上取整到 32 像素画布倍数和 17 帧整段）。无法缩短的是采样：
+DiT 步数固定 30，只能通过进程级环境变量调整，因此即便最小画布也要几十分钟，算不上快速验证。
+
+`POST /v1/videos` 现在接受可选的 `steps` 整数。`h3v_generate_variant_steps()` 按任务传入
+并把它限制在 [1, `H3V_SAMPLE_STEPS`=30]；旧的 `h3v_generate_variant()` 保持原签名并传 0
+（引擎默认）。这同时修掉一个潜在缺陷：环境变量此前接受 1..256，而 sigma/时间步暂存数组
+只按 30 分配，大于 30 会越界写。两条路径现在共用同一个上限。任务对象回报请求的 `steps`，
+完成后的 `cwick` 对象仍回报实际步数。默认行为（不传字段或传 0）不变。
+
+应用第二步新增 256×256 / 320×320 画布选项、步数输入框，以及一键「快速验证档」
+（256×256、4 秒、4 步）。本机上这条 256² / 4 步路径在 384.1 s 内生成了清晰且在动的人物
+（§99），预设正是基于这次实测。完整 30 步调度仍是质量渲染的默认值。
+
+## §101 视频线的内存感知驻留
+
+文本/模型线早就把各权重阶段接入了共享内存预算（`--mem-fraction`，默认主机内存的
+80%；`--max-memory`；禁 swap 时 wire）。视频线没有：它的 DiT（61.73 GiB）每次请求
+按需映射、退出时解除映射，从不 wire，于是 VM 可以自由压缩/换出 30 步采样循环每步都要
+重读的那些页；两个 VAE 虽在进程启动时映射，同样没有 wire。
+
+`cwick_mem_fit_model()` 现在承担单个权重阶段的统一决策：给定该阶段的映射字节数、
+运行期暂存和预留量，把总和与上限比较，在禁 swap 模式下只在该阶段装得下时才 fault-in
+并 wire。超预算的阶段刻意保留为惰性、SSD 支持的映射——wire 一个超预算阶段的一部分只会
+把别的东西挤进压缩器。视频线在每次 safetensors 打开后调用它：两个 VAE 在模型加载时
+（进程常驻），DiT 在生成时（一次采样期常驻；`close()` 自动 unwire）。
+`CWICK_H3V_WIRE=0/1` 可覆盖决策做 A/B。
+
+两个 62 GiB 阶段刻意错峰：text encoder 只在第 1 阶段映射，第 3 阶段映射 DiT 前就释放；
+若两者同时 wire，峰值会到 134 GiB、超过 102.4 GiB 上限，恰恰造成本打算避免的 swap。
+text encoder 是只读一次的流式访问，保持惰性既正确又比 wire 更省。
+
+新增四个指标：`cwick:model_weight_bytes`、`cwick:model_resident_bytes`、
+`cwick:model_target_bytes`、`cwick:model_wired`。
+
+实测（同机、Metal、256×256 / 1 步、驻留路径）：VAE 9.70 GiB + audio VAE 0.56 GiB +
+DiT 61.73 GiB 全部记录为 `wire resident`，上限 102.40 GiB（128 GiB 主机的 80%），
+合计约 72 GiB 已 wire，全程无 wire 失败。禁 swap 的决定性证据是换页计数而非
+`swapused` 电平：`Swapouts` 从 137479946 → 137479946（增量 **0**），`swapused`
+反而从 6052 降到 5916 MiB；`Compressions` 增量只占其开机累计值的 0.009%。早先一次
+观察到的 `swapused` 上涨 2.1 GiB 是其他进程的全局噪声，不是模型驻留页被换出：`mlock`
+成功后这些页不可能被 paging。`denoise check` 报空间相关 0.955（门槛 0.35）。
+`make test` 与 `make h3vprobe` 均通过。
+
+## §102 视频接口只使用 Ref2VA
+
+§97 让下载包里的两个分区都能被选中，这是弄清各自行为的正确手段。但
+`POST /v1/videos` 的输入是 prompt 加可选参考图、输出是一段生成视频，对应的是
+全模态参考工作流，因此与接口语义匹配的 transformer 是 Ref2VA。首帧/尾帧分区
+服务于另一种请求形态，此前只是因为目录排序在前才成为默认。
+
+本版 `h3v_model_open()` 只发现 `Ref2VA/`（或它的扁平副本），默认变体就是它；
+请求里 `variant` 指定首帧/尾帧分区会在入队前被 HTTP 400 拒绝，其分片不再探测、
+不再映射。这消除了接口上意外的质量 A/B，同时不改变共享 VAE、文本编码器、
+任务模型与进度 API。
+
+## §103 Ref2VA 参考图呈现与参考几何
+
+切到 Ref2VA 后，管线里还有两处沿用首帧请求形态：
+
+1. 参考图被缩放到生成画布，只作为 latent 行进入序列。全模态参考工作流里，
+   图片同时也是文本呈现的一部分（prompt 前是 `Picture 1: <视觉块>`），视觉
+   token 行在 AdaLN 上取视频模态。新增的 `h3_text_cond_ref_dir()` 复用图像线
+   的视觉塔构建该呈现，并返回逐行模态标签。`CWICK_H3V_REF_PRESENT=0` 可回到
+   裸 prompt。
+2. 图片参考按自身分辨率编码，不继承生成画布。`CWICK_H3V_REF_EDGE`
+   （32..6272，未设置 = 画布）缩放参考短边后编码，条件行按自身 latent 网格
+   打包并使用自己的空间 RoPE 网格；图片参考还让共享音视频 rotary 时钟前进
+   一格，此前缺失。`CWICK_H3V_CONDROWS=0` 与显式短边不叠加：旧的目标 t=0
+   布局要求参考网格与目标网格相同。
+   注意：上限 `H3V_REF_EDGE_MAX`(6272) 与生成画布上限 `H3V_MAX_SIZE`(2560，2K)
+   是两个独立常量。早期实现误用画布上限截断 REF_EDGE，导致显式 2048 被静默回落到
+   画布尺寸；现已拆开，设 2048 会真正按参考图自身短边编码（1152×1536 → 2048×2720）。
+   画布上限本身也从 1280 放开到 2560（低于 4K）：应用 3 的 `vsize` 增加 1600×900 /
+   1920×1080 / 2560×1440 三档，`sizeHint` 同步；图像线 `H3_MAX_SIZE` 本就是 6272、
+   已覆盖 4K，无需改。尺寸换算提成纯函数 `h3v_ref_encode_size()`，生产路径与单测
+   共用；`make test` 覆盖 2048 生效、未设置回落、越界忽略，以及 2560 准入 / 3840 拒绝。
+   参考短边只影响 VAE 编码栅格与条件行，不改变生成分辨率；DiT 行数随画布近似平方
+   增长，2K 全 30 步要数小时——UI 提示引导先用 4 步验证档。
+
+两个旋钮都不改变权重精度、采样器或任务/HTTP 模型。
+
+新呈现生效前的接口实测（`--backend metal`、256x256、4 秒、30 步、seed 42、
+`input/sample.png` 加 `input/sample_video.txt`，POST `/v1/videos` 指定
+`variant:Ref2VA`）：1,342,128 ms 完成（文本 58,397、DiT 1,232,712、视频 VAE
+45,123、音频 VAE 3,906 ms），102 帧、612 KiB mp4，`spatial_corr 0.899`、
+`snr_db 0.17`、`suspect_noise 0`。全程 `cwick:host_swapouts_total` 保持
+137485839 不变，102.40 GiB 上限下 wire 66.28 GiB。抽帧 0/20/60/100 都是
+米色毛绒外套、贝雷帽的坐姿人物，第 100 帧按 prompt 转身，旧的第 0 帧横条已消失。
+遗留问题是质感：外套上颗粒与零散绿色斑点明显，整体偏软，这正是下面 4 步 A/B
+要验证的点。
+
+同条件 4 步 A/B（`--backend metal`、256x256、4 秒、seed 42、同一 prompt 与
+RGB 参考图、4 步采样）：
+
+| 配置 | 文本 token | 序列行数 | 总耗时 ms | DiT ms | spatial_corr | clean_corr | snr_db |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `REF_PRESENT=0`，参考图按画布 | 34 | 2358 | 321737 | 202266 | 0.891 | 0.885 | -0.60 |
+| `REF_PRESENT=1`，参考图按画布 | 1417 | 3741 | 514776 | 342490 | 0.905 | 0.877 | -0.36 |
+| `REF_PRESENT=1`，`REF_EDGE=512`（336 条件行） | 1417 | 4013 | 522574 | 356200 | 0.921 | 0.905 | -0.17 |
+
+三组都产出 102 帧 mp4 且 `suspect_noise 0`。视觉呈现多花约 60 s 文本编码与
+140 s DiT（4 步），但第 20/60/100 帧更平滑，脸型、短发、贝雷帽与米色外套
+更贴近参考；裸 prompt 那组脸更大更糊、彩斑更多。参考图改按 512 短边编码后
+三个相关系数都再升，但在 256x256 下视觉只是边际改善，因此保留为可选。
+视觉呈现成为新默认。
+
+同一 30 步接口任务在开启呈现后复跑：2,145,126 ms（文本 111,825、DiT
+1,981,593、视频 VAE 45,705、音频 VAE 3,849 ms），102 帧、596 KiB mp4，
+`spatial_corr 0.814`、`snr_db -0.52`、`suspect_noise 0`。抽帧 0/20/60/100
+仍是同一张脸、贝雷帽与米色外套，且没有上一版的绿色斑点，只是构图更近、
+256x256 下质感依旧偏软。`spatial_corr` 下降不是画质结论：它量的是 latent
+内水平相邻相关性，不是清晰度或参考相似度。wire 权重仍是 66.28 GiB；
+`cwick:host_swapouts_total` 整个会话涨了 988 个宿主页（16 MiB），来自其他
+进程，远小于且不可能来自已 mlock 的模型页。两次 30 步都不构成 768p 画质
+结论：256x256 只是最小可跑验证。
+
+## §104 QuickTime 黑屏的根因是 avcC 结构非法，不是生成器
+
+一个 256×256 / 30 步的 Ref2VA mp4 用 ffmpeg 解码时画面正常（抽帧是清晰、在动的人物），
+但用 QuickTime 打开却是黑屏。这种「解码器之间分裂」的表现指向解码路径，而不是 DiT 或
+VAE 输出——生成器在 §99 和 §103 已经修好。
+
+用一个走 AVFoundation（QuickTime 自身使用的解码栈）的小 probe 稳定复现了失败：
+`AVAssetReader` 在第一帧就返回 `AVFoundationErrorDomain -11821 Cannot Decode`，
+底层 OSStatus `-12137`。同样的文件在 ffmpeg 里能解码，是因为 ffmpeg 会从 VideoToolbox
+在每个 IDR 前写入的带内 SPS/PPS NAL 重建缺失的参数集；而只信任容器头的严格
+`h264_mp4toannexb` 转换则报 `Global extradata truncated, corrupted stream or
+invalid MP4/AVCC bitstream`。
+
+根因在 `h3v_mp4.m` 的 `build_avcc()`。format-description API 返回的是一份扁平的
+参数集列表（本编码器为 SPS 后跟 PPS，共两项）。代码把这份列表的项数写进了 avcC 的
+`numOfSequenceParameterSets`，然后原样输出整份列表，完全漏掉了独立的
+`numOfPictureParameterSets` 字段。得到的记录是
+`01 64 00 14 ff e2 000a<SPS> 0004<PPS>`：它声称有两个 SPS，把 PPS 当成第二个
+SPS 喂进去，还缺了 PPS 计数字节。ISO/IEC 14496-15 要求两段分开写——先 numOfSPS +
+各 SPS，再 numOfPPS + 各 PPS。严格解析器拒绝这条非法记录并渲染黑屏；宽松解析器
+靠带内 NAL 恢复。
+
+现在 `build_avcc()` 按 NAL type 给每个参数集分类（7 = SPS、8 = PPS），分别收进两个
+数组，再用正确计数输出两段。修后的记录是
+`01 64 00 14 ff e1 000c<SPS> 01 0004<PPS>`。
+
+验证走 `tools/h3vmuxprobe` 的合成色带，几秒内就能测封装器，不用等几分钟的 DiT/VAE：
+
+- avcC 字节现在带 `e1`（一个 SPS）和末尾的 `01` PPS 计数；
+- AVFoundation probe 成功解出第一帧（`OK 64x64 mean_luma=87.07`），而旧文件返回
+  `Cannot Decode`；
+- 只依赖容器头的严格 `h264_mp4toannexb` 转换成功。
+
+这个修复是应用 3 在线预览与下载的前提：一个画面正确但 QuickTime / Safari 拒绝解码的
+文件，对用户而言就是一个黑屏播放器。应用自身的文案也一并对齐了当前视频语义：参考图
+复选框不再把字段写成 `reference_image`（线上字段是 `image`），也不再声称图片会替换
+首帧 latent——Ref2VA 是把它作为 Picture 1 编入文本条件（§103）。任务的 `variant`
+现在显示在进度面板里，让 Ref2VA 默认值从接口到界面全程可见。
+
+真实生成也确认了修复，不只靠合成探针：任务 `video_1795373529_1`（256×256、4 秒、4 步、
+`sample.png` 参考图、默认 Ref2VA）用时 488.2 s（文本 69.1、DiT 356.7、视频 VAE 56.1、
+音频 VAE 4.1、封装 0.3），产出 615,030 字节 / 102 帧。其 avcC 为
+`01 64 00 14 ff e1 000a<SPS> 01 00 04<PPS>`；AVFoundation probe 返回
+`OK 256x256 mean_luma=156.36`（修复前是 `Cannot Decode`），严格 Annex-B 转换通过，
+抽帧可见参考图中的人物、贝雷帽与外套，无黑帧、无绿格子接缝。256p / 4 步下的偏软是
+分辨率与步数上限，不是解码失败。
+
+## §105 视频任务期间的内存打满：各 stage 独立驻留、没有共享预算
+
+30 步 256×256 Ref2VA 任务的 DiT 跑到 200–241 s/步（第 1–6 步分别是 216072、206066、201178、199627、227345、241420 ms），
+是紧邻其前那个 4 步任务 89.2 s/步的 2.4 倍——画布相同、序列长度相同（3677 行）、wire resident 的 DiT 也相同（61.73 GiB）。
+通过 `/v1/metrics` 采集的主机指标解释了差距：
+
+- 02:51:49 启动时，swap 为 4.28 / 5.00 GiB，`host_compressions_total` = 2226116165；
+- 03:28:15 启动时，即两个视频任务之后，swap 为 6.61 / 8.00 GiB（macOS 把 swap 文件从 5 扩到 8 GiB），compressions = 2279810266；
+- 也就是**两个视频任务期间 swap +2.33 GiB、compressions +5370 万次**；
+- 临时的 unmap 日志显示 DiT 采样期 RSS 峰值是 73.92 GiB（transformer 关闭时 `RSS 73.92 -> 12.20 GiB`）；
+- 空闲时只有 root 模型驻留（`process_footprint_bytes` = 28.5 GiB），5 秒采集窗口里 compressions/swapouts 增量为 0——压力由视频任务制造，不是空闲服务。
+
+根因。`cwick_mem_fit_model()` 一次只评估单个 stage 是否能放进 102.40 GiB（128 GiB 的 80%）上限，
+没有跨 stage 的累加账本。视频线对每个 stage 调用一次，于是每个 stage 都独立报告「fits under budget」并被 wire。
+`h3v_model_open()` 在模型打开时就把 video VAE（9.70 GiB）和 audio VAE（0.56 GiB）wire resident，
+并且整个模型生命周期都持有；`h3v_generate()` 随后在采样时再打开并 wire DiT（61.73 GiB）叠加上去。
+因此并发 mlock 的集合是约 72 GiB（RSS 峰值 73.92 GiB），而不是一次只有一个 stage。
+wired 页不能被压缩或换出，压力就转嫁到主机上所有其他进程：全局 compressor 与 swap 文件上升。
+非 wire 的临时区（attention buffer、Metal arena 临时页）在 `waitUntilCompleted` 内产生缺页，这是 2.4 倍步时劣化的可能来源。
+这是关联而非严格 A/B：两个任务在同一进程里背靠背运行，系统状态的累积是混杂因素。
+
+后续一个任务确认了这条曲线的极端端：`video_1795375995_1`（736×1280、30 步、seq 29357 = 256p 的 8 倍）
+DiT 第 11 步 731656 ms 单调劣化到第 30 步 788257 ms——总共 6.3 小时、约 13 min/步，而 256p/4 步是 89 s/步。
+同一运行内、权重和行数都不变而步时持续上升，正是系统压力累积导致缺页/压缩率上升的特征。
+
+建议修复，与 goal 约束一致（不剪枝、不降精度、Metal、80% 预算、禁 swap）：让 VAE 驻留变懒——
+在第 4/5 阶段才 fault in video/audio VAE，用完即 unwire，使 DiT 采样期只持有 61.73 GiB（峰值 73.92 → 约 63 GiB）；
+给 `cwick_mem_fit_model()` 增加 `already_resident_bytes` 累加参数，并让所有活动视频 stage 共用一份账本；
+把 80% 上限当作跨 stage 的全局预算，而不是逐 stage 的判断。
+改前先做 4 步 A/B，对比 RSS 峰值、compressions 增量与 DiT 步时，再决定是否提升为默认。尚未实施——本节仅为诊断。
+
+## §106 大画布视频的格子伪影来自过小的 VAE 解码分块
+
+一个 736×1280 / 30 步的 Ref2VA 片段（`video_1795375995_1`，sample.png 参考图）在 §104 修复后能被 QuickTime 正确打开，
+但画质发糊、带网格：脸部清楚，服装纹理和轮廓却覆盖着规则方格。这不是黑屏、不是解码失败，也不是采样不足——任务跑满了 30 步。
+
+证据按取证顺序：
+
+- ffprobe：736×1280、H.264 High、yuv420p、4.71 Mb/s、102 帧。avcC 已是 §104 的合法形式
+  （`ff e1 ... 01 00 04`），AVFoundation probe 返回 `OK 736x1280 mean_luma=63.89`，严格 Annex-B 转换通过。容器与解码器没问题。
+- 这个 job 在耗时上是离群点：DiT 每步 731656 → 788257 ms（共 6.3 小时），因为画布产生 27600 个视频行 / seq 29357
+  （256p 的 8 倍）叠加 §105 的驻留压力。慢和格子是两个独立症状，本节只处理后者。
+- 抽帧的梯度能量在 lag=16 px（一个 latent cell = 16 像素）和 lag=192 px（一个 VAE 解码 tile）出现峰值；
+  水平 tile 边界 x=160/320/480/640 的梯度是邻域的 2.4–3.6 倍。周期性指向 VAE 解码器，不是 DiT。
+- `tools/h3vencprobe` 在 736×1280 下把平滑 ramp 不经过 DiT 直接做 VAE 往返，重建图复现了接缝：
+  边界/非边界梯度均值比水平 4.14 倍、垂直 5.33 倍。解码**常量全零 latent** 同样产生 16 px 的 cell 纹理和 tile 周期台阶，
+  确认伪影由解码器的分块引入，与采样出的 latent 内容无关。
+
+根因。视频 VAE 解码器把 latent 切成 12×12 cell 的 tile、2 cell 重叠。它的 rotary 表用 tile 局部坐标
+（`2*(i+0.5)/n - 1`），每块都铺满整个 [-1,1]，于是相邻块对同一行给出不同相位的预测。2 cell（32 px）的线性 cross-fade
+盖不住这个不连续，边界以 192 px 网格泄漏。256p 的 latent 是 16×16、实际只有一块，所以之前所有 256p 测试都看不到。
+
+第一次尝试按图像线已验证的 `_stitch_tiles` 重写拼接（整行 raw buffer、带内双向混合、裁远端边、最后量化）。
+实测否决：往返相关系数仍是 0.9913，边界比没有改善（一个变体把 x 接缝恶化到 35 倍），于是完整回退。调混合权重不是解法，
+问题在 tile 几何本身。
+
+有效的修复是放大 tile。`H3V_VAE_TILE_CELLS` 从 12 改 48、`H3V_VAE_TILE_OVERLAP` 从 2 改 8，
+两者可用 `CWICK_H3V_VAE_TILE=N` 在运行时覆盖（重叠变成 N/6）。同一 736×1280 平滑 ramp 往返实测：
+
+| tile cell | 接缝比 x | 接缝比 y | R 相关系数 | 解码耗时 |
+|---|---|---|---|---|
+| 12（旧） | 4.48 | 5.33 | 0.9913 | 56.0 s |
+| 24 | 1.89 | 6.50 | 0.9928 | 42.1 s |
+| 48（新） | 0.00 | 1.61 | 0.9937 | 31.8 s |
+
+更大的 tile 也更快（重叠往返次数少），且 80×46 latent 的 attention 序列仍可控。用新默认重编译后，
+x=640 / y=640 的边界梯度是 0.63 / 0.71，而此前是 4–10。权重、精度、采样步数都没变。
+
+736×1280 / 4 步端到端片段随后完成（`/tmp/h3vprobe/fix736.mp4`，102 帧 / 4.25 s，2.46 MB）。
+采样报告 `spatial corr 0.979 / clean corr 0.981 / snr -0.07 dB / suspect_noise 0`；
+抽取 6 帧（n=0/20/40/60/80/101）得到三点独立结论：
+
+- **192 px 的 tile 接缝消失**。与早先 tile=12 / 30 步片段逐帧对比，x=160/320/480/640 的横向条带不再出现。
+  tile 几何修复在端到端链路上成立，不只是平滑 ramp 往返里成立。
+- **仍有细密的 16 px 棋盘/点阵纹理覆盖全画面**。放大后皮肤、头发、衣服上都是规则的 cell-三角格纹。
+  这是解码常量全零 latent 即可复现的 cell 级固有伪影，放大 tile 并不解决它。§106 只修掉了大尺度 tile 格子。
+- **4 步片段明显比 30 步片段软**：衣料纹理和五官细节不再可辨。这是采样步数不足，与 tile 改动无关。
+
+身份部分保留（同一位长发微笑人物，片段内有轻微转头），但参考服装没有保留：`sample.png` 是米色毛绒外套 /
+吊带裙 / 长筒靴，生成画面是素色深色高领毛衣。4 步经过文本呈现路径传递的参考细节太少。
+没有黑帧、绿块或单侧格子残留。
+
+结论：736×1280 画布上，清晰度现在受限于采样步数和 VAE 固有的 16 px cell 纹理，而不是 tile 接缝。
+增加步数是管线内唯一能提升细节的手段，代价是实测约 6 h。该运行也实时印证了 §105：
+空闲页掉到约 27k（436 MiB），swap 5.6/7.2 GiB；DiT 每步 752–813 s，VAE 解码 979.7 s（合计 4307 s）。
+
+## §107 256×256/30 步片段：QuickTime 发糊是分辨率天花板，§105 的步时归因被证伪
+
+片段 `output/cwick-video-video_1795406010_1.mp4`：256×256 / 102 帧 / 4.25 s / 30 步，
+Ref2VA，参考图 `sample.png`、prompt `sample_video.txt`，经 `/v1/videos` 在 Metal 下生成。
+
+容器不是原因。avcC 是 §104 的合法形式
+（`01 64 00 14 ff e1 00 0a<SPS> 01 00 04<PPS>`：一段 SPS、一段 PPS），H.264 High + AAC 32 kHz 立体声，
+包 DTS 以 24 fps 从 0 到 101000 单调递增，完整解码无错误帧。QuickTime 里看到的发糊是生成图像本身，
+不是封装、avcC 或时间戳问题。
+
+抽取 6 帧（n=0/20/40/60/80/101）：身份与服装现在贴近参考（米色毛绒外套、吊带裙、贝雷帽）——
+30 步把早先 4 步片段丢掉的参考细节传过来了（§106）。无 tile 接缝、无绿块、无黑帧。
+脸部与背景仍有轻微 16 px cell 纹理，整体偏软。在这个画布下两者都在预期内：
+256×256 是最小验证画布，经 VAE 的 16× 空间压缩映射到 16×16 latent，
+解码器固有的 cell 纹理（§106 用全零 latent 复现）占据每个显示像素的很大比例，
+任何全屏播放都要把 256×256 放大。这是分辨率天花板，不是退化：
+没有采样器或驻留方式的改动能让 16×16 latent 渲染得像 80×46 一样。
+
+日志与 metrics：text 112110.5 ms（呈现后 1417 token），DiT 30 步、60–63 s/步、合计 1979.5 s，
+去噪 `spatial corr 0.847`、`gen/ref std -0.74 dB => ok`，video VAE 54114.3 ms、
+audio VAE 3951.9 ms、mux 200.9 ms，总计 2196.4 s。
+峰值 RSS 73.52 GiB（unmapped `73.52 -> 11.79 GiB`），wired 集合与 §105 相同——
+model-open 起持有 VAE 9.70 GiB + audio VAE 0.56 GiB，采样期 DiT 61.73 GiB。
+任务结束时空闲页 4.8M（95% 空闲）、swap 3930/5120 MiB、compressor 339 MiB：无主机内存压力。
+serve 日志记录了 2096 次 `/v1/metrics` 抓取，全部 HTTP 200、25133 字节；
+本次分析时进程已停止，因此没有实时抓取可用。
+
+**对 §105 的修正**：同样的 256×256/30 步形状、同样 3677 行、同样 61.73 GiB wired DiT、
+同样 73.52 GiB RSS 峰值，这次跑出 60–63 s/步，而 §105 记录的是 200–241 s/步。
+wired 集合完全相同，差异在主机 swap/压缩压力。§105 的步时回归是系统级压力的函数，
+不是 VAE 提前 wire 造成的。因此 §105 提议的 VAE 懒驻留修复得不到这次对比的支持，**未实施**。
+保留现有驻留模型；要保护步时，应在长时间视频任务前结束或清理其他吃 swap 的作业，而不是改驻留。
+
+实用结论：256×256 是正确性/速度冒烟测试，不是画质档位。要细节就放大画布——
+在主机压力低时远达不到 §105 的 6.3 h 异常。要速度就降步数，但 4 步会丢参考服装（§106）。
+16 px cell 纹理是 VAE 解码器固有属性，无法从采样器侧调掉。
+
+## §108 QuickTime 里的「跳帧」是时间维 VAE 接缝，不是封装问题
+
+一段 544×960 / 30 步 Ref2VA 成片（`video_1795410431_1`，102 帧、4.25 s）在
+QuickTime 里看着像跳帧。三项独立检查都排除了容器：包表里只有一个 stts 项、
+步长恒为 1000/24000 s、dts 严格递增；avcC 含一个 SPS 和一个 PPS；用
+AVFoundation AssetReader 严格解码，102 帧全部解出、帧间隔只有 0.041667 s 一个值、
+零异常间隔。`ffmpeg -f null` 报的 `non monotonically increasing dts` 来自 null
+muxer 重新编码解码流，不是源文件错误。时间戳、关键帧位置（IDR 在 0/48/95）、
+MP4 box 都没有问题。
+
+跳变在像素里。逐帧平均绝对差（中位数 4.52）呈现干净的周期性脉冲：进入第
+20/40/60/80/100 帧的跳变均值 **21.34**，是其他区间的 2–14 倍，而紧邻的前一帧
+只有 1–4。较小的峰值落在 4 的倍数帧（9–11.6）。周期正好是 20 帧 = 5 个 latent step
+= 一个时间 chunk，4 帧峰值对应单个 latent step。
+
+根因：解码器几何把 17 个像素帧折成 5 个 latent step（`17n+5` 像素帧 ↔ `5n+2`
+latent 帧）。相邻 latent chunk 重叠 2 个 latent step，正确解码应把重叠部分也解出来、
+对共享帧做线性交叉淡化。本引擎的解码器一次性解完所有 latent step，只对空间 tile
+做 cross-fade，**没有时间维重叠解码、也没有时间维 cross-fade**。于是每 20 帧的边界
+就是硬切，观感上每约 0.83 s 跳一下。102 帧也不在 checkpoint 合法的 `17n+5` 网格上
+（最近的是 90 或 107）。
+
+修复方向（未实施）：像空间 tile 拼接那样，每个 chunk 带 2 个 latent 的重叠解码，
+并对共享帧做混合。这会改动 VAE 解码循环并和空间分块交叉，需要单独 A/B 与回归后再落地。
+低成本缓解是请求合法帧数，能去掉额外的截断，但消不掉硬切接缝。
+
+日志/metrics：text 112.1 s、DiT 30 步每步 363–409 s 共 11093.8 s、video VAE
+465.0 s、audio VAE 3.9 s、mux 0.3 s，合计 11678.2 s。去噪健康（`spatial corr 0.901`、
+`gen/ref std -0.43 dB => ok`）。相比 §107 中 256×256 的步时慢 6 倍，是 transformer
+行数约 4.2 倍（15300 vs 3677）的预期代价——attention 随行数平方增长。任务前后主机
+都是 95% 空闲、swap 3691/5120 MiB，不存在内存压力。
+
+## §109 时间维 VAE overlap + cross-fade 消除了分块边界硬切
+
+§108 把 QuickTime 里的「跳帧」定位到视觉 VAE 一次性解完所有 latent、时间维
+没有重叠，于是每个 5 步分块边界都是硬切。训练规则把 17 个像素帧折成 5 个
+latent step，每个编码分块丢掉 3 个尾部 latent，所以正确解码要把 2 个 latent
+的重叠部分也解出来，并对共享的 5 帧做线性混合；rope 按分块自身 7 个 latent
+做长度归一化。原先的整段解码两样都没做。
+
+修复：`h3v_vae_decode` 改为按 5 步分块、带 2 步重叠逐块解码。每块用局部 rope
+解 7 个 latent，取解码帧 [3,20) 的 17 帧作为主输出，并把开头 5 帧与上一块的
+5 帧尾部按 1→0 / 0→1 的权重线性混合。缓冲区放 17*chunks+5 帧，mux 取前
+17*chunks，于是所有入片帧都来自做过 cross-fade 的主输出。空间分块及其自身的
+cross-fade 不变，在每块内部照常执行。`lt<=5` 与 `CWICK_H3V_TEMPORAL_XFADE=0`
+保留整段解码，供参考帧往返测试和 A/B 使用。
+
+同一 latent 的 A/B（256×256、1 步、seed 42、Metal，只差开关）：边界 MAE
+5.358 → 4.212（-21%），单帧峰值 6.05 → 4.69（-23%），边界 5 帧能量
+11.57 → 8.40（-27%）。旧的单帧脉冲（第 20 帧 5.43、第 21 帧 0.43）变成
+5 帧渐变（第 17/18/19 帧 4.57、2.48、0.34）。两次去噪一致（`spatial corr` 均
+0.987），抽帧拼图没有新的空间接缝、黑帧或块状伪影。VAE 解码因重叠的冗余计算
+从 39.2 s 升到 53.1 s（+35%）。总墙钟时间两次不可比：DiT 阶段自身从 126.5 s
+波动到 85.7 s，与本开关无关。
+
+按训练规则混合的首帧权重是 1，所以第一个共享帧仍有约 4.5 的跳变；这部分残余
+是采样器自身的 5 步边界，不是 VAE 接缝。要消掉它需要比 checkpoint 训练时更多
+的重叠 latent。`make test` PASS。
+
+## §110 时间维 cross-fade 修复后的第一条真实 30 步成片
+
+256×256 / 30 步 Ref2VA 成片 `video_1795424360_1`（102 帧、4.25 s、24 fps）是
+§109 落地后第一条完整质量的成片。按此前报过的两个症状复查：时间跳变与块状纹理。
+
+容器干净：stts 只有一项，pts==dts 从 0 到 101000 步长 1000，avcC 含一个 SPS
+和一个 PPS；AVFoundation AssetReader 解出全部 102 帧，帧间隔恒为 0.041667 s、
+零异常。`ffmpeg -f null` 报的 dts 非单调和 §108 一样，是 null muxer 重新编码所致。
+
+逐帧 MAE（中位数 4.46）里已没有旧的 20 帧脉冲：进入第 20/40/60/80/100 帧的
+跳变是 3.17/3.76/7.48/6.51/2.66（均值 4.72），全片最大只有 12.53（第 83 帧）。
+对比修复前的 256×256 成片（同为 30 步、不同 seed），边界均值 20.08 → 4.72
+（−76%），最大值 33.17 → 12.53（−62%）。两处最大的亮度变化（第 85/84 帧 dL
+8.77/8.43）正好是人物从正面转到侧面，属于 prompt 要求的动作；没有相邻重复帧
+（最小 MAE > 0.5）。抽帧拼图看不到黑帧、绿块、格子接缝、重影或冻结帧，原始尺寸下
+毛绒外套与五官都清晰可辨。
+
+这是 §109 路径在真实采样质量下（而不只是 1 步 A/B）站得住的第一份证据：
+cross-fade 消除了周期跳变，且没有引入空间接缝或新的模糊。两条成片构图不同
+（seed 不同），所以整体清晰度的差异不归因于开关，只有边界脉冲的变化归因于它。
+
+日志/metrics：text 84.45 s、DiT 30 步每步 60–67 s 共 1971.1 s、video VAE
+63.77 s、audio VAE 3.97 s、mux 0.26 s，合计 2125.73 s。去噪健康（`spatial corr 0.847`、
+`gen/ref std -0.74 dB => ok`）。video VAE 从 §107 的 54.1 s 升到 63.77 s，是符合
+预期的重叠 latent 解码成本。计数器：1 个 job、成功 1、失败 0、可疑白噪声 0；
+驻留 66.28 GiB、wired、RSS 峰值 73.97 GiB。主机 swap 启动时 8.06/9.00 GiB、
+结束时降到 6.4/7.5 GiB——这是开机以来的高基线，但步时仍保持健康的 60–63 s，
+再次印证 §107：步时回归跟任务期间的压力有关，而不是 swap 的绝对水位。
+
+## §111 256×256 下脸为什么糊,以及什么真正能改善
+
+针对 §110 那条 256×256 / 30 步成片单独复查了「脸糊」。发糊来自分辨率,不是采样、
+cross-fade 或封装的缺陷。三项独立事实定位了它。
+
+1. 输出网格。VAE 空间压缩 16×,所以 256×256 画布只有 16×16 latent,脸大约只占
+   其中 4×4 个格子,latent 里没有可恢复的细节。同一脸部裁剪的拉普拉斯方差:参考图
+   缩到 256 是 3991,生成帧是 1730–2547——生成前就少了一半高频,解码器补不回来。
+
+2. 参考条件行。first-frame latent 路径默认按**生成画布**编码参考图,除非设置
+   `CWICK_H3V_REF_EDGE`。日志写得很明确:`reference image encoded: 256x256 RGB ->
+   1x24 latent (16x16)`,而同一张图是以 768×1024 RGB 到达的。这条路径能传递的身份
+   细节上限就是 16×16 latent。
+
+3. 文本呈现已经是高分辨率,不是瓶颈。`h3_text_cond_ref_dir` 把参考图经视觉塔按
+   1024 短边编码(`h3_vision_size` → `h3_bound_edge(1024,1024)`),得到 1417 个文本
+   token。这正是身份和毛绒外套仍贴近参考的原因:结构来自高分辨率呈现,逐像素的
+   发糊来自 16×16 输出网格。
+
+脸部对比印证了这个形态:五官结构、眼睛数、表情都正确,没有马赛克或重影——是均匀
+发软,正是 16×16 网格重建到 256 像素的样子。逐帧 MAE(§110)与 cross-fade A/B(§109)
+已经排除了时间接缝这个原因。
+
+在 goal.md 约束下的优化边界:不加锐化滤镜、不加超分模型、不改精度或剪枝。引擎内
+唯一能提升参考细节传递的旋钮是 `CWICK_H3V_REF_EDGE=N`,它把条件行按参考图
+自身短边而非画布缩放;这是进程级环境变量,需重启服务生效。checkpoint 默认按
+2048 短边编码参考图,本机放开到 `H3V_REF_EDGE_MAX`(6272),因此设
+`CWICK_H3V_REF_EDGE=2048` 可复现官方呈现(如 1152×1536 → 2048×2720),而不是
+被生成画布上限（现为 2560，且与参考范围相互独立）截断。短边越大条件行越多、DiT 耗时近似平方增长;本机在
+80% / 禁 swap 预算下,2048 编码的瞬时缓冲约 46 GiB,需与驻留权重合计评估。
+真正提升脸部细节的办法仍是加大画布(512×512 给 32×32 latent,细节容量约 4×),
+代价同样是 DiT 时间近似平方增长。
+此轮未跑 `REF_EDGE` 的受控 A/B:服务已驻留模型,第二个 DiT 实例会突破 80% / 禁 swap
+预算;只做了无权重的尺寸换算单测(`make test` 通过)。
+
+## §112 应用 3 用同一张尺寸配对表绑定两步画布
+
+应用 3（`apps/imagegen`）此前已支持头像/服装/姿势三类上传、两个图像接口、异步视频任务轮询、
+进度/在线查看/下载以及快速验证档。缺口是第一步 `size` 与第二步 `size` 相互独立：可能用
+1536×2048 竖版图去配 1280×720 视频，条件图与生成帧的构图不一致。
+
+现在两步共用 `apps/imagegen/app.js` 里的 `SIZE_PAIRS` 表：每一行同时给出图像画布与同宽高比
+的视频画布。视频尺寸都是 `H3V_CANVAS_MULTIPLE`(32) 的整倍数、落在 256..2560；图像尺寸落在
+256..6272（`H3_MIN_SIZE`/`H3_MAX_SIZE`）。七档为 256×256→256×256（快速验证）、
+1024×1024→1024×1024、1536×2048→768×1024、1024×1536→768×1152、2048×1536→1280×960、
+2048×1152→1024×576、2560×1440→2560×1440（§102 的 2K 上限）。第一步选档会同步写入第二步
+的视频尺寸并刷新配对提示；从生成的图进入第二步时会再次断言配对，避免手改视频尺寸后错位。
+「快速验证档」一键把两步画布都设为 256×256，并把时长设为最短 4 秒、采样 4 步。
+
+手动视频尺寸保留在单独的 `<optgroup>`（标注"扩展画布 · 不与步骤 1 配对"）里，大画布仍然可
+选；选中时配对解除，提示文案会明确说明。服务端未改：两个图像接口接受范围内的任意 `WxH`，
+`/v1/videos` 仍只有 Ref2VA。`make src/webui_embed.c && make cwick` 刷新内嵌 UI；`make test`
+新增两条断言确认共享表与两个 optgroup 进了二进制，`node --check` 校验 JS。本轮未实跑生成：
+服务驻留权重，起第二个实例会突破 80% / 禁 swap 预算。
+
+## §113 图像与 realtime 切换对称释放 video 权重
+
+一次图像编辑与视频任务混跑的日志证据：切到图像模型时 video 的 VAE 仍驻留，61.74 GiB 图像
+DiT 叠在 10.26 GiB video 侧上，RSS 约 72 GiB。18:58:07 重新加载 video DiT 时打出
+`could not wire 4.81 GiB ... (Resource temporarily unavailable)`，即 `mlock` 返回 EAGAIN；
+采样第一步耗时 171.9 s，健康值为 60–67 s。`cwick_mem_lock_range` 只在首次失败时打日志，
+所以 4.81 GiB 只是下界。它上面那句 "wire resident ... fits under budget" 报的是**尝试**字节数，
+不是真正 pin 住的字节数，不能当成成功。
+
+根因：`srv_switch_model` 与 `srv_switch_video` 都会释放另外三份权重，但 `srv_switch_image`
+只释放 text 和 realtime，`srv_switch_realtime` 只释放 text 和 image，导致离开 video 后它仍驻留。
+`swap_gate_open` 在 `vid_busy` 非零时已拒绝切换，所以拆除时没有 clip 在读这些映射。
+
+两处切换现在都会在加载新权重前调用 `srv_release_video_model()`，并把 `H3V_SERVED_ID`
+写进 "releasing" 日志。四条切换路径现已对称：各自释放另外三份权重。`make cwick` 编译干净、
+`make test` 通过；因服务驻留权重，本轮未实跑 A/B。
+
+## §114 无 ctts 的 B 帧导致 QuickTime 播放顺序错乱
+
+一条 256×256 / 30 步视频（`video_1795432400_1`）在 QuickTime 里画面跳动、不稳定；ffmpeg 直接
+抽帧同样跳，所以问题在编码/封装，不在播放器，也不在码率（256² 下 1.0 Mbps 充足）。对该 MP4
+逐帧探测：56 B / 43 P / 3 I，显示时间戳非单调（0、3000、2000、4000、1000…），尾部两帧时间戳
+重复，且容器没有 `ctts` box——封装器以为 `AllowFrameReordering=0` 就不会有 B 帧，把每个 sample
+的 PTS 都写成等于 DTS。实测关闭输出重排并不能阻止 VideoToolbox 继续**编码** B 帧。
+
+根治：把编码器固定到 Baseline（`kVTProfileLevel_H264_Baseline_AutoLevel`，avcC profile 0x42），
+该 profile 不允许 B 帧；同时对每个 sample 用 `CMSampleBufferGetPresentationTimeStamp` 写出
+`ctts` 表作为兜底（无 B 帧时 offset 全为 0，合法）。现在只给视频轨写 `ctts`。
+
+`h3vmuxprobe` 60 帧 A/B：修复前 43 个 B 帧、PTS 乱序、仅 58 个唯一显示时间戳；修复后 0 个 B 帧、
+60 个唯一 PTS、严格单调 0/1000/2000…。256×256/30 帧下：1 I + 29 P、30 个唯一且有序 PTS。
+`make test` 新增断言校验 avcC 为 Baseline、ctts offset 全为 0。当前服务是用旧二进制启动的，
+新视频需重启服务才会用上修复；已有的 MP4 无法靠重封装修好，因为 B 帧已在码流里。
+
+## §115 stss 把全部帧标成 sync 导致 QuickTime 播放 P 帧出现重影
+
+一条 256×256 / 30 步视频（`video_1795439347_1`）用 ffmpeg 解码画面正常，但在 QuickTime 里有重影。
+§114 的 B 帧修复在该文件上已确认生效：Baseline（avcC 0x42）、3 I / 99 P、无 B 帧、102 个唯一且
+单调的 PTS、ctts offset 全为 0。唯一剩下的差异是 sync 表：stss 把全部 102 个 sample 都列为随机
+访问点，而实际只有 3 个 IDR。
+
+根因：`avcc_first_nal_type()` 只看每个 AVCC sample 的第一个 NAL，但 VideoToolbox 在每个 IDR 访问
+单元前加了一个 SEI（type 6），IDR slice（type 5）排在第二位。于是没有任何 sample 判定为 sync，
+`put_stbl` 的兜底（`n ? n : n_samples`）又把全部 sample 标成 sync。QuickTime 信任 stss，在每个
+声明的 sync 点重启解码；从没有参考帧的 P 帧起解就留下上一帧画面，形成重影。ffmpeg 忽略 stss，
+所以抽帧看不出问题。
+
+修复：`avcc_has_idr()` 扫描 sample 内所有 NAL 找 type 5；stss 兜底在没有 IDR 时只标首帧，绝不全标。
+`h3vmuxprobe` 102 帧实测：sync 数 102 → 3，落在 sample 1/49/97（keyint=48 的 IDR），与码流一致。
+`make test` 新增两条断言：stss 只列 IDR sample、不把 P 帧当随机访问点。与 §114 一样，当前服务早于
+该二进制，新视频需重启才会用上；已有 MP4 无法只靠重封装修好（错误的 sync 表已写进文件，需要用修好的
+muxer 从基本码流重新封装）。
