@@ -10,7 +10,7 @@
 
 名字就是画面：灯芯是让一大块蜡持续燃烧的那根细线。这里的"蜡"是 SSD 上 18–475 GiB 的权重库，"灯芯"是每个 token 真正过总线的那几 GB。
 
-六个 checkpoint 目前端到端支持——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。四个是文本模型，一个生成图像，一个是全双工语音模型：
+七个 checkpoint 目前端到端支持——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。四个是文本模型，一个生成图像，一个生成视频，一个是全双工语音模型：
 
 | 模型 | 磁盘占用 | 结构 | 为什么收它 |
 | --- | --- | --- | --- |
@@ -19,9 +19,10 @@
 | **MiniMax-M3.1-Flash** | ≈233 GiB，48 分片 | 60 层（3 层稠密），128 专家 top-4，NVFP4 专家 + FP8 稠密 | MoE 三者中占用最小 |
 | **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic**（Qwen3.5-9B） | ≈18 GiB，4 分片 | 32 层：24 层 Gated DeltaNet + 8 层 GQA，稠密 BF16，无专家 | 混合线性注意力；唯一稠密文本模型，整份常驻内存，也是最快的一个 |
 | **MiniMax-H3-Image** | ≈190 GiB，两棵树 | Qwen3-VL 条件器 → 50 层 DiT → 分块 ViT VAE | 文生图与图像编辑，走 OpenAI 图像接口 |
+| **MiniMax-H3** | ≈72 GiB 常驻（Ref2VA 子集） | 50 层 DiT（hidden 5376，24 个视频 latent）→ 分块视频 VAE + 音频 VAE → mp4 | 文生视频与参考图生视频，走异步 `/v1/videos` 任务接口 |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64 层 FP8 thinker → talker → flow + HiFT，24 kHz | 全双工语音走 WebSocket，同一轮里边听边说 |
 
-六个管线共用一条铁律：**任何时刻只常驻一个模型**。图像与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
+七个管线共用一条铁律：**任何时刻只常驻一个模型**。图像、视频与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
 
 # 目录
 
@@ -36,7 +37,7 @@
 - [模型、上下文与内存](#模型上下文与内存)
 - [长 prompt 与前缀缓存](#长-prompt-与前缀缓存)
 - [思考、流式与工具](#思考流式与工具)
-- [图像与语音管线](#图像与语音管线)
+- [图像、视频与语音管线](#图像视频与语音管线)
 - [速度](#速度)
 - [验证](#验证)
 - [详细文档](#详细文档)
@@ -79,7 +80,7 @@
 
 - **Apple Silicon**，以 128 GiB 为设计点。规划器启动时读取本机内存，把上限设在它的 80%，常驻 spine 与 KV 缓存先从这里出，剩下的全给专家缓存，其余留在 SSD。稳态因此落在上限之下：`swap` 保持平，不会一路涨到几十 GB，压缩器也碰不到每个 token 都要访问的那些页。
 - **更小的 Mac** 走同一条路径——SSD 流式不是降级模式，它就是"模型比 RAM 大"时的运行方式。
-- **Metal** 加速 GLM 与 DeepSeek 后端（专家 GEMV、批式投影），在 Apple Silicon 上就是默认后端，`--backend cpu` 强制走 CPU 路径。启动时它把 GPU 的 wired 内存上限提到 RAM 的 80%，并把推理状态（KV 缓存、索引器池、循环状态）锁成 wired——每个 token 都要碰的那些页既不被压缩也不被换出。住在 GPU arena 里的专家 blob 下一次 dispatch 直接绑定、不做拷贝，这正是统一内存在这里值得用的原因。MiniMax 后端留在 CPU 线程池：它的内核在这些形状下实测**更慢**，数字在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md)，而不是藏在一个开关后面。
+- **Metal** 加速 GLM 与 DeepSeek 后端（专家 GEMV、批式投影），在 Apple Silicon 上就是默认后端，`--backend cpu` 强制走 CPU 路径。启动时它把 GPU 的 wired 内存上限提到 RAM 的 80%，并把推理状态（KV 缓存、索引器池、循环状态）锁成 wired——每个 token 都要碰的那些页既不被压缩也不被换出。住在 GPU arena 里的专家 blob 下一次 dispatch 直接绑定、不做拷贝，这正是统一内存在这里值得用的原因。H3 图像与视频 transformer 也用 Metal 张量核 GEMM；视频路径遇到不支持的形状可用 `CWICK_H3V_GPU=0` 逐次回退。MiniMax-M3.1 **文本**后端留在 CPU 线程池：它的内核在这些形状下实测**更慢**，数字在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md)，而不是藏在一个开关后面。
 - **不支持 NVIDIA 与 ROCm。** 这是为一类机器刻意做窄的引擎。
 
 ## 架构
@@ -94,6 +95,7 @@
         │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
         │              └── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► 文本编码 → DiT → 分块 VAE
+        ├── /v1/videos ──► h3v.c ──► 文本编码 → Ref2VA DiT → 分块视频 VAE + 音频 VAE → mp4
         ├── /v1/realtime（WebSocket）──► ws.c + rt_realtime.c ──► VAD + 会话状态
         │        └── rt_audio.c → rt_thinker.c → rt_talker.c → rt_flow.c → rt_hift.c
         ├── /v1/systemone ──► jev.c ──► 一次 prefill，读答案位置的分布
@@ -114,14 +116,14 @@
 - **语言与依赖**：C11，外加几个 Objective-C 文件做 Metal 桥。链接的只有 macOS 系统框架——Accelerate、Metal、CoreImage、ImageIO、CoreGraphics——以及系统自带的 `sqlite3`。没有 Python，没有 BLAS，没有运行期转换步骤。语音的 `.pt` 张量由一个纯 C 的 zip/pickle 读取器（`rt_torch.c`）就地读取，任何 checkpoint 都不做格式转换。
 - **一个二进制，四个子命令**：`setup`（生成合成验证模型）、`run`（单条 prompt，或多条一起批解码）、`serve`（API 服务）、`doctor`（读一遍常驻字节并打印内存计划）。
 - **web 控制台是编译进去的**（`src/webui_embed.c`），所以 `--web` 不需要磁盘上的静态资源，也没有第二个进程；应用是 `apps/` 下的文件，由同一个服务端托管，状态进 sqlite。
-- **六个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像或语音模型会先释放文本引擎，切回来再释放它。
+- **七个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像、视频或语音模型会先释放文本引擎，切回来再释放它。
 
 ## 快速开始
 
 ### 0. 前置条件
 
 - Apple Silicon 上的 macOS，以及 `clang`。别的都不要——内存设计点见[支持的硬件](#支持的硬件)。
-- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
+- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，视频模型常驻 ≈72 GiB（Ref2VA 子集，完整目录含两个分区），语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
 
 ### 1. 构建与测试
 
@@ -160,7 +162,7 @@ sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 
 Qwen3.5 这个 checkpoint 对客户端暴露的名字是
 `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic`——请求 `model` 字段填它，`GET /v1/models` 也报它。它内部的 `model_type` 标签（`qwen3_5` / `qwen3_5_text`）只用于选择内核，为兼容起见仍被接受，但不再是展示名。
 
-`start.sh` 同时传了 `--rt` 和 `--img`，把语音与图像管线注册成可热切换的目标；从设置面板（或 `POST /v1/models/switch`）选一个才让它常驻。文本模型常驻时两个图像接口和 WebSocket 语音接口返回 503，反之亦然——详见[图像与语音管线](#图像与语音管线)。
+`start.sh` 同时传了 `--rt`、`--img` 和 `--videos`，注册语音、图像与视频管线。`POST /v1/images/...` 与 `POST /v1/videos` 首次调用时会通过同一个单模型切换闸门加载自己的管线；也可以从设置面板（或 `POST /v1/models/switch`）显式切换。`/v1/realtime` 仍需先切到 `Sophon-Realtime-32B-Tag`。另一种管线常驻或忙时这些接口返回 503——详见[图像、视频与语音管线](#图像视频与语音管线)。
 
 `start.sh` 是推荐的入口：它打开了前缀缓存、web 控制台、局域网共享、模型目录和密码——这些一项一项都容易忘。不用脚本时，同一个服务是：
 
@@ -221,7 +223,7 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 
 **模型**标签页列出 `./models` 下已下载的权重、正在下载的任务（进度、速率、ETA），并提供模型目录的只读检索。下载由服务端后台执行：可暂停、继续、失败重试、取消；中断留下的部分文件在重启后用 Range 请求续传。单分片超过 100 GiB、整个仓库几百 GiB 全程用 64 位尺寸处理。五个接口与落盘布局见 `docs/SERVER.zh-CN.md`。
 
-市场里随 `apps/` 带四个 H5 应用，各自有 sqlite 库和 manifest。**井字棋**你执 X 先手，机器每一手都把棋盘与各空格的战术事实交给 `POST /v1/systemone`，问「落在哪一格赢的概率最大」，右侧栏画出每个空格的概率读数与双方的对弈过程。**3D 卡丁车**在莫比乌斯环上跑圈，模型实时随机决策在前方生成路障：每次重新洗牌 12 个选项、换随机种子与加压点，目标是把跑圈难度拉满；右侧栏分别是 AI 路障统计与卡丁车统计。**H5 图像生成**接受提示词与可选的头像/服装/姿势上传，调用 `/v1/images/edits`（纯文本时走 `/v1/images/generations`），显示进度、在线预览并下载 PNG。**TeachMe** 把麦克风采到的 16 kHz PCM 经 `/v1/realtime` WebSocket 送出：模型边听边把回答说出来，服务端 VAD 负责免提轮转与插话打断，右侧栏显示每轮的耳/预填充/解码/合成耗时。两个游戏应用调用 `POST /v1/systemone`，图像应用调用图像接口，TeachMe 调用语音接口；对话页走面板上**接口**选中的那个端点。控制台只负责托管，每个应用在手机屏和桌面屏上各自排版。开 `--lan` 后每个应用有二维码，同 Wi-Fi 的手机不用知道地址就能打开。
+市场里随 `apps/` 带四个 H5 应用，各自有 sqlite 库和 manifest。**井字棋**你执 X 先手，机器每一手都把棋盘与各空格的战术事实交给 `POST /v1/systemone`，问「落在哪一格赢的概率最大」，右侧栏画出每个空格的概率读数与双方的对弈过程。**3D 卡丁车**在莫比乌斯环上跑圈，模型实时随机决策在前方生成路障：每次重新洗牌 12 个选项、换随机种子与加压点，目标是把跑圈难度拉满；右侧栏分别是 AI 路障统计与卡丁车统计。**H5 图像生成**接受提示词与可选的头像/服装/姿势上传，第一步调用 `/v1/images/edits`（纯文本时走 `/v1/images/generations`）生成图片，第二步把该图与视频提示词交给 `/v1/videos`；两步都有进度、在线预览与下载，配对尺寸档让两张画布一一对应。**TeachMe** 把麦克风采到的 16 kHz PCM 经 `/v1/realtime` WebSocket 送出：模型边听边把回答说出来，服务端 VAD 负责免提轮转与插话打断，右侧栏显示每轮的耳/预填充/解码/合成耗时。两个游戏应用调用 `POST /v1/systemone`，图像应用调用图像与视频接口，TeachMe 调用语音接口；对话页走面板上**接口**选中的那个端点。控制台只负责托管，每个应用在手机屏和桌面屏上各自排版。开 `--lan` 后每个应用有二维码，同 Wi-Fi 的手机不用知道地址就能打开。
 
 模型被问的是**决策**而不是文案；每个应用把自己那份状态（一局棋、一份决策日志、一圈成绩）写进 `--store` 下自己的 sqlite 文件。
 
@@ -255,20 +257,24 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | `--password P` / `--api-key NAME` | — | 单用户登录 / 给 Agent 平台的具名 key |
 | `--models-dir DIR` | — | 额外列出（最多 8 个）可切换的 checkpoint，一次只加载一个 |
 | `--img DIR` | `CWICK_IMAGE_MODEL` | 图像 checkpoint 目录；提供 `POST /v1/images/generations` 与 `/v1/images/edits`，并允许按需切换到 `MiniMax-H3-Image` |
+| `--videos DIR` | `CWICK_VIDEO_MODEL` | 视频 checkpoint 目录；提供 `POST /v1/videos`、`GET /v1/videos/{id}` 与 `/content`，并允许按需切换到 `MiniMax-H3` |
 | `--rt DIR` | `CWICK_REALTIME_MODEL` | 语音 checkpoint 目录；提供 `/v1/realtime` WebSocket，并允许切换到 `Sophon-Realtime-32B-Tag` |
 | `--store DIR` | `~/.cwick/apps` | 每个应用一个 sqlite，外加 `auth.db` |
 
-环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_IMAGE_MODEL`、`CWICK_REALTIME_MODEL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。两者都设置时 `--img` / `--rt` 优先。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
+环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_IMAGE_MODEL`、`CWICK_VIDEO_MODEL`、`CWICK_REALTIME_MODEL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。两者都设置时 `--img` / `--videos` / `--rt` 优先。视频专用开关有 `CWICK_H3V_GPU=0`（CPU 回退）、`CWICK_H3V_WIRE=0/1`（是否 wire DiT/VAE）与 `CWICK_H3V_REF_EDGE=N`（按参考图自身短边编码），完整清单见 [docs/SERVER.zh-CN.md](docs/SERVER.zh-CN.md)。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/models` | 常驻模型，加上 `--models-dir` / `--img` / `--rt` 下找到的模型；每条带 `supported` / `unsupported_reason`，图像管线标为 `cwick.kind:"image"` |
+| GET | `/v1/models` | 常驻模型，加上 `--models-dir` / `--img` / `--videos` / `--rt` 下找到的模型；每条带 `supported` / `unsupported_reason`，图像与视频管线分别标为 `cwick.kind:"image"` / `"video"` |
 | GET | `/v1/realtime` | WebSocket 全双工语音（`?model=…`）；需要 `--rt`，base64 PCM16 入、`response.audio.delta` 出 |
-| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。`MiniMax-H3-Image` 改为热装载图像管线，不触碰文本模型 |
+| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。`MiniMax-H3-Image` 与 `MiniMax-H3` 改为热装载图像/视频管线，不触碰文本模型 |
 | POST | `/v1/images/generations` | 由 JSON prompt 返回 `b64_json` 图像；需要 `--img` / `CWICK_IMAGE_MODEL` 或按需切换图像模型 |
 | POST | `/v1/images/edits` | `multipart/form-data`，`image` 字段可重复；返回同样的图像响应 |
+| POST | `/v1/videos` | 异步视频任务；JSON 传 `prompt`、`size`（`WxH`，每轴 256–2560、32 的倍数）、`seconds`、可选 `steps`（1–30，0 = 30 步）与 `image`（base64/data URL 参考图）；只有 `variant:"Ref2VA"`；需要 `--videos` / `CWICK_VIDEO_MODEL` |
+| GET | `/v1/videos/{id}` | 轮询任务：`status`、`progress`、`phase`、`steps_done` / `steps_total`；完成后带 `cwick` 对象，含逐阶段计时、`spatial_corr`、`snr_db`、`suspect_noise` |
+| GET | `/v1/videos/{id}/content` | 流式返回完成的 mp4 |
 | POST | `/v1/completions` | 纯文本补全，流式或非流式 |
 | POST | `/v1/chat/completions` | messages、`stream`、`tools`、`reasoning_effort` |
 | POST | `/v1/responses` | Responses 方言：输入 `input` items，输出 `response` 对象 / `response.*` 事件 |
@@ -386,11 +392,26 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 
 **流式工具调用在生成过程中就可见**：模型一写出函数名，三个方言就各自用空的 `arguments` 开启调用，随后追加参数增量（chat 是 `delta.tool_calls[].function.arguments`、Responses 是 `response.function_call_arguments.delta`、Messages 是 `input_json_delta`）。增量会继续落在**参数值内部**，因此「一个很长参数」的工具调用（一段 shell 脚本、一个文件正文）是逐段填充的，而不是最后整体出现。增量拼接结果与最终 payload 逐字节一致；私有进度字段 `delta.cwick_tool` 仍发给内置控制台。实测与结算规则见 DECISIONS §58、§59。
 
-## 图像与语音管线
+## 图像、视频与语音管线
 
 另外两个 checkpoint 走各自的接口。它们和文本模型一样是**单模型常驻**：切过去会先释放文本引擎，切回来再释放它。`--img DIR` / `--rt DIR`（或 `CWICK_IMAGE_MODEL` / `CWICK_REALTIME_MODEL`）把它们注册成切换目标，`start.sh` 两个都传了。另一种管线常驻时访问这个接口会返回 503。
 
 **图像**——`POST /v1/images/generations` 收 JSON prompt，返回 `{"created":…,"data":[{"b64_json":"…"}]}`；`POST /v1/images/edits` 是 `multipart/form-data`，`image` 字段可重复，响应形状相同。`MiniMax-H3-Image` 跑一个 Qwen3-VL 条件器、一个 50 层 DiT 和一个分块 ViT VAE 解码器。两条权重规则要紧：这个 checkpoint 只在约 4 MP 以上才出干净图，所以任何请求都渲染在 2048² 画布上再 Lanczos 缩回请求尺寸（512² 的开销和 2048² 相同）；VAE 必须按 256 px 分块、带重叠与交叉淡入解码，整张一次解会出可见网格。两个响应都带逐阶段的 `cwick` 计时对象，每个阶段发生时都打一行带时间戳的 `[image]` stdout 日志。参数限制（6 步、`guidance_scale: 1`、只支持 `b64_json`）与完整数值对齐在 [docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md)。
+
+**视频**——`POST /v1/videos` 返回 `202` 与任务 `id`；`GET /v1/videos/{id}` 轮询 `status` / `progress` / `phase` / `steps_done` / `steps_total`，`status` 变成 `completed` 后用 `GET /v1/videos/{id}/content` 流式取 mp4。任务收 JSON `prompt`、`size`（`WxH`，每轴 256–2560、32 的倍数）、`seconds`，以及可选 `steps`（1–30；0 保留 30 步调度）与 `image`（base64 或 data URL 参考图）。`MiniMax-H3` **只用 Ref2VA** transformer：参考图折进文本呈现，首帧/尾帧分区既不探测也不接受，`variant` 指定它会得到 HTTP 400。50 层 DiT（hidden 5376、24 个视频 latent）按需打开，占 61.73 GiB，VAE 与文本编码器保持映射；DiT 和视频 VAE 在 Metal 上走 BF16/F32 张量核 GEMM，`CWICK_H3V_GPU=0` 回退 CPU。权重阶段装得下内存上限时 wire 常驻，`cwick:model_resident_bytes` / `cwick:model_wired` 回报决策。DiT 行数随画布近似平方增长，2K 全 30 步要数小时——`steps:2..4` 给出几分钟的验证片段。每个任务的 `cwick` 对象带逐阶段计时（含参考图 VAE 的 `encode_ms`）与 `spatial_corr`、`snr_db`、`suspect_noise`；阶段以 `[video]` 行进 stdout，`cwick:video_*` 进 `/v1/metrics`。完整请求规则见 [docs/SERVER.zh-CN.md](docs/SERVER.zh-CN.md)，实测结论见 `docs/DECISIONS.zh-CN.md` §89–§103。
+
+```sh
+# 4 步 256x256 验证片段；机器上有代理时必须带 --noproxy '*'
+TOKEN=$(curl -s --noproxy '*' localhost:8001/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{"password":"cwick-local"}' \
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+JOB=$(curl -s --noproxy '*' -X POST localhost:8001/v1/videos \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"prompt":"镜头缓慢扫过安静街道","size":"256x256","seconds":4,"steps":4}' \
+  | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+# 轮询 GET /v1/videos/$JOB 直到 status == completed，然后：
+curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
+```
 
 **语音**——`/v1/realtime` 是 WebSocket：16 kHz 的 base64 PCM16 用 `input_audio_buffer.append` 送入，`response.audio.delta` 把 24 kHz PCM 送回。`Sophon-Realtime-32B-Tag` 跑一个 64 层 FP8 thinker（逐行 scale 直接从映射的分片读），接 talker、flow 和 HiFT 声码器；`.pt` 张量由 `rt_torch.c` 就地读取，不做转换。每个 `response.done` 都带 `cwick` 对象，给出全链路拆分（`ear_s`、`prefill_s`、`decode_s`、`talker_s`、`turn_s`、`first_audio_s`、音频 token 数、`pcm_chunks`），同一份数字也进 stdout 和 `/v1/metrics` 的 `cwick:realtime_*`。服务端 VAD 用释放迟滞和 100 ms 短片段门限，所以词内轻声不会断句、咔哒声不会开一轮（`CWICK_RT_VAD_LEGACY=1` 恢复旧的单阈值）。事件、指标、两个已知故障模式见 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md)，全链路数字在下面。
 
@@ -414,18 +435,21 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 | Qwen3.5-9B | prefill，30,970 token 的 prompt | 436 s | **71.0** | 30K 处仍有平地的 94%——一块里 attention 2.3 s、投影 4.5 s |
 | Qwen3.5-9B | 决策，3 题 / 525 token | 9.44 s | **55.6** | 三次 prefill，无 decode（见 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)） |
 
-两个非文本管线有自己的单位——一张图或一句话，不是 token 速率。都在同一台 M3 Max 上测得：
+三个非文本管线有自己的单位——一张图、一段 mp4 或一句话，不是 token 速率。都在同一台 M3 Max 上测得：
 
 | 管线 | 阶段 | 耗时 | 备注 |
 | --- | --- | --- | --- |
 | MiniMax-H3-Image | 图像，2048² 画布，`--backend cpu` | 949.0 s | 文本编码 46.1 + DiT 874.3 + VAE 28.3；512² 开销相同 |
 | MiniMax-H3-Image | 图像，2048² 画布，`--backend metal` | **535.6 s** | attention 64.5 → 9.0 s/步；投影仍在 BF16 GEMM 路径 |
 | MiniMax-H3-Image | 编辑，1 参考，256²（调试下限） | 515.4 s | 2124 行；2048² 加 3 参考约 40.3 分钟 |
+| MiniMax-H3 | 视频，256²，30 步，metal | ≈2126 s | 文本 84 + DiT 60–67 s/步 ×30 + VAE 64；102 帧 / 4.25 s |
+| MiniMax-H3 | 视频，256²，4 步，metal | 597 s | DiT 441 s；`steps:2..4` 用于快速验证 |
+| MiniMax-H3 | 视频，544×960，30 步，metal | ≈11678 s | DiT 363–409 s/步——行数随画布² 增长 |
 | Sophon-Realtime-32B-Tag | 耳，8.73 s 音频 | 0.17 s | ≈52× 实时，55 个音频 embedding |
 | Sophon-Realtime-32B-Tag | 第 1 轮，冷 | 18.54 s | prefill 8.16 + decode 9.40，首音频 12.96 s，语音 4.08 s |
 | Sophon-Realtime-32B-Tag | 第 2 轮，热 | **13.22 s** | prefill 2.83 s（复用静态提示），首音频 7.67 s |
 
-语音数字是一句 8.73 s 音频的墙钟时间；decode 与 talker 合成重叠，扣掉 `talker_s` 后纯解码约 4 tok/s，prefill 约 22 tok/s。完整逐阶段表在 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md) 与 [docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md)。
+语音数字是一句 8.73 s 音频的墙钟时间；decode 与 talker 合成重叠，扣掉 `talker_s` 后纯解码约 4 tok/s，prefill 约 22 tok/s。完整逐阶段表在 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md)、[docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md) 和 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)（视频 Metal A/B）。
 
 ### 什么决定了 token 速率
 
@@ -459,8 +483,10 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 Beta，且变化很快。每个改动都先在这台机器上量过才留下，输掉的那些写在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) 里——包括那些看起来显而易见的。
 
 ```sh
-make test        # 747 项断言：引擎、采样、前缀缓存、服务端、web UI、应用、图像、语音
+make test        # 804 项断言：引擎、采样、前缀缓存、服务端、web UI、应用、图像、视频、语音
 make bench       # 不加载 checkpoint 也能测内核
+make h3vprobe    # 视频管线探针，单独构建，不在 make test 内
+make h3vmuxprobe # mp4 容器检查：avcC、ctts、stss
 ```
 
 正确性是锚定的，不靠肉眼：固定 prompt 必须产出固定的 top-1 token id 与 logit；每个内核改动都与参考实现互检到 1e-5（fp8 分块 GEMM 实测 8.3e-6，FP4 分组核与单行核逐位相同）。`cwick doctor` 会读一遍每个常驻字节加一段专家库抽样，所以坏分片在请求之前就被发现；`/v1/metrics` 发布的就是日志里打的同一份状态。
@@ -507,6 +533,7 @@ cwick/
 │   ├── q35_*.c        Qwen3.5 后端：Gated DeltaNet + 门控 GQA，稠密 BF16
 │   ├── mm_*.c         MiniMax-M3.1 后端：NVFP4 专家、bf16 GQA
 │   ├── h3*.c/.m       MiniMax-H3-Image：条件器、DiT、分块 VAE
+│   ├── h3v*.c/.m      MiniMax-H3 视频：Ref2VA DiT、时间/空间分块 VAE、mp4
 │   ├── rt_*.c         语音：.pt 读取、音频塔、thinker、talker、flow、HiFT、VAD
 │   ├── ws.c           /v1/realtime 的 WebSocket 传输
 │   ├── metal*.c/.m    Metal 内核与零拷贝 arena
@@ -518,8 +545,8 @@ cwick/
 ├── web/               控制台源码：index.html、app.js、app.css、login.html
 ├── apps/              四个 H5 应用与 manifest.json（井字棋、卡丁车、图像、TeachMe）
 ├── models/            在线下载的权重（.gitignore）
-├── docs/              架构、存储、性能、决策、服务端、精度、图像、语音
-├── tests/             test_cwick.c——747 项检查
+├── docs/              架构、存储、性能、决策、服务端、精度、图像、视频、语音
+├── tests/             test_cwick.c——804 项检查
 ├── tools/             独立的 C 探针：内核、分层测试、模型运行器
 ├── start.sh           推荐入口（前缀缓存 + web + 局域网 + 密码）
 └── download_model.sh  可断点续传的 checkpoint 下载

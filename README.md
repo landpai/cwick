@@ -19,9 +19,10 @@ The name is the picture: a wick is the narrow thread that lets a large body of
 wax burn. Here the wax is an 18–475 GiB weight bank on the SSD, and the wick is
 the few gigabytes per token that actually cross the bus.
 
-Six checkpoints are supported end to end today — not by design a closed list,
+Seven checkpoints are supported end to end today — not by design a closed list,
 but each needs its own loader, quantizers, prompt renderer and kernels. Four are
-text models, one generates images and one is a full-duplex speech model:
+text models, one generates images, one generates video and one is a full-duplex
+speech model:
 
 | model | on disk | shape | why it is here |
 |---|---|---|---|
@@ -30,11 +31,12 @@ text models, one generates images and one is a full-duplex speech model:
 | **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest of the MoE models |
 | **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic** (Qwen3.5-9B) | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only dense text model, held wholly in RAM, and the fastest |
 | **MiniMax-H3-Image** | ≈190 GiB, two trees | Qwen3-VL conditioner → 50-layer DiT → tiled ViT VAE | text-to-image and image editing behind the OpenAI image API |
+| **MiniMax-H3** | ≈72 GiB resident (Ref2VA subset) | 50-layer DiT (hidden 5376, 24 video latents) → tiled video VAE + audio VAE → mp4 | text- and reference-image-to-video behind the async `/v1/videos` job API |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64-layer FP8 thinker → talker → flow + HiFT, 24 kHz | full-duplex speech over a WebSocket, hearing and speaking in the same turn |
 
-One model is resident at a time across **all six**: the image and speech
-pipelines are hot-switched through the same `/v1/models/switch` as the text
-backends, and each release the previous pipeline before loading. The quality
+One model is resident at a time across **all seven**: the image, video and
+speech pipelines are hot-switched through the same `/v1/models/switch` as the
+text backends, and each release the previous pipeline before loading. The quality
 rule is not negotiable and is enforced at load time for the text models:
 **top-k is the model's own `num_experts_per_token`** (never reduced), experts
 are never pruned, embeddings are never tied, and a missing shard fails closed
@@ -53,7 +55,7 @@ instead of quietly running a smaller model.
 - [Models, context and memory](#models-context-and-memory)
 - [Long prompts and the prefix cache](#long-prompts-and-the-prefix-cache)
 - [Thinking, streaming and tools](#thinking-streaming-and-tools)
-- [Image and speech pipelines](#image-and-speech-pipelines)
+- [Image, video and speech pipelines](#image-video-and-speech-pipelines)
 - [Speed](#speed)
 - [Verification](#verification)
 - [Detailed Guides](#detailed-guides)
@@ -142,10 +144,12 @@ benchmark command — which is the actual point. A verdict is a file, not a feel
   and wires the inference state — KV cache, indexer pools, recurrent state — so
   the pages every token touches are neither compressed nor swapped. Expert blobs
   that live in the GPU arena are bound to the next dispatch without a copy, which
-  is the whole reason unified memory is worth using here. The MiniMax backend
-  stays on the CPU pool: its kernels measured *slower* on the GPU at these shapes,
-  and the numbers are in [docs/DECISIONS.md](docs/DECISIONS.md) rather than hidden
-  behind a flag.
+  is the whole reason unified memory is worth using here. The H3 image and video
+  transformers also use Metal tensor-core GEMMs; the video path falls back per
+  call with `CWICK_H3V_GPU=0` when a shape is unsupported. The MiniMax-M3.1 text
+  backend stays on the CPU pool: its kernels measured *slower* on the GPU at
+  these shapes, and the numbers are in [docs/DECISIONS.md](docs/DECISIONS.md)
+  rather than hidden behind a flag.
 * **NVIDIA and ROCm are not supported.** This is a deliberately narrow engine for
   one machine class.
 
@@ -161,6 +165,7 @@ client (curl / coding agent / desktop chat app / web console / WebSocket)
         │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
         │              └── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► text encode → DiT → tiled VAE
+        ├── /v1/videos ──► h3v.c ──► text encode → Ref2VA DiT → tiled video VAE + audio VAE → mp4
         ├── /v1/realtime (WebSocket) ──► ws.c + rt_realtime.c ──► VAD + session state
         │        └── rt_audio.c → rt_thinker.c → rt_talker.c → rt_flow.c → rt_hift.c
         ├── /v1/systemone ──► jev.c ──► one prefill, read the distribution
@@ -190,10 +195,10 @@ state on this machine
 - **The web console is compiled in** (`src/webui_embed.c`), so `--web` needs no
   assets on disk and no second process; the apps are files under `apps/`, served
   by the same server and stored in sqlite.
-- **One model resident at a time across all six pipelines.** That is a bandwidth
+- **One model resident at a time across all seven pipelines.** That is a bandwidth
   decision, not a missing feature: two generations would halve each other's
-  cache. Switching to the image or speech model releases the text engine first,
-  and switching back releases it again.
+  cache. Switching to the image, video or speech model releases the text engine
+  first, and switching back releases it again.
 
 ## Quick Start
 
@@ -202,9 +207,10 @@ state on this machine
 - macOS on Apple Silicon, and `clang`. Nothing else — see
   [Supported hardware](#supported-hardware) for the memory design point.
 - A checkpoint: ~18 GiB (Qwen3.5), ~233 GiB (MiniMax), ~306 GiB (GLM) or
-  ~475 GiB (DeepSeek) of SSD free for text; the image model needs ~190 GiB and
-  the speech model ~42 GiB. Download each as published — there is no conversion
-  step.
+  ~475 GiB (DeepSeek) of SSD free for text; the image model needs ~190 GiB, the
+  video model ~72 GiB resident (Ref2VA subset; the full root holds both
+  partitions) and the speech model ~42 GiB. Download each as published — there
+  is no conversion step.
 
 ### 1. Build and test
 
@@ -250,11 +256,13 @@ The Qwen3.5 checkpoint is announced to clients as
 tags (`qwen3_5` / `qwen3_5_text`) only select the kernels and are also accepted
 for compatibility, but are no longer the advertised name.
 
-`start.sh` also passes `--rt` and `--img` so the speech and image pipelines are
-available as hot-switch targets; pick one from the settings panel (or with
-`POST /v1/models/switch`) to make it resident. The two image endpoints and the
-WebSocket speech endpoint answer 503 while a text model is resident, and vice
-versa — see [Image and speech pipelines](#image-and-speech-pipelines).
+`start.sh` also passes `--rt`, `--img` and `--videos`, registering the speech,
+image and video pipelines. `POST /v1/images/...` and `POST /v1/videos` load their
+pipeline on first use through the same one-model swap gate; an explicit
+`POST /v1/models/switch` (or the settings panel) works too. `/v1/realtime` still
+needs a switch to `Sophon-Realtime-32B-Tag`. These routes answer 503 while
+another pipeline is resident or busy — see
+[Image, video and speech pipelines](#image-video-and-speech-pipelines).
 
 `start.sh` is the recommended entry point: it turns on the prefix cache, the web
 console, LAN sharing, the model directories and a password, all of which are
@@ -390,14 +398,16 @@ places every obstacle on the Mobius strip in real time: each decision shuffles
 its twelve option letters, draws a variation seed and a pressure point, and
 asks for the hardest possible obstacle, while the sidebar shows obstacle and
 kart statistics. **H5 image studio** takes a prompt plus optional face, outfit
-and pose uploads and calls `/v1/images/edits` (or `/v1/images/generations` for
-plain text), showing progress, an inline preview and a PNG download. **TeachMe**
+and pose uploads, calls `/v1/images/edits` (or `/v1/images/generations` for
+plain text) for the step-one image, then posts that image plus a video prompt to
+`/v1/videos`; both steps show progress, an inline preview and a download, and
+paired size presets keep the two canvases matched. **TeachMe**
 captures the microphone as 16 kHz PCM and streams it over the `/v1/realtime`
 WebSocket: the model hears and speaks back, server-side VAD handles hands-free
 turns and barge-in, and the sidebar shows the per-turn ear / prefill / decode /
 talker timings. The two game apps call `POST /v1/systemone`, the image studio
-calls the image endpoints and TeachMe calls the speech endpoint; the chat tab
-goes to whichever endpoint its selector names. Each app lays itself out for a
+calls the image and video endpoints and TeachMe calls the speech endpoint; the
+chat tab goes to whichever endpoint its selector names. Each app lays itself out for a
 phone screen as well as a desktop one; the console only hosts them. With `--lan`
 each app has a QR code, so a phone on the same Wi-Fi can open it without knowing
 the address.
@@ -446,25 +456,33 @@ serve also have an environment twin:
 | `--password P` / `--api-key NAME` | — | single-user login / named key for agent platforms |
 | `--models-dir DIR` | — | extra checkpoints to list (up to 8); switching loads one at a time |
 | `--img DIR` | `CWICK_IMAGE_MODEL` | image checkpoint directory; exposes `POST /v1/images/generations` and `/v1/images/edits` and allows an on-demand switch to `MiniMax-H3-Image` |
+| `--videos DIR` | `CWICK_VIDEO_MODEL` | video checkpoint directory; exposes `POST /v1/videos`, `GET /v1/videos/{id}` and `/content`, and allows an on-demand switch to `MiniMax-H3` |
 | `--rt DIR` | `CWICK_REALTIME_MODEL` | speech checkpoint directory; exposes the `/v1/realtime` WebSocket and allows a switch to `Sophon-Realtime-32B-Tag` |
 | `--store DIR` | `~/.cwick/apps` | one sqlite file per app plus `auth.db` |
 
 Environment twins: `CWICK_MEM_PCT`, `CWICK_MEM_MAX_GIB`, `CWICK_STORE`,
 `CWICK_PASSWORD`, `CWICK_API_KEY`, `CWICK_WARMUP`, `CWICK_WEB`, `CWICK_METAL`,
-`CWICK_IMAGE_MODEL`, `CWICK_REALTIME_MODEL`, `CWICK_SEED` (sampling seed, so a
-run is repeatable), `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT` (model catalog host for
-the **模型** tab). `--img` / `--rt` win when both they and the environment
-variable are set. The library always writes to `./models`; it is in `.gitignore`.
+`CWICK_IMAGE_MODEL`, `CWICK_VIDEO_MODEL`, `CWICK_REALTIME_MODEL`, `CWICK_SEED`
+(sampling seed, so a run is repeatable), `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`
+(model catalog host for the **模型** tab). `--img` / `--videos` / `--rt` win when
+they and the environment variable are both set. Video-specific overrides are
+`CWICK_H3V_GPU=0` (CPU fallback), `CWICK_H3V_WIRE=0/1` (wiring the DiT/VAE) and
+`CWICK_H3V_REF_EDGE=N` (encode the reference image at its own short edge);
+the full list is in [docs/SERVER.md](docs/SERVER.md). The library always writes
+to `./models`; it is in `.gitignore`.
 
 ## API
 
 | method | path | notes |
 |---|---|---|
-| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` / `--img` / `--rt`; each entry carries `supported` / `unsupported_reason`, and the image pipeline is marked `cwick.kind:"image"` |
+| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` / `--img` / `--videos` / `--rt`; each entry carries `supported` / `unsupported_reason`, and the image/video pipelines are marked `cwick.kind:"image"` / `"video"` |
 | GET | `/v1/realtime` | WebSocket full-duplex speech (`?model=…`); requires `--rt`, base64 PCM16 in and `response.audio.delta` out |
-| POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` instead hot-loads the image pipeline without touching the text model |
+| POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` and `MiniMax-H3` hot-load the image/video pipeline without touching the text model |
 | POST | `/v1/images/generations` | `b64_json` image from a JSON prompt; requires `--img` / `CWICK_IMAGE_MODEL` or an on-demand image switch |
 | POST | `/v1/images/edits` | `multipart/form-data` with repeatable `image` parts; same image response shape |
+| POST | `/v1/videos` | async video job; JSON `prompt`, `size` (`WxH`, 256..2560, multiple of 32), `seconds`, optional `steps` (1–30, 0 = 30) and `image` (base64/data URL reference); only `variant:"Ref2VA"` exists; requires `--videos` / `CWICK_VIDEO_MODEL` |
+| GET | `/v1/videos/{id}` | poll a job: `status`, `progress`, `phase`, `steps_done`/`steps_total`; when done, a `cwick` object with per-phase timings, `spatial_corr`, `snr_db`, `suspect_noise` |
+| GET | `/v1/videos/{id}/content` | stream the finished mp4 |
 | POST | `/v1/completions` | raw text completion, streaming or not |
 | POST | `/v1/chat/completions` | messages, `stream`, `tools`, `reasoning_effort` |
 | POST | `/v1/responses` | Responses dialect: `input` items in, a `response` object / `response.*` events out |
@@ -663,7 +681,7 @@ the end. Concatenating the shards gives byte-for-byte the object in the final
 payload; the private `delta.cwick_tool` progress field is still sent for the
 bundled console. See DECISIONS §58 and §59.
 
-## Image and speech pipelines
+## Image, video and speech pipelines
 
 Two more checkpoints sit behind their own endpoints. Both are single-resident
 like the text models: switching to one releases the text engine, and switching
@@ -683,6 +701,40 @@ whole-image pass produces a visible grid. Both responses carry a `cwick` timing
 object per phase, and every phase prints a stamped `[image]` line to stdout as
 it happens. Parameter limits (six steps, `guidance_scale: 1`, `b64_json` only)
 and the full numerical alignment are in [docs/IMAGE.md](docs/IMAGE.md).
+
+**Video** — `POST /v1/videos` answers `202` with a job `id`;
+`GET /v1/videos/{id}` polls `status` / `progress` / `phase` /
+`steps_done` / `steps_total`, and `GET /v1/videos/{id}/content` streams the mp4
+once `status` is `completed`. A job takes JSON `prompt`, `size` (`WxH`, 256..2560
+per axis, multiple of 32), `seconds`, optional `steps` (1–30; 0 keeps the
+30-step schedule) and an optional `image` (base64 or data URL). `MiniMax-H3`
+uses the **Ref2VA** transformer only: the reference image is folded into the
+text presentation, and the first/last-frame partition is neither probed nor
+accepted — naming it in `variant` gets HTTP 400. The 50-layer DiT (hidden 5376,
+24 video latent channels) opens on demand at 61.73 GiB while the VAE and text
+encoder stay mapped; DiT and video VAE run as BF16/F32 tensor-core GEMMs on
+Metal, with `CWICK_H3V_GPU=0` as the CPU fallback. Weight stages are wired when
+they fit the memory ceiling, and `cwick:model_resident_bytes` /
+`cwick:model_wired` report the decision. DiT rows grow roughly with the square
+of the canvas, so a 2K full 30-step job takes hours — `steps:2..4` gives a
+minutes-long verification clip. Each job's `cwick` object carries per-phase
+timings (including `encode_ms` for the reference-image VAE) plus `spatial_corr`,
+`snr_db` and `suspect_noise`; phases reach stdout as `[video]` lines and
+`/v1/metrics` as `cwick:video_*`. Full request rules in
+[docs/SERVER.md](docs/SERVER.md), measured findings in `docs/DECISIONS.md` §89–§103.
+
+```sh
+# 4-step 256x256 verification clip; --noproxy '*' is needed on hosts with a proxy
+TOKEN=$(curl -s --noproxy '*' localhost:8001/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{"password":"cwick-local"}' \
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+JOB=$(curl -s --noproxy '*' -X POST localhost:8001/v1/videos \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"prompt":"a slow pan across a quiet street","size":"256x256","seconds":4,"steps":4}' \
+  | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+# poll GET /v1/videos/$JOB until status == completed, then:
+curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
+```
 
 **Speech** — `/v1/realtime` is a WebSocket: base64 PCM16 at 16 kHz goes in with
 `input_audio_buffer.append`, and `response.audio.delta` carries 24 kHz PCM back
@@ -725,14 +777,17 @@ decode is the default 21 GiB cache from the work in
 | Qwen3.5-9B | prefill, 30,970-token prompt | 436 s | **71.0** | 94% of the flat rate at 30K — a block spends 2.3 s in attention, 4.5 s in projections |
 | Qwen3.5-9B | decision, 3 questions / 525 tokens | 9.44 s | **55.6** | three prefills, no decode (see [docs/PERF.md](docs/PERF.md)) |
 
-The two non-text pipelines have their own units — one rendered image or one
-spoken reply, not a token rate. Both measured on the same M3 Max:
+The three non-text pipelines have their own units — one rendered image, one
+mp4 or one spoken reply, not a token rate. All measured on the same M3 Max:
 
 | pipeline | phase | wall | note |
 |---|---|---|---|
 | MiniMax-H3-Image | image, 2048² canvas, `--backend cpu` | 949.0 s | text encode 46.1 + DiT 874.3 + VAE 28.3; 512² costs the same |
 | MiniMax-H3-Image | image, 2048² canvas, `--backend metal` | **535.6 s** | attention 64.5 → 9.0 s/step; projections stay on the BF16 GEMM path |
 | MiniMax-H3-Image | edit, 1 ref, 256² (debug floor) | 515.4 s | 2124 rows; a 2048² canvas with 3 refs is 40.3 min |
+| MiniMax-H3 | video, 256², 30 steps, metal | ≈2126 s | text 84 + DiT 60–67 s/step ×30 + VAE 64; 102 frames / 4.25 s |
+| MiniMax-H3 | video, 256², 4 steps, metal | 597 s | DiT 441 s; `steps:2..4` is the quick verification clip |
+| MiniMax-H3 | video, 544×960, 30 steps, metal | ≈11678 s | DiT 363–409 s/step — rows grow roughly with canvas² |
 | Sophon-Realtime-32B-Tag | ear, 8.73 s audio | 0.17 s | ≈52× realtime, 55 audio embeddings |
 | Sophon-Realtime-32B-Tag | turn 1, cold | 18.54 s | prefill 8.16 + decode 9.40, first audio 12.96 s, 4.08 s speech |
 | Sophon-Realtime-32B-Tag | turn 2, warm | **13.22 s** | prefill 2.83 s (static prompt reused), first audio 7.67 s |
@@ -740,7 +795,8 @@ spoken reply, not a token rate. Both measured on the same M3 Max:
 The speech figures are wall time for one 8.73 s utterance; decode overlaps
 talker synthesis, so subtracting `talker_s` leaves ~4 tok/s of pure decoding,
 and prefill runs at ~22 tok/s. Full per-phase tables are in
-[docs/REALTIME.md](docs/REALTIME.md) and [docs/IMAGE.md](docs/IMAGE.md).
+[docs/REALTIME.md](docs/REALTIME.md), [docs/IMAGE.md](docs/IMAGE.md) and
+[docs/PERF.md](docs/PERF.md) (video Metal A/B).
 
 ### What sets the token rate
 
@@ -789,8 +845,10 @@ kept, and the ones that lost are written down in
 [docs/DECISIONS.md](docs/DECISIONS.md) — including the ones that looked obvious.
 
 ```sh
-make test        # 747 checks: engines, sampler, prefix cache, server, web UI, apps, image, speech
+make test        # 804 checks: engines, sampler, prefix cache, server, web UI, apps, image, video, speech
 make bench       # kernel timings without loading a checkpoint
+make h3vprobe    # video pipeline prober (built separately, not part of make test)
+make h3vmuxprobe # mp4 container checks: avcC, ctts, stss
 ```
 
 Correctness is anchored, not eyeballed: a fixed prompt must produce a fixed
@@ -856,6 +914,7 @@ cwick/
 │   ├── q35_*.c        Qwen3.5 backend: Gated DeltaNet + gated GQA, dense BF16
 │   ├── mm_*.c         MiniMax-M3.1 backend: NVFP4 experts, bf16 GQA
 │   ├── h3*.c/.m       MiniMax-H3-Image: conditioner, DiT, tiled VAE
+│   ├── h3v*.c/.m      MiniMax-H3 video: Ref2VA DiT, temporal/tiled VAE, mp4
 │   ├── rt_*.c         speech: .pt reader, audio tower, thinker, talker, flow, HiFT, VAD
 │   ├── ws.c           WebSocket transport for /v1/realtime
 │   ├── metal*.c/.m    Metal kernels and the zero-copy arena
@@ -867,8 +926,8 @@ cwick/
 │   └── webui*.c       the console, embedded at build time
 ├── web/               console source: index.html, app.js, app.css, login.html
 ├── apps/              four H5 apps plus manifest.json (tic-tac-toe, kart, image, TeachMe)
-├── docs/              architecture, storage, performance, decisions, server, precision, image, realtime
-├── tests/             test_cwick.c — 747 checks
+├── docs/              architecture, storage, performance, decisions, server, precision, image, video, realtime
+├── tests/             test_cwick.c — 804 checks
 ├── tools/             standalone C probes: kernels, layer tests, model runners
 ├── start.sh           recommended entry point (prefix cache + web + LAN + password)
 └── download_model.sh  resumable checkpoint download
