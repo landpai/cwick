@@ -28,6 +28,8 @@
 #include "ds_engine.h"
 #include "mm_engine.h"
 #include "q35_engine.h"
+#include "ik_engine.h"
+#include "ik_prompt.h"
 #include "sample.h"
 
 /* A turn ends on any id in the checkpoint's stop set, not just the first. */
@@ -74,6 +76,10 @@ struct cwick_engine {
      * when the checkpoint is that architecture. Dense BF16, so unlike the
      * other two it streams nothing and budgets no expert cache. */
     q35_engine *q35;
+    /* Inkling-2-Mini backend. Same deal as `ds`/`mm`/`q35`: non-NULL exactly
+     * when the checkpoint is that architecture. Its weights are fully
+     * resident and wired, so there is no spine and no expert cache to share. */
+    ik_engine *ik;
     cwick_spine spine;
     /* `spine` is embedded, not allocated, so a second engine can share the
      * weights by copying the struct: every member is a pointer to something
@@ -242,6 +248,7 @@ void cwick_engine_set_think_budget(cwick_engine *eng, int64_t budget,
         if (eng->ds) eng->ds->ctx.think_budget = -1;
         if (eng->mm) eng->mm->ctx.think_budget = -1;
         if (eng->q35) eng->q35->ctx.think_budget = -1;
+        if (eng->ik) eng->ik->ctx.think_budget = -1;
         return;
     }
     eng->think_budget = budget;
@@ -271,12 +278,19 @@ void cwick_engine_set_think_budget(cwick_engine *eng, int64_t budget,
         eng->q35->ctx.think_close_id = close_id;
         eng->q35->ctx.think_open_at_start = open_at_start;
     }
+    if (eng->ik) {
+        eng->ik->ctx.think_budget = budget;
+        eng->ik->ctx.think_open_id = open_id;
+        eng->ik->ctx.think_close_id = close_id;
+        eng->ik->ctx.think_open_at_start = open_at_start;
+    }
 }
 
 void cwick_engine_set_think_closed_at_start(cwick_engine *eng, bool closed) {
     if (!eng) return;
     if (eng->mm) eng->mm->ctx.think_closed_at_start = closed;
     if (eng->q35) eng->q35->ctx.think_closed_at_start = closed;
+    if (eng->ik) eng->ik->ctx.think_closed_at_start = closed;
 }
 
 cwick_status cwick_gen_window(int64_t pos, int64_t prompt_len,
@@ -366,6 +380,7 @@ void cwick_engine_set_decode_phase(cwick_engine *eng, const char *phase) {
     if (eng->ds) eng->ds->ctx.decode_phase = phase;
     if (eng->mm) eng->mm->ctx.decode_phase = phase;
     if (eng->q35) eng->q35->ctx.decode_phase = phase;
+    if (eng->ik) eng->ik->ctx.decode_phase = phase;
 }
 
 /* Wall clock helper: enough resolution to price a single decode step. */
@@ -467,6 +482,7 @@ void cwick_engine_set_stop(cwick_engine *eng, volatile int *stop) {
     if (eng->ds) eng->ds->ctx.stop = stop;
     if (eng->mm) eng->mm->ctx.stop = stop;
     if (eng->q35) eng->q35->ctx.stop = stop;
+    if (eng->ik) eng->ik->ctx.stop = stop;
 }
 
 void cwick_engine_set_abort_poll(cwick_engine *eng, bool (*poll)(void *),
@@ -486,6 +502,183 @@ void cwick_engine_set_abort_poll(cwick_engine *eng, bool (*poll)(void *),
         eng->q35->ctx.abort_poll = poll;
         eng->q35->ctx.abort_poll_user = user;
     }
+    if (eng->ik) {
+        eng->ik->ctx.abort_poll = poll;
+        eng->ik->ctx.abort_poll_user = user;
+    }
+}
+
+cwick_status cwick_engine_set_images(cwick_engine *eng, const float *embeds,
+                                     int64_t n_tokens,
+                                     const int64_t *image_tokens, size_t n_images,
+                                     cwick_error *err) {
+    if (eng && eng->ik)
+        return ik_engine_set_images(eng->ik, embeds, n_tokens,
+                                    image_tokens, n_images, err);
+    cwick_error_set(err, CWICK_ERR_STATE, "this model has no vision tower");
+    return CWICK_ERR_STATE;
+}
+
+int cwick_engine_vision_embed(cwick_engine *eng, const uint8_t *data, size_t len,
+                              float **embeds, int64_t *n_tokens, int64_t *rows,
+                              int64_t *cols, cwick_error *err) {
+    if (eng && eng->ik)
+        return ik_engine_vision_embed(eng->ik, data, len, embeds, n_tokens,
+                                      rows, cols, err);
+    cwick_error_set(err, CWICK_ERR_STATE, "this model has no vision tower");
+    return -1;
+}
+
+cwick_status cwick_engine_prepare_images(cwick_engine *eng,
+                                         const char *const *images,
+                                         size_t n_images,
+                                         cwick_image_batch *batch,
+                                         cwick_error *err) {
+    if (batch) memset(batch, 0, sizeof(*batch));
+    cwick_error_clear(err);
+    if (!eng || !eng->ik || !batch || (n_images && !images) ||
+        n_images > IK_MAX_IMAGES || eng->spec.hidden_size <= 0) {
+        cwick_error_set(err, n_images > IK_MAX_IMAGES ? CWICK_ERR_ARGUMENT
+                                                     : CWICK_ERR_STATE,
+                        n_images > IK_MAX_IMAGES
+                            ? "at most %d images are supported"
+                            : "image preparation requires a resident vision model",
+                        IK_MAX_IMAGES);
+        return err->status;
+    }
+    batch->image_tokens = (int64_t *)calloc(n_images ? n_images : 1,
+                                            sizeof(int64_t));
+    if (!batch->image_tokens) abort();
+    for (size_t i = 0; i < n_images; i++) {
+        if (!images[i] || !*images[i]) {
+            cwick_error_set(err, CWICK_ERR_ARGUMENT, "image %zu has no base64 data", i);
+            goto fail;
+        }
+        size_t bytes = 0;
+        uint8_t *data = (uint8_t *)cwick_b64_decode(images[i], strlen(images[i]), &bytes);
+        if (!data || !bytes) {
+            free(data);
+            cwick_error_set(err, CWICK_ERR_ARGUMENT, "image %zu is not valid base64", i);
+            goto fail;
+        }
+        float *part = NULL;
+        int64_t nt = 0, rows = 0, cols = 0;
+        int vr = cwick_engine_vision_embed(eng, data, bytes, &part, &nt, &rows, &cols, err);
+        free(data);
+        if (vr != 0 || !part || nt <= 0) {
+            free(part);
+            if (err->status == CWICK_OK)
+                cwick_error_set(err, CWICK_ERR_STATE, "image %zu vision encoding failed", i);
+            goto fail;
+        }
+        CWICK_INFO("image", "decoded image %zu: %lldx%lld -> %lld vectors",
+                   i + 1, (long long)rows, (long long)cols, (long long)nt);
+        if (nt > 4096 || batch->n_tokens > IK_MAX_IMAGE_TOKENS - nt) {
+            free(part);
+            cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                            "image token spans exceed %d tokens", IK_MAX_IMAGE_TOKENS);
+            goto fail;
+        }
+        size_t hidden = (size_t)eng->spec.hidden_size;
+        float *all = (float *)realloc(batch->embeds,
+                                     (size_t)(batch->n_tokens + nt) * hidden * sizeof(float));
+        if (!all) { free(part); abort(); }
+        memcpy(all + (size_t)batch->n_tokens * hidden, part,
+               (size_t)nt * hidden * sizeof(float));
+        free(part);
+        batch->embeds = all;
+        batch->n_tokens += nt;
+        batch->image_tokens[i] = nt;
+    }
+    batch->n_images = n_images;
+    return CWICK_OK;
+fail:
+    cwick_image_batch_free(batch);
+    return err->status != CWICK_OK ? err->status : CWICK_ERR_STATE;
+}
+
+void cwick_image_batch_free(cwick_image_batch *batch) {
+    if (!batch) return;
+    free(batch->embeds);
+    free(batch->image_tokens);
+    memset(batch, 0, sizeof(*batch));
+}
+
+cwick_status cwick_engine_image_token_id(cwick_engine *eng,
+                                         const cwick_tokenizer *tok,
+                                         uint32_t *id_out, cwick_error *err) {
+    if (!eng || !eng->ik) {
+        cwick_error_set(err, CWICK_ERR_STATE, "this model has no vision tower");
+        return CWICK_ERR_STATE;
+    }
+    cwick_status st = ik_prompt_image_token_id(tok, id_out, err);
+    if (st != CWICK_OK) return st;
+    if (eng->ik->m.c.image_token_id > 0 &&
+        *id_out != eng->ik->m.c.image_token_id) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "image placeholder token %u disagrees with model token %lld",
+                        *id_out, (long long)eng->ik->m.c.image_token_id);
+        return CWICK_ERR_ARGUMENT;
+    }
+    return CWICK_OK;
+}
+
+cwick_status cwick_expand_image_placeholders(const uint32_t *ids, int64_t n_ids,
+                                             uint32_t image_token_id,
+                                             const cwick_image_batch *batch,
+                                             uint32_t **out, int64_t *n_out,
+                                             cwick_error *err) {
+    if (out) *out = NULL;
+    if (n_out) *n_out = 0;
+    if (!ids || n_ids < 0 || !batch || !out || !n_out ||
+        batch->n_images > IK_MAX_IMAGES) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT, "invalid image placeholder input");
+        return CWICK_ERR_ARGUMENT;
+    }
+    int64_t span_total = 0;
+    for (size_t i = 0; i < batch->n_images; i++) {
+        int64_t span = batch->image_tokens ? batch->image_tokens[i] : 0;
+        if (span <= 0 || span > 4096 || span_total > IK_MAX_IMAGE_TOKENS - span) {
+            cwick_error_set(err, CWICK_ERR_ARGUMENT, "invalid image token span");
+            return CWICK_ERR_ARGUMENT;
+        }
+        span_total += span;
+    }
+    if (span_total != batch->n_tokens) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "image token spans do not match embedding count");
+        return CWICK_ERR_ARGUMENT;
+    }
+    int64_t places = 0;
+    for (int64_t i = 0; i < n_ids; i++)
+        if (ids[i] == image_token_id) places++;
+    if ((size_t)places != batch->n_images) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "prompt has %lld image placeholders for %zu images",
+                        (long long)places, batch->n_images);
+        return CWICK_ERR_ARGUMENT;
+    }
+    int64_t total = batch->n_tokens;
+    if (total > INT64_MAX - n_ids + places) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT, "expanded prompt is too large");
+        return CWICK_ERR_ARGUMENT;
+    }
+    int64_t count = n_ids - places + total;
+    uint32_t *expanded = (uint32_t *)malloc((size_t)(count ? count : 1) * sizeof(uint32_t));
+    if (!expanded) abort();
+    int64_t w = 0, image = 0;
+    for (int64_t i = 0; i < n_ids; i++) {
+        if (ids[i] != image_token_id) {
+            expanded[w++] = ids[i];
+        } else {
+            for (int64_t j = 0; j < batch->image_tokens[image]; j++)
+                expanded[w++] = image_token_id;
+            image++;
+        }
+    }
+    *out = expanded;
+    *n_out = count;
+    return CWICK_OK;
 }
 
 void cwick_engine_set_verbose(cwick_engine *eng, bool verbose) {
@@ -493,6 +686,7 @@ void cwick_engine_set_verbose(cwick_engine *eng, bool verbose) {
     if (eng && eng->ds) eng->ds->ctx.verbose = verbose;
     if (eng && eng->mm) eng->mm->ctx.verbose = verbose;
     if (eng && eng->q35) eng->q35->ctx.verbose = verbose;
+    if (eng && eng->ik) eng->ik->ctx.verbose = verbose;
 }
 
 static bool engine_stopped(const cwick_engine *eng) {
@@ -2751,6 +2945,42 @@ cwick_status cwick_engine_new(const cwick_engine_options *opt, cwick_engine **ou
         return CWICK_OK;
     }
 
+    /* ---- Inkling-2-Mini: fully resident. The checkpoint is dequantized to a
+     * BF16 arena at load and mlock'd, so there is no stream, no expert cache
+     * and no spine: the only sizing decision is the KV window, which is 8 KiB
+     * per position per full-attention layer (4 of them) plus a 1024-slot ring
+     * on each of the other 20, and three copies of the loop layers' caches. */
+    if (strncmp(eng->spec.model_type, "inkling2", 8) == 0) {
+        int64_t want = opt->max_context > 0 ? opt->max_context
+                                            : next_capacity(&eng->spec, 0);
+        eng->ik = cwick_xmalloc(sizeof(ik_engine));
+        if (ik_engine_open(eng->ik, opt->model_root, want, err) != 0) {
+            free(eng->ik);
+            eng->ik = NULL;
+            cwick_engine_free(eng);
+            return CWICK_ERR_STATE;
+        }
+        eng->capacity = eng->ik->capacity;
+        eng->ik->ctx.stop = opt->stop;
+        eng->ik->ctx.abort_poll = NULL;
+        eng->ik->ctx.abort_poll_user = NULL;
+        eng->ik->ctx.verbose = opt->verbose;
+        eng->ik->ctx.tag = eng->req_tag;
+        eng->ik->ctx.spec = &eng->spec;
+        eng->ik->smp = eng->smp;
+        eng->max_new = opt->max_new_tokens > 0 ? opt->max_new_tokens : 512;
+        CWICK_INFO("init", "Inkling-2-Mini engine ready: %s dim=%lld layers=%lld "
+                   "experts=%lld top-%lld context=%lld kv=%.2fGiB",
+                   eng->spec.model_type, (long long)eng->spec.hidden_size,
+                   (long long)eng->spec.num_hidden_layers,
+                   (long long)eng->spec.num_experts,
+                   (long long)eng->spec.num_experts_per_token,
+                   (long long)eng->capacity,
+                   cwick_gib((double)ik_cache_bytes(&eng->ik->m, eng->capacity)));
+        *out = eng;
+        return CWICK_OK;
+    }
+
     /* ---- size the inference state *before* the weights are opened ------
      * KV/KDA/anchor buffers are allocated once and live for the whole run,
      * so the expert-cache budget has to subtract them first. This is also
@@ -3193,6 +3423,7 @@ int64_t cwick_engine_pos(const cwick_engine *eng) {
     if (eng->ds) return eng->ds->pos;
     if (eng->mm) return eng->mm->pos;
     if (eng->q35) return eng->q35->pos;
+    if (eng->ik) return eng->ik->pos;
     return eng->pos;
 }
 
@@ -3218,6 +3449,11 @@ cwick_status cwick_engine_reset(cwick_engine *eng, cwick_error *err) {
     }
     if (eng->q35) {
         q35_engine_reset(eng->q35);
+        eng->pos = 0;
+        return CWICK_OK;
+    }
+    if (eng->ik) {
+        ik_engine_reset(eng->ik);
         eng->pos = 0;
         return CWICK_OK;
     }
@@ -3277,6 +3513,11 @@ void cwick_engine_free(cwick_engine *eng) {
         free(eng->model_root);
         free(eng);
         return;
+    }
+    if (eng->ik) {
+        ik_engine_close(eng->ik);
+        free(eng->ik);
+        eng->ik = NULL;
     }
     if (eng->q35) {
         q35_engine_close(eng->q35);
@@ -3361,6 +3602,7 @@ void cwick_engine_set_sampler(cwick_engine *eng, const cwick_sampler_cfg *cfg) {
      * so the two backends cannot disagree about what a request asked for. */
     if (eng->ds) eng->ds->smp = eng->smp;
     if (eng->mm) eng->mm->smp = eng->smp;
+    if (eng->ik) eng->ik->smp = eng->smp;
 }
 
 /* The seed for a generation. CWICK_SEED pins it (an A/B that wants the same
@@ -3685,6 +3927,11 @@ cwick_status cwick_engine_apply_prefix(cwick_engine *eng, const cwick_prefix_sta
         cwick_error_set(err, CWICK_ERR_ARGUMENT, "prefix: bad state");
         return CWICK_ERR_ARGUMENT;
     }
+    if (eng->ik) {
+        cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
+                        "prefix: Inkling state snapshots are not implemented");
+        return CWICK_ERR_UNSUPPORTED;
+    }
     if (eng->mm) {
         if (s->kind != 2 || !s->blob || s->blob_len == 0) {
             cwick_error_set(err, CWICK_ERR_STATE,
@@ -3848,13 +4095,19 @@ static bool jev_blocks_even(void) {
     return e && atoi(e) != 0;       /* off by default; see the measurement */
 }
 
-cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
+static cwick_status prefill_logits_at_impl(cwick_engine *eng,
                                             const uint32_t *prompt,
                                             int64_t prompt_len, int64_t start_pos,
-                                            float *logits_out, cwick_error *err) {
+                                            float *logits_out, bool reset_start,
+                                            cwick_error *err) {
     cwick_error_clear(err);
-    int64_t cap = eng ? eng->capacity : 0;
-    if (prompt_len < 1 || start_pos < 0 || start_pos + prompt_len > cap) {
+    if (!eng || !prompt || !logits_out) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT, "prefill needs an engine, prompt and logits");
+        return CWICK_ERR_ARGUMENT;
+    }
+    int64_t cap = eng->capacity;
+    if (prompt_len < 1 || start_pos < 0 || start_pos > cap ||
+        prompt_len > cap - start_pos) {
         cwick_error_set(err, CWICK_ERR_ARGUMENT,
                        "prefill window %lld..%lld outside 0..%lld",
                        (long long)start_pos,
@@ -3863,7 +4116,7 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
     }
 
     const bool resume = start_pos > 0;
-    if (!resume) {
+    if (!resume && reset_start) {
         cwick_engine_reset(eng, err);
         if (err->status != CWICK_OK) return err->status;
     } else {
@@ -3874,6 +4127,7 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
         if (eng->ds) eng->ds->pos = start_pos;
         if (eng->mm) eng->mm->pos = start_pos;
         if (eng->q35) eng->q35->pos = start_pos;
+        if (eng->ik) eng->ik->pos = start_pos;
     }
 
     const bool report = eng->req_tag[0] != '\0';
@@ -3944,6 +4198,25 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
         memcpy(logits_out, eng->q35->logits,
                (size_t)eng->spec.vocab_size * sizeof(float));
         free(ids);
+    } else if (eng->ik) {
+        int32_t *ids = cwick_xmalloc((size_t)prompt_len * sizeof(int32_t));
+        for (int64_t i = 0; i < prompt_len; i++) ids[i] = (int32_t)prompt[i];
+        int64_t pos = 0;
+        while (pos < prompt_len) {
+            int n = (int)(prompt_len - pos > IK_CHUNK ? IK_CHUNK
+                                                      : prompt_len - pos);
+            if (ik_model_forward(&eng->ik->m, ids + pos, n, eng->ik->pos,
+                                 eng->ik->logits, err) != 0) {
+                free(ids);
+                st = CWICK_ERR_STATE;
+                goto done;
+            }
+            eng->ik->pos += n;
+            pos += n;
+        }
+        memcpy(logits_out, eng->ik->logits,
+               (size_t)eng->spec.vocab_size * sizeof(float));
+        free(ids);
     } else if (eng->ds) {
         int32_t *ids = cwick_xmalloc((size_t)prompt_len * sizeof(int32_t));
         for (int64_t i = 0; i < prompt_len; i++) ids[i] = (int32_t)prompt[i];
@@ -3990,6 +4263,41 @@ done:
                    st == CWICK_OK ? "" : " — failed");
     }
     return st;
+}
+
+cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
+                                            const uint32_t *prompt,
+                                            int64_t prompt_len, int64_t start_pos,
+                                            float *logits_out, cwick_error *err) {
+    return prefill_logits_at_impl(eng, prompt, prompt_len, start_pos,
+                                  logits_out, true, err);
+}
+
+cwick_status cwick_engine_prefill_logits_with_images(
+    cwick_engine *eng, const uint32_t *prompt, int64_t prompt_len,
+    const cwick_image_batch *batch, float *logits_out, cwick_error *err) {
+    cwick_error_clear(err);
+    if (!eng || !eng->ik || !batch || batch->n_images == 0 ||
+        !batch->embeds || batch->n_tokens <= 0) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "image prefill requires a resident model and non-empty image batch");
+        return CWICK_ERR_ARGUMENT;
+    }
+    cwick_status st = cwick_engine_reset(eng, err);
+    if (st != CWICK_OK) return st;
+    st = cwick_engine_set_images(eng, batch->embeds, batch->n_tokens,
+                                 batch->image_tokens, batch->n_images, err);
+    if (st != CWICK_OK) return st;
+    st = prefill_logits_at_impl(eng, prompt, prompt_len, 0, logits_out, false, err);
+    if (st != CWICK_OK) return st;
+    if (eng->ik->m.img_used != eng->ik->m.img_tokens) {
+        cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                        "prompt consumed %lld of %lld image embedding tokens",
+                        (long long)eng->ik->m.img_used,
+                        (long long)eng->ik->m.img_tokens);
+        return CWICK_ERR_ARGUMENT;
+    }
+    return CWICK_OK;
 }
 
 cwick_status cwick_engine_prefill_logits(cwick_engine *eng, const uint32_t *prompt,
@@ -4500,6 +4808,9 @@ cwick_status cwick_engine_generate(cwick_engine *eng, const uint32_t *prompt,
     if (eng && eng->q35)
         return q35_engine_generate(eng->q35, prompt, prompt_len, max_new,
                                    keep_prompt, NULL, NULL, result, err);
+    if (eng && eng->ik)
+        return ik_engine_generate(eng->ik, prompt, prompt_len, max_new,
+                                  keep_prompt, NULL, NULL, result, err);
     return generate_impl(eng, prompt, prompt_len, max_new, keep_prompt,
                          NULL, NULL, result, err);
 }
@@ -4747,6 +5058,9 @@ cwick_status cwick_engine_generate_stream(cwick_engine *eng, const uint32_t *pro
     if (eng && eng->q35)
         return q35_engine_generate(eng->q35, prompt, prompt_len, max_new, false,
                                    sink, user, result, err);
+    if (eng && eng->ik)
+        return ik_engine_generate(eng->ik, prompt, prompt_len, max_new, false,
+                                  sink, user, result, err);
     return generate_impl(eng, prompt, prompt_len, max_new, false,
                          sink, user, result, err);
 }

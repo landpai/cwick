@@ -137,6 +137,7 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+.workbuddy/
 
 # --- local secrets ---------------------------------------------------------
 .env

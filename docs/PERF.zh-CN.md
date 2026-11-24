@@ -1037,3 +1037,89 @@ DiT 阶段耗时包含首个 block 前约 52 s 的一次性开销：打开 62 Gi
 1.9e-5、BF16 GEMM 7.8e-3、跨步 F32 GEMM 7.6e-6、64 宽注意力 2.3e-4、128 宽
 注意力 2.7e-4。`CWICK_H3V_GPU=0` 是 A/B 逃生开关；任何不支持的形状都按次回退，
 所以视频生成不会被 GPU 路径卡住。
+
+## Inkling-2-Mini 走 Metal：修正前向后的四个接口（2026-11-24）
+
+同一台 M3 Max 12P+4E / 40 核 GPU / 128 GiB，`--backend metal`、
+`--context 32768`、`temperature=0`、`max_tokens=64`。请求把 effort 记录设为
+`none`；checkpoint 仍可能自行输出 thinking 块。冷启动 28.4 s，其中 28.2 s
+用于把 checkpoint 反量化进 49.16 GiB 常驻 arena。arena 与 2.32 GiB KV/卷积
+状态一起 wired，共 51.48 GiB；源 checkpoint 映射在 wired 前释放。
+
+`tools/apibench.sh` 测量完整 HTTP 往返。流式 `first` 是从 curl 的接收 trace
+中解析出的首个非空 content、reasoning 或 tool delta，不是 HTTP 头，也不是
+只有 role 的帧。prefill/decode 来自访问日志中的引擎计时。文本行是两次运行的
+均值；非流式和图像行各运行一次。
+
+| 接口 | 模式 | 输入 -> 生成 | 首个可见 delta | 客户端合计 | prefill | decode |
+|---|---|---:|---:|---:|---:|---:|
+| `/v1/systemone` | 非流式 | 550 token，3 问 -> 0 | 62,396 ms | 62,396 ms | 8.7 tok/s | — |
+| `/v1/chat/completions` | 流式 | 86 -> 64 | 12,162 ms | 25,477 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/responses` | 流式 | 86 -> 64 | 12,297 ms | 24,920 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/messages` | 流式 | 86 -> 64 | 11,913 ms | 24,678 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/chat/completions` | 非流式 | 86 -> 64 | 25,583 ms | 25,583 ms | 7.33 tok/s | 4.55 tok/s |
+| `/v1/responses` | 非流式 | 86 -> 64 | 25,737 ms | 25,737 ms | 7.26 tok/s | 4.54 tok/s |
+| `/v1/messages` | 非流式 | 86 -> 64 | 25,099 ms | 25,099 ms | 7.20 tok/s | 4.79 tok/s |
+| `/v1/chat/completions` | 流式 | 126（96 图像）-> 64 | 14,562 ms | 27,956 ms | 10.05 tok/s | 4.55 tok/s |
+| `/v1/responses` | 流式 | 126（96 图像）-> 64 | 15,034 ms | 28,909 ms | 9.76 tok/s | 4.39 tok/s |
+| `/v1/messages` | 流式 | 126（96 图像）-> 64 | 14,972 ms | 29,152 ms | 9.82 tok/s | 4.31 tok/s |
+
+图像 fixture 是 450×308 的 corn JPEG。解码加 23 层视觉塔耗时 1.58 s，输出
+96 个合并向量；占位符展开发生在文本 prefill 之前。所有行均返回 HTTP 200。
+决策请求每个问题只 prefill 一次，不生成 token。
+
+完整运行后的内存采样：进程 physical footprint 55.71 GB，RSS 约 52.0 GiB，
+可写区域 52.0 GiB 常驻且 `swapped_out=0K`。整个运行期间 host compressor
+计数稳定在 2,427,260,575，host swap 使用量稳定在 2,296,840,192 字节；这部
+分 swap 在 cwick 启动前就存在，不归因于本进程。累计计数器为 4,116,892 次
+Metal linear 调用和 2,477 个 decode step。没有修改 host 级 VM 设置。
+
+这些数字的正确性锚点：26-token 算术 prompt 的 ID 与 checkpoint tokenizer
+完全一致；原生前向与 cwick 的首 token 都是 `<|message_model|>`，主要候选
+token 也一致。实测请求对 2+2 返回 `4`，三种图像接口均返回 `Corn`，双图返
+回 `carrot, corn`，三种工具封装均生成 `get_weather({"city":"Paris"})`，工具
+结果续答正确，System One 选择具有高置信度。145-token 长 prefill 回归仍由
+§116 覆盖。
+
+## Inkling-2-Mini 打包专家与多模态全链路结果（2026-11-24）
+
+本节取代上文 Inkling-2-Mini 的常驻内存与吞吐数据。最终配置直接常驻
+checkpoint 的 NVFP4 / MXFP8 打包专家字节：20 个 NVFP4 层、4 个 MXFP8 层、
+128 experts、top-8，保留全部 24 个存储层和三轮 loop。没有剪枝、跳过层或
+专家，也没有转换到更低精度格式。
+
+冷启动 **3.57 s**。wired 分配为 **18.19 GiB 权重 + 2.32 GiB KV/卷积状态**。
+完整文本/图像基准运行后，进程 physical footprint 为 **22.4 GiB**（峰值
+22.5 GiB），RSS 约 22.0 GiB，可写区域 `swapped_out=0K`。host swap 仍约
+2.34 GiB，且全部在 cwick 启动前就已存在；没有修改 host 级 VM 设置。
+
+下表为最终构建每个接口各一次流式运行，`--backend metal --context 32768`、
+`temperature=0`、`max_tokens=64`。`first` 是首个非空 SSE delta，`total` 是
+完整 HTTP 往返；prefill/decode 来自同一请求的引擎计时。
+
+| 输入 | 接口 | 输入 -> 生成 | 首个可见 delta | 客户端合计 | prefill | decode |
+|---|---|---:|---:|---:|---:|---:|
+| 文本 | `/v1/chat/completions` | 86 -> 64 | 3,933 ms | 11,111 ms | 23.25 tok/s | 8.52 tok/s |
+| 文本 | `/v1/responses` | 86 -> 64 | 3,746 ms | 10,233 ms | 24.37 tok/s | 9.42 tok/s |
+| 文本 | `/v1/messages` | 86 -> 64 | 3,692 ms | 10,187 ms | 24.78 tok/s | 9.40 tok/s |
+| 文本 | `/v1/systemone` | 550，3 问 -> 0 | 20,916 ms | 20,916 ms | 26.30 tok/s | — |
+| 图像 | `/v1/chat/completions` | 126（96 图像）-> 64 | 15,795 ms | 22,495 ms | 8.89 tok/s | 9.11 tok/s |
+| 图像 | `/v1/responses` | 126（96 图像）-> 64 | 15,244 ms | 22,763 ms | 9.32 tok/s | 8.09 tok/s |
+| 图像 | `/v1/messages` | 126（96 图像）-> 64 | 16,224 ms | 23,174 ms | 8.69 tok/s | 8.71 tok/s |
+| 图像 | `/v1/systemone` | 233，1 问 -> 0 | 32,810 ms | 32,810 ms | 7.10 tok/s | — |
+
+图像 fixture 是 450×308 的 corn JPEG。视觉解码加视觉塔约 1.4–1.7 s，输出
+96 个合并向量。图像 prefill 只把当前激活的专家即时反量化到临时 BF16 缓冲，
+并沿用正确性参考路径的 Metal BF16/FP32 GEMM 语义；decode 回到打包 Metal
+内核。System One 每个问题只 prefill 一次，不生成 token。所有请求均返回
+HTTP 200。
+
+最终构建的正确性锚点：`2+2` 返回 `4`；完整图像回答返回 `Corn`；三种图像
+接口均产生连贯的 corn/颜色推理；图像 System One 返回 `corn`，概率
+0.999928。Web 图片上传、预览/删除、IndexedDB 回放和四种请求 builder 已在
+真实浏览器验证。`make test` 与独立 Metal 数值探针均通过。
+
+要求的 80 tok/s prefill / 40 tok/s decode 目标**尚未达到**。实测文本约
+24–26 / 8.5–9.4 tok/s，图像约 7–9 / 8–9 tok/s。剩余图像成本主要是激活专家
+的 BF16 即时反量化与 GEMM；剩余 decode 成本主要是打包专家带宽和主机同步。
+以上均为全链路数据，不是单独的 kernel 估值。

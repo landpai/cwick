@@ -141,6 +141,7 @@ void cwick_metrics_prefix_query(bool hit, int64_t reused);
 /* The expert stream is sampled at render time, so `/metrics` reports the
  * cache as it is *now* rather than as it was at some earlier step. */
 void cwick_metrics_set_stream(const cwick_stream *s);
+void cwick_metrics_set_ik_gpu_calls(uint64_t calls);
 void cwick_metrics_set_memory_ceiling(uint64_t bytes);
 /* Per-model residency decision (the video pipeline reports its heaviest
  * stage here). Exposed so a scraper can confirm the wired bytes actually

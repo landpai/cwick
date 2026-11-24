@@ -10,7 +10,7 @@
 
 名字就是画面：灯芯是让一大块蜡持续燃烧的那根细线。这里的"蜡"是 SSD 上 18–475 GiB 的权重库，"灯芯"是每个 token 真正过总线的那几 GB。
 
-七个 checkpoint 目前端到端支持——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。四个是文本模型，一个生成图像，一个生成视频，一个是全双工语音模型：
+目前端到端支持八个 checkpoint——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。五个是文本模型，一个生成图像，一个生成视频，一个是全双工语音模型：
 
 | 模型 | 磁盘占用 | 结构 | 为什么收它 |
 | --- | --- | --- | --- |
@@ -18,11 +18,12 @@
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB，48 分片 | 40 层，384 路由专家 top-6，MLA + FP4 专家 + FP8 attention | 仍能进笔记本的最大一个 |
 | **MiniMax-M3.1-Flash** | ≈233 GiB，48 分片 | 60 层（3 层稠密），128 专家 top-4，NVFP4 专家 + FP8 稠密 | MoE 三者中占用最小 |
 | **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic**（Qwen3.5-9B） | ≈18 GiB，4 分片 | 32 层：24 层 Gated DeltaNet + 8 层 GQA，稠密 BF16，无专家 | 混合线性注意力；唯一稠密文本模型，整份常驻内存，也是最快的一个 |
+| **Inkling-2-Mini** | ≈18.18 GiB，1 分片 | 24 个存储层，循环核心执行 3 轮，128 专家 top-8，NVFP4/MXFP8 + 视觉塔 | 完整文本+图像理解，打包专家以 18.19 GiB 常驻 |
 | **MiniMax-H3-Image** | ≈190 GiB，两棵树 | Qwen3-VL 条件器 → 50 层 DiT → 分块 ViT VAE | 文生图与图像编辑，走 OpenAI 图像接口 |
 | **MiniMax-H3** | ≈72 GiB 常驻（Ref2VA 子集） | 50 层 DiT（hidden 5376，24 个视频 latent）→ 分块视频 VAE + 音频 VAE → mp4 | 文生视频与参考图生视频，走异步 `/v1/videos` 任务接口 |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64 层 FP8 thinker → talker → flow + HiFT，24 kHz | 全双工语音走 WebSocket，同一轮里边听边说 |
 
-七个管线共用一条铁律：**任何时刻只常驻一个模型**。图像、视频与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
+八个管线共用一条铁律：**任何时刻只常驻一个模型**。图像、视频与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
 
 # 目录
 
@@ -32,6 +33,7 @@
 - [架构](#架构)
 - [快速开始](#快速开始)
 - [用法](#用法)
+  - [用 Inkling-2-Mini 理解文本与图像](#用-inkling-2-mini-理解文本与图像)
 - [配置](#配置)
 - [API](#api)
 - [模型、上下文与内存](#模型上下文与内存)
@@ -80,7 +82,7 @@
 
 - **Apple Silicon**，以 128 GiB 为设计点。规划器启动时读取本机内存，把上限设在它的 80%，常驻 spine 与 KV 缓存先从这里出，剩下的全给专家缓存，其余留在 SSD。稳态因此落在上限之下：`swap` 保持平，不会一路涨到几十 GB，压缩器也碰不到每个 token 都要访问的那些页。
 - **更小的 Mac** 走同一条路径——SSD 流式不是降级模式，它就是"模型比 RAM 大"时的运行方式。
-- **Metal** 加速 GLM 与 DeepSeek 后端（专家 GEMV、批式投影），在 Apple Silicon 上就是默认后端，`--backend cpu` 强制走 CPU 路径。启动时它把 GPU 的 wired 内存上限提到 RAM 的 80%，并把推理状态（KV 缓存、索引器池、循环状态）锁成 wired——每个 token 都要碰的那些页既不被压缩也不被换出。住在 GPU arena 里的专家 blob 下一次 dispatch 直接绑定、不做拷贝，这正是统一内存在这里值得用的原因。H3 图像与视频 transformer 也用 Metal 张量核 GEMM；视频路径遇到不支持的形状可用 `CWICK_H3V_GPU=0` 逐次回退。MiniMax-M3.1 **文本**后端留在 CPU 线程池：它的内核在这些形状下实测**更慢**，数字在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md)，而不是藏在一个开关后面。
+- **Metal** 加速 GLM、DeepSeek、Qwen3.5 与 Inkling-2-Mini（专家 GEMV、批式投影与 Inkling 打包专家），在 Apple Silicon 上就是默认后端，`--backend cpu` 强制走 CPU 路径。启动时它把 GPU 的 wired 内存上限提到 RAM 的 80%，并把推理状态（KV 缓存、索引器池、循环状态）锁成 wired——每个 token 都要碰的那些页既不被压缩也不被换出。住在 GPU arena 里的专家 blob 下一次 dispatch 直接绑定、不做拷贝，这正是统一内存在这里值得用的原因。H3 图像与视频 transformer 也用 Metal 张量核 GEMM；视频路径遇到不支持的形状可用 `CWICK_H3V_GPU=0` 逐次回退。MiniMax-M3.1 **文本**后端留在 CPU 线程池：它的内核在这些形状下实测**更慢**，数字在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md)，而不是藏在一个开关后面。
 - **不支持 NVIDIA 与 ROCm。** 这是为一类机器刻意做窄的引擎。
 
 ## 架构
@@ -93,7 +95,8 @@
         │              ├── GLM-5.3-flash : spine.c  attention.c  moe.c  pfx.c
         │              ├── DeepSeek-V4.1  : ds_model.c  ds_ops.c  ds_quant.c
         │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
-        │              └── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
+        │              ├── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
+        │              └── Inkling-2-Mini : ik.c  ik_engine.c  ik_prompt.c  ik_vision.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► 文本编码 → DiT → 分块 VAE
         ├── /v1/videos ──► h3v.c ──► 文本编码 → Ref2VA DiT → 分块视频 VAE + 音频 VAE → mp4
         ├── /v1/realtime（WebSocket）──► ws.c + rt_realtime.c ──► VAD + 会话状态
@@ -116,14 +119,14 @@
 - **语言与依赖**：C11，外加几个 Objective-C 文件做 Metal 桥。链接的只有 macOS 系统框架——Accelerate、Metal、CoreImage、ImageIO、CoreGraphics——以及系统自带的 `sqlite3`。没有 Python，没有 BLAS，没有运行期转换步骤。语音的 `.pt` 张量由一个纯 C 的 zip/pickle 读取器（`rt_torch.c`）就地读取，任何 checkpoint 都不做格式转换。
 - **一个二进制，四个子命令**：`setup`（生成合成验证模型）、`run`（单条 prompt，或多条一起批解码）、`serve`（API 服务）、`doctor`（读一遍常驻字节并打印内存计划）。
 - **web 控制台是编译进去的**（`src/webui_embed.c`），所以 `--web` 不需要磁盘上的静态资源，也没有第二个进程；应用是 `apps/` 下的文件，由同一个服务端托管，状态进 sqlite。
-- **七个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像、视频或语音模型会先释放文本引擎，切回来再释放它。
+- **八个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像、视频或语音模型会先释放文本引擎，切回来再释放它。
 
 ## 快速开始
 
 ### 0. 前置条件
 
 - Apple Silicon 上的 macOS，以及 `clang`。别的都不要——内存设计点见[支持的硬件](#支持的硬件)。
-- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，视频模型常驻 ≈72 GiB（Ref2VA 子集，完整目录含两个分区），语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
+- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5 或 Inkling-2-Mini）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，视频模型常驻 ≈72 GiB（Ref2VA 子集，完整目录含两个分区），语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
 
 ### 1. 构建与测试
 
@@ -150,6 +153,14 @@ make test       # 验证套件：引擎、采样、前缀缓存、服务端、�
 
 下载好的目录**本身就是**模型根目录：`config.json` 加分片就是加载器要的全部，契约校验器会拒绝那些质量参数被改过的 checkpoint。
 
+文本+图像模型可这样下载：
+
+```sh
+./download_model.sh thinkingmachines/Inkling-2-Mini \
+    -o ./models/thinkingmachines/Inkling-2-Mini \
+    --include '*.safetensors' '*.json' -j 2
+```
+
 ### 3. 起服务
 
 ```sh
@@ -157,6 +168,10 @@ sh ./start.sh glm              # GLM-5.3-flash，      0.0.0.0:8001，500K 上�
 sh ./start.sh deepseek         # DeepSeek-V4.1-Flash，同上
 sh ./start.sh minimax          # MiniMax-M3.1-Flash，32K 上下文（KV 是 2.3 KiB/位置/层）
 sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 GiB 加载期即 wire 常驻）
+
+# Inkling-2-Mini 使用独立的多模态服务配置
+./cwick serve --root ./models/thinkingmachines/Inkling-2-Mini \
+  --backend metal --context 32768 --port 8001 --web --jev
 ```
 
 Qwen3.5 这个 checkpoint 对客户端暴露的名字是
@@ -197,6 +212,63 @@ curl -N localhost:8001/v1/chat/completions \
 
 流式与非流式用的是同一个请求；加 `reasoning_effort` 就是调思考深度，加 `tools` 数组就会返回 `tool_calls`。任何 OpenAI 兼容客户端都能接上来——桌面聊天应用、编程 Agent，或内置控制台。`POST /v1/responses` 是同一个引擎的 Responses 方言（输入 `input` items，输出 `response` 对象或 `response.*` 事件），给说那套 API 的客户端用；字段与事件清单在 [docs/SERVER.zh-CN.md](docs/SERVER.zh-CN.md#responses-api)。`POST /v1/messages` 是 Anthropic 那一套——Claude Code 说的就是它——`system`、content blocks、`tool_use`/`tool_result`、`thinking.budget_tokens`，流是 `message_start…message_stop`。三种方言打的是同一个引擎，具名 API key 与 `x-api-key` 都能鉴权。内置控制台三种都说：面板上的**接口**选择决定这一轮发给哪个端点，而三种方言渲染进同一套气泡、工具卡片和统计行。
 
+### 用 Inkling-2-Mini 理解文本与图像
+
+`Inkling-2-Mini` 的四个接口都接受文本和本地图片。一轮可以带多张图片，也
+可以只发图片。图片输入使用 base64 或 `data:image/...;base64,...` URL；远程
+HTTP URL 会被拒绝。Chat Completions、Responses、Anthropic Messages 和
+System One 共用同一套视觉塔与图片占位符展开逻辑。
+
+```sh
+IMAGE=$(base64 -i corn.jpg | tr -d '\n')
+
+# OpenAI Chat Completions
+curl -s http://127.0.0.1:8001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_tokens\":128,
+       \"messages\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$IMAGE\"}}]}]}"
+
+# OpenAI Responses
+curl -s http://127.0.0.1:8001/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_output_tokens\":128,
+       \"input\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"input_text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,$IMAGE\"}]}]}"
+
+# Anthropic Messages
+curl -s http://127.0.0.1:8001/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_tokens\":128,
+       \"messages\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"image\",\"source\":{\"type\":\"base64\",
+           \"media_type\":\"image/jpeg\",\"data\":\"$IMAGE\"}}]}]}"
+
+# System One：只 prefill，不生成 token，stream/thinking 保持关闭
+curl -s http://127.0.0.1:8001/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"state\":\"Image input.\",
+       \"images\":[\"data:image/jpeg;base64,$IMAGE\"],
+       \"questions\":{\"vegetable\":{\"type\":\"choice\",
+         \"instructions\":\"What vegetable is shown in the image?\",
+         \"criteria\":[\"corn\",\"carrot\",\"potato\"]}}}"
+```
+
+三种聊天方言也支持带图片的流式请求，SSE 事件形状不变。工具结果和
+function-call output 可以在同一段历史里携带图片。内置 Web 控制台支持多图
+选择、粘贴、拖放、预览/删除和纯图片轮次；图片 blob 以 64 MiB 上限存进
+IndexedDB，localStorage 只存引用，因此刷新后历史仍能回放。System One 模式
+发送同一份有序图片列表，并关闭 stream、tools 和 thinking。
+
+Inkling 保留完整模型：全部 24 个存储层、三轮 loop、128 experts 与 top-8。
+NVFP4/MXFP8 打包专家保持常驻（18.19 GiB wired）；图像 prefill 只把激活专家
+即时反量化到临时 BF16 缓冲，decode 使用打包 Metal。全链路数据见
+[docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)，数值策略理由见
+[docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) §118。
+
 ### 日志与指标
 
 服务端把每条诊断打到 **stdout**，一事件一行，带墙上时间，请求在飞时还带请求号，所以并发日志照样能 grep：
@@ -216,7 +288,7 @@ decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)
 
 ### Web 控制台、模型库与应用市场
 
-`--web` 由二进制自己提供单页控制台——磁盘上没有静态资源，没有第二个进程，和 API 同端口。五个标签页：**对话**（流式，端点在 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 之间由面板上的**接口**选择切换，三者走同一条渲染路径，reasoning 与 tool calls 分区显示）、**应用**（应用市场）、**模型**（模型库）、**日志**（本进程的 stdout/stderr，环形缓冲，所以浏览器能跟住一个长期运行的 serve）、**设置**（控制台与设置合一）。设置页同时承载实时 `/v1/metrics`：解码速度、常驻内存、专家/前缀缓存命中率、TTFT 的四分钟趋势图；还有一个 Prometheus 指标浏览器：列出 `/v1/metrics` 全部序列的
+`--web` 由二进制自己提供单页控制台——磁盘上没有静态资源，没有第二个进程，和 API 同端口。五个标签页：**对话**（流式，端点在 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 之间由面板上的**接口**选择切换，三者走同一条渲染路径，reasoning 与 tool calls 分区显示）。输入区支持文件选择、粘贴、拖放多图，可预览/删除，图片以 IndexedDB 保存并在刷新后回放；System One 模式可发送带图决策并渲染选项与概率结果。**应用**（应用市场）、**模型**（模型库）、**日志**（本进程的 stdout/stderr，环形缓冲，所以浏览器能跟住一个长期运行的 serve）、**设置**（控制台与设置合一）。设置页同时承载实时 `/v1/metrics`：解码速度、常驻内存、专家/前缀缓存命中率、TTFT 的四分钟趋势图；还有一个 Prometheus 指标浏览器：列出 `/v1/metrics` 全部序列的
 HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）为它单独画趋势，计数器还能切成每秒
 增量；再加 `cwick:model_info` 的全部标签、`cwick:model_loaded` 实时状态位、生成参数自定义、
 只读运行配置，以及本地模型切换（本构建无法装载的条目标为不支持且不可选）。设置页另有图像模型面板：显示 `image_model.dir` / `loaded`，可热装载 `MiniMax-H3-Image`。顶栏的**中 / EN**切换会原地重绘文案、让内容区淡入、把焦点移到视图标题；卡片入场、背景渐变与当前语言按钮的光晕构成动效，`prefers-reduced-motion` 下自动关闭。所有请求都是同源的，**没有**把控制台指向外部 OpenAI 兼容地址的选项；仍可签发具名 API key 供其他客户端接入本机 cwick。
@@ -243,9 +315,9 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | --- | --- | --- |
 | `--root DIR` | — | 模型根目录：`config.json` 加按发布原样的分片 |
 | `--host` / `--port` | `127.0.0.1` / `8000` | `start.sh` 绑 `0.0.0.0:8001` |
-| `--context N` | 131072 | KV 容量（token，>100K）；`run` 默认 4096。`start.sh` 用 500000，MiniMax 用 32768 |
+| `--context N` | 131072 | KV 容量（token，>100K）；`run` 默认 4096。`start.sh` 用 500000，MiniMax 用 32768，本文 Inkling 命令也用 32768 |
 | `--max-tokens N` | 1000000 | 请求没带 `max_tokens` 时的默认值，会被窗口裁到剩余空间；`start.sh` 传 8192 |
-| `--backend metal\|cpu` | Apple Silicon 上为 metal | 专家 GEMV、批式投影，以及 Qwen3.5 的整个 decode 步都在 GPU 上 |
+| `--backend metal\|cpu` | Apple Silicon 上为 metal | 专家 GEMV、批式投影、Inkling 打包专家，以及 Qwen3.5 的整个 decode 步都在 GPU 上 |
 | `--mem-fraction PCT` | 80 | 本进程可占用的宿主内存比例 |
 | `--max-memory GiB` | — | 绝对上限，更小时优先 |
 | `--allow-swap` | 关 | 不再锁 wired（只用于调试放不下的计划） |
@@ -276,10 +348,10 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | GET | `/v1/videos/{id}` | 轮询任务：`status`、`progress`、`phase`、`steps_done` / `steps_total`；完成后带 `cwick` 对象，含逐阶段计时、`spatial_corr`、`snr_db`、`suspect_noise` |
 | GET | `/v1/videos/{id}/content` | 流式返回完成的 mp4 |
 | POST | `/v1/completions` | 纯文本补全，流式或非流式 |
-| POST | `/v1/chat/completions` | messages、`stream`、`tools`、`reasoning_effort` |
-| POST | `/v1/responses` | Responses 方言：输入 `input` items，输出 `response` 对象 / `response.*` 事件 |
-| POST | `/v1/messages` | Anthropic 方言：输入 `system` + content blocks，输出 `message` 对象 / `message_start…message_stop` |
-| POST | `/v1/systemone` | 一次 prefill 读出类型化决策（choice / score / noul），需要 `--jev`；也可用 `/inference/v1/systemone` |
+| POST | `/v1/chat/completions` | messages、`stream`、`tools`、`reasoning_effort`；Inkling 支持有序文本+图片 content |
+| POST | `/v1/responses` | Responses 方言：输入 `input` items，输出 `response` 对象 / `response.*` 事件；Inkling 支持 `input_image` |
+| POST | `/v1/messages` | Anthropic 方言：输入 `system` + content blocks，输出 `message` 对象 / `message_start…message_stop`；Inkling 支持 base64 `image` block |
+| POST | `/v1/systemone` | 一次 prefill 读出类型化决策（choice / score / noul），需要 `--jev`；Inkling 支持有序 `image` / `images`；也可用 `/inference/v1/systemone` |
 | GET | `/v1/systemone` | 当前决策适配器：家族、prompt 语法、可读字母、各项上限 |
 | GET | `/v1/hub/models` | `./models` 下已下载的 checkpoint，含大小与完整状态 |
 | DELETE | `/v1/hub/models/<name>` | 删除已下载的 checkpoint（递归，限制在 `./models` 内）；常驻模型或正在下载时返回 409 |
@@ -316,15 +388,17 @@ curl -s http://127.0.0.1:8001/v1/systemone \
 三种题型：`choice` 返回选中项和全部分布；`score` 返回概率加权的档位索引与 legend；
 `noul` 返回"陈述成立"的概率（两侧由 `criteria` 的 `{"true": …, "false": …}` 指定）。
 `state` 可以是字符串，也可以是任意 JSON 值；每个问题的 `instructions` 必填。一次请求
-最多十个问题，每个问题最多 26 个选项。对外发布的路径是 `/inference/v1/systemone`，
-`/v1/systemone` 是短写法。
+最多十个问题，每个问题最多 26 个选项。使用 `Inkling-2-Mini` 时，顶层 `image` 或
+`images` 接受与聊天接口相同的本地 base64/data URL；纯图片 state 默认使用
+`Image input.`。对外发布的路径是 `/inference/v1/systemone`，`/v1/systemone` 是短写法。
 
 **它跟着模型走。** 每个受支持的 checkpoint 有自己的 prompt 语法与答案拼写：GLM 与
 DeepSeek 用"思考块已关闭"的那一轮（`glm-chat-closed`、`deepseek-chat-closed`），MiniMax
-用它的普通对话轮（`minimax-chat-plain`）。适配器在 tokenizer 加载时解析一次，之后每次
+用它的普通对话轮（`minimax-chat-plain`），Inkling 用 `inkling2-chat-plain`。适配器在
+tokenizer 加载时解析一次，之后每次
 `POST /v1/models/switch` 都重新解析——切换模型就是切换这个端点底下的接口，不存在"拿
 MiniMax 的 prompt 去读 GLM logits"的路径。`GET /v1/systemone` 公布当前生效的那一个；
-`make jevprobe` 只读 tokenizer、不加载权重，逐字母打印 token 表（三个自带 checkpoint
+`make jevprobe` 只读 tokenizer、不加载权重，逐字母打印 token 表（五个自带文本 checkpoint
 都是 26/26、带前导空格）。
 
 请求里写了服务端已不再服务的模型名，会被 400 拒绝并点名当前常驻模型。这是有意的：一个
@@ -338,6 +412,8 @@ argmax。
 成本是每个问题一次 prefill；同一问题的所有选项共用那一次前向，所以九宫格和两选一的代价
 一样。这台机器上，MiniMax 上 550 token 的一次决策是 95.5 s，320B 权重上一个三问请求是
 306 s——几乎全部都是 prefill，因为这个端点不生成 token，也没有别的东西可以摊薄。
+Inkling 的 550-token 三问请求为 20.92 s（26.30 tok/s），233-token 图像决策为
+32.81 s（含视觉，7.10 tok/s）。
 
 **一个请求里的问题共用同一段 prefill。** 每个问题都以同样的 `system` + `<state>` 那一轮开头，
 所以端点先把所有问题编码一遍，取 token 级最长公共前缀，只 prefill 一次，再从这里续着算每个
@@ -360,6 +436,7 @@ prefill；`usage` 照样报 `input_tokens`、`cached_input_tokens`、`prefilled_
 | DeepSeek-V4.1-Flash-1017 | 500K | 压缩 MLA | 6/384 × 40 层 | 2.8 tok/s |
 | MiniMax-M3.1-Flash | 32K | bf16 GQA，2.3 KiB/位置/层 | 4/128 × 57 层 | 1.48 tok/s |
 | Qwen3.5-9B | 128K | f32 GQA 64 KiB/位置 + 50 MiB DeltaNet 状态 | 无——稠密，整份常驻内存 | **20.0 tok/s** |
+| Inkling-2-Mini | 32K | 2.32 GiB KV + 卷积状态 | 8/128，NVFP4/MXFP8 打包 | **8.5–9.4 tok/s** |
 
 上下文不抽象，也不免费：MiniMax 上 500K 位置就是 64 GiB 的 KV，直接从专家缓存里出，也就是直接从 token 速率里出。这就是 `start.sh minimax` 把它压在 32K 的原因——量过，不是拍脑袋。
 
@@ -368,6 +445,12 @@ prefill；`usage` 照样报 `input_tokens`、`cached_input_tokens`、`prefilled_
 正因为如此，pin 缓存**不会**因为装得下就填到天花板：过了大约 RAM 的四分之一，压缩器开始收页，命中率还在涨而整个步反而变长，所以上限是 `host / 6`，背后的实测数字在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) §27。
 
 只待在天花板之下还不够，所以 spine 与专家 arena 默认**锁成 wired**：VM 既不能压缩也不能换出每个 token 都要读的那些字节。`--allow-swap` 可以关掉它，那是用来调试"计划放不下"的，不是用来长期跑的。
+
+Inkling-2-Mini 小到可以整份常驻：冷启动 3.57 s，18.19 GiB 打包权重与
+2.32 GiB 推理状态一起 wired。最终基准进程 physical footprint 为 22.4 GiB，
+`swapped_out=0K`。图像请求不长期保留第二份 BF16 专家副本，只为激活专家创建
+临时 BF16 缓冲。`CWICK_IK_DUAL_EXPERTS=1` 仅用于调试，不是默认，因为更大的
+工作集会让 packed prefill 明显变慢。
 
 ## 长 prompt 与前缀缓存
 
@@ -434,6 +517,12 @@ curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
 | Qwen3.5-9B | prefill，14,060 token 的 prompt | 184 s | **76.2** | 平的：两段 attention 都是 GEMM（DECISIONS §54） |
 | Qwen3.5-9B | prefill，30,970 token 的 prompt | 436 s | **71.0** | 30K 处仍有平地的 94%——一块里 attention 2.3 s、投影 4.5 s |
 | Qwen3.5-9B | 决策，3 题 / 525 token | 9.44 s | **55.6** | 三次 prefill，无 decode（见 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)） |
+| Inkling-2-Mini | 文本 prefill，86 token | 3.5–3.7 s | **23.3–24.8** | 全链路流式基准，`max_tokens=64` |
+| Inkling-2-Mini | 文本 decode | 106–117 ms/token | **8.5–9.4** | 同一批请求，packed Metal 专家 |
+| Inkling-2-Mini | 图像 prefill，126 token（96 图像） | 13.5–14.5 s | **8.7–9.3** | 视觉 + 激活专家按需 BF16 Metal GEMM |
+| Inkling-2-Mini | 图像 decode | 110–124 ms/token | **8.1–9.1** | 同一批请求，完整回答 `Corn` |
+| Inkling-2-Mini | 文本决策，3 题 / 550 token | 20.92 s | **26.3** | 无 decode |
+| Inkling-2-Mini | 图像决策，1 题 / 233 token | 32.81 s | **7.1** | `corn` p=0.999928，无 decode |
 
 三个非文本管线有自己的单位——一张图、一段 mp4 或一句话，不是 token 速率。都在同一台 M3 Max 上测得：
 
@@ -461,6 +550,7 @@ curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
 | DeepSeek-V4.1 | 2.78 tok/s | 约 18 GB，大多是 bf16 稠密 | 专家 fp4 GEMV 实测 58.5 GB/s |
 | MiniMax-M3.1 | 1.48 tok/s | 约 5 GiB 未命中 | 同 shard 读天花板；缓存超过 30 GiB 会喂给压缩器 |
 | Qwen3.5-9B | 20.0 tok/s | ~16.5 GB，全部常驻 | GPU 到内存的通路：实测 368 GB/s 中的 341（§61） |
+| Inkling-2-Mini | 9.4 tok/s | 从 18.19 GiB 常驻 arena 读取选中的打包专家 | 专家带宽 + 逐层主机同步 |
 
 限制是算术，不是少了一个优化：MoE 一步要搬 20–30 GB，CPU 集群最高读 123 GB/s，而引擎一次权重读取只产出一个 token（完整推导在 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)）。稠密模型恰好是这套推理失效的地方——16.5 GB 走 GPU 的 368 GB/s 就是每步 45 ms，它现在跑的正是这个数。同一条闭环在别处已经拿到的是 prefill 这一侧——MiniMax 上 550 token 95.5 s（5.8 tok/s），一个三问决策共享前缀后 102 s 而不是 214 s。稠密模型剩下的只有一个杠杆：一次权重读取产出多个 token。
 
@@ -483,13 +573,13 @@ curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
 Beta，且变化很快。每个改动都先在这台机器上量过才留下，输掉的那些写在 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) 里——包括那些看起来显而易见的。
 
 ```sh
-make test        # 804 项断言：引擎、采样、前缀缓存、服务端、web UI、应用、图像、视频、语音
+make test        # 869 项断言：引擎、采样、前缀缓存、服务端、web UI、应用、图像、视频、语音
 make bench       # 不加载 checkpoint 也能测内核
-make h3vprobe    # 视频管线探针，单独构建，不在 make test 内
+make h3vgpuprobe # Metal GEMM/attention 数值探针，无需 checkpoint
 make h3vmuxprobe # mp4 容器检查：avcC、ctts、stss
 ```
 
-正确性是锚定的，不靠肉眼：固定 prompt 必须产出固定的 top-1 token id 与 logit；每个内核改动都与参考实现互检到 1e-5（fp8 分块 GEMM 实测 8.3e-6，FP4 分组核与单行核逐位相同）。`cwick doctor` 会读一遍每个常驻字节加一段专家库抽样，所以坏分片在请求之前就被发现；`/v1/metrics` 发布的就是日志里打的同一份状态。
+正确性是锚定的，不靠肉眼：固定 prompt 必须产出固定的 top-1 token id 与 logit；每个内核改动都与参考实现互检到 1e-5（fp8 分块 GEMM 实测 8.3e-6，FP4 分组核与单行核逐位相同）。Inkling 的固定算术请求返回 `4`，三种图像接口均返回 `Corn`，图像 System One 以 0.999928 返回 `corn`。`cwick doctor` 会读一遍每个常驻字节加一段专家库抽样，所以坏分片在请求之前就被发现；`/v1/metrics` 发布的就是日志里打的同一份状态。
 
 ## 详细文档
 
@@ -532,6 +622,7 @@ cwick/
 │   ├── ds_*.c         DeepSeek-V4.1 后端：FP4 专家、FP8 attention
 │   ├── q35_*.c        Qwen3.5 后端：Gated DeltaNet + 门控 GQA，稠密 BF16
 │   ├── mm_*.c         MiniMax-M3.1 后端：NVFP4 专家、bf16 GQA
+│   ├── ik_*.c         Inkling-2-Mini 后端：循环 MoE、打包专家、视觉塔
 │   ├── h3*.c/.m       MiniMax-H3-Image：条件器、DiT、分块 VAE
 │   ├── h3v*.c/.m      MiniMax-H3 视频：Ref2VA DiT、时间/空间分块 VAE、mp4
 │   ├── rt_*.c         语音：.pt 读取、音频塔、thinker、talker、flow、HiFT、VAD
@@ -546,7 +637,7 @@ cwick/
 ├── apps/              四个 H5 应用与 manifest.json（井字棋、卡丁车、图像、TeachMe）
 ├── models/            在线下载的权重（.gitignore）
 ├── docs/              架构、存储、性能、决策、服务端、精度、图像、视频、语音
-├── tests/             test_cwick.c——804 项检查
+├── tests/             test_cwick.c——869 项检查
 ├── tools/             独立的 C 探针：内核、分层测试、模型运行器
 ├── start.sh           推荐入口（前缀缓存 + web + 局域网 + 密码）
 └── download_model.sh  可断点续传的 checkpoint 下载

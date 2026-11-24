@@ -33,6 +33,11 @@
   var $ = function (id) { return document.getElementById(id); };
   var LS_SESSIONS = 'cwick.sessions.v1';
   var LS_PREFS = 'cwick.prefs.v1';
+  var IMAGE_DB = 'cwick.images.v1';
+  var IMAGE_STORE = 'images';
+  var MAX_IMAGE_SIDE = 1024;
+  var MAX_DRAFT_IMAGES = 8;
+  var MAX_IMAGE_BYTES = 64 * 1024 * 1024;
   var MAX_ROUNDS = 4;                 /* tool-call round trips per turn */
   var EMPTY_HTML = '';                /* captured from the served document */
 
@@ -41,6 +46,9 @@
     sessions: [],
     currentId: null,
     busy: false,
+    sending: false,
+    imageBusy: false,
+    draftImages: [],
     abort: null,
     prefs: { api: 'chat', effort: 'extreme', maxTokens: 2048, stream: true, tools: false, lang: 'zh' },
     lastTokS: 0,
@@ -82,6 +90,376 @@
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
   /* ------------------------------------------------------------------ */
+  /* local images: blobs in IndexedDB, references in session JSON         */
+  /* ------------------------------------------------------------------ */
+  var imageDbPromise = null;
+  var imageCache = new Map();
+  var imageLoads = new Map();
+
+  function imageRef(image) {
+    if (!image || typeof image.id !== 'string' || !image.id) return null;
+    return {
+      id: image.id,
+      name: String(image.name || 'image'),
+      mime: String(image.mime || 'image/jpeg'),
+      width: Number(image.width) || 0,
+      height: Number(image.height) || 0,
+      size: Number(image.size) || 0,
+      createdAt: Number(image.createdAt) || 0
+    };
+  }
+  function storedSession(s) {
+    var out = {};
+    Object.keys(s).forEach(function (k) { if (k !== 'messages') out[k] = s[k]; });
+    out.messages = (s.messages || []).map(function (m) {
+      var copy = {};
+      Object.keys(m).forEach(function (k) { if (k !== 'images') copy[k] = m[k]; });
+      if (Array.isArray(m.images)) {
+        copy.images = m.images.map(imageRef).filter(Boolean);
+        if (!copy.images.length) delete copy.images;
+      }
+      return copy;
+    });
+    return out;
+  }
+  function sessionImages(s) {
+    var refs = [];
+    (s.messages || []).forEach(function (m) {
+      (m.images || []).forEach(function (image) {
+        var ref = imageRef(image);
+        if (ref) refs.push(ref);
+      });
+    });
+    return refs;
+  }
+  function referencedImageIds(extra) {
+    var ids = new Set();
+    state.sessions.forEach(function (s) {
+      sessionImages(s).forEach(function (image) { ids.add(image.id); });
+    });
+    (extra || []).forEach(function (image) {
+      var ref = imageRef(image);
+      if (ref) ids.add(ref.id);
+    });
+    return ids;
+  }
+  function releaseImage(id) {
+    var cached = imageCache.get(id);
+    if (cached && cached.url && cached.url !== cached.dataUrl) URL.revokeObjectURL(cached.url);
+    imageCache.delete(id);
+    imageLoads.delete(id);
+  }
+  function openImageDb() {
+    if (!window.indexedDB) return Promise.reject(new Error(t('chat.imageFailed') + 'IndexedDB'));
+    if (!imageDbPromise) {
+      imageDbPromise = new Promise(function (resolve, reject) {
+        var req = window.indexedDB.open(IMAGE_DB, 1);
+        req.onupgradeneeded = function () {
+          req.result.createObjectStore(IMAGE_STORE, { keyPath: 'id' });
+        };
+        req.onsuccess = function () { resolve(req.result); };
+        req.onerror = function () { reject(req.error || new Error('IndexedDB open failed')); };
+      });
+    }
+    return imageDbPromise;
+  }
+  function imageDbGet(id) {
+    return openImageDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var req = db.transaction(IMAGE_STORE, 'readonly').objectStore(IMAGE_STORE).get(id);
+        req.onsuccess = function () { resolve(req.result); };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+  function imageDbAll() {
+    return openImageDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var req = db.transaction(IMAGE_STORE, 'readonly').objectStore(IMAGE_STORE).getAll();
+        req.onsuccess = function () { resolve(req.result || []); };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+  function imageDbWrite(fn) {
+    return openImageDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(IMAGE_STORE, 'readwrite');
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error || new Error('IndexedDB write failed')); };
+        tx.onabort = function () { reject(tx.error || new Error('IndexedDB write aborted')); };
+        try { fn(tx.objectStore(IMAGE_STORE)); } catch (e) { reject(e); }
+      });
+    });
+  }
+  function discardImages(images) {
+    var candidates = new Set();
+    (images || []).forEach(function (image) {
+      var ref = imageRef(image);
+      if (ref) candidates.add(ref.id);
+    });
+    if (!candidates.size) return Promise.resolve();
+    var keep = referencedImageIds(state.draftImages);
+    var ids = [];
+    candidates.forEach(function (id) { if (!keep.has(id)) ids.push(id); });
+    if (!ids.length) return Promise.resolve();
+    return imageDbWrite(function (store) {
+      ids.forEach(function (id) { store.delete(id); });
+    }).then(function () {
+      ids.forEach(releaseImage);
+    }).catch(function () { /* localStorage deletion must still succeed */ });
+  }
+  function pruneOrphanImages() {
+    return imageDbAll().then(function (records) {
+      var keep = referencedImageIds(state.draftImages), orphans = [];
+      records.forEach(function (record) { if (!keep.has(record.id)) orphans.push(record); });
+      return discardImages(orphans);
+    }).catch(function () { /* storage can be unavailable in private browsing */ });
+  }
+  function ensureImageCapacity(bytes) {
+    return imageDbAll().then(function (records) {
+      var keep = referencedImageIds(state.draftImages), orphans = [], used = 0;
+      records.forEach(function (record) {
+        if (!keep.has(record.id)) orphans.push(record);
+        else used += Number(record.size) || (record.blob && record.blob.size) || 0;
+      });
+      if (used + bytes > MAX_IMAGE_BYTES) {
+        var err = new Error(t('chat.imageFull'));
+        err.code = 'image-full';
+        throw err;
+      }
+      if (!orphans.length) return;
+      return imageDbWrite(function (store) {
+        orphans.forEach(function (record) { store.delete(record.id); });
+      }).then(function () { orphans.forEach(function (record) { releaseImage(record.id); }); });
+    });
+  }
+  function fileDataUrl(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = function () { reject(new Error(t('chat.imageFailed') + file.name)); };
+      reader.readAsDataURL(file);
+    });
+  }
+  function blobDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsDataURL(blob);
+    });
+  }
+  /* Match the image studio's reference-image path: decode locally, fit within
+     1024px, and encode JPEG so the shared 8 MiB request ceiling stays useful. */
+  function shrinkImageFile(file) {
+    return fileDataUrl(file).then(function (dataUrl) {
+      return new Promise(function (resolve, reject) {
+        var img = new Image();
+        img.onload = function () {
+          try {
+            var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+            var scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(w, h));
+            var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+            var canvas = document.createElement('canvas');
+            canvas.width = cw; canvas.height = ch;
+            var ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, cw, ch);
+            ctx.drawImage(img, 0, 0, cw, ch);
+            canvas.toBlob(function (blob) {
+              if (blob) resolve({ blob: blob, width: cw, height: ch });
+              else reject(new Error(t('chat.imageFailed') + file.name));
+            }, 'image/jpeg', 0.82);
+          } catch (e) { reject(e); }
+        };
+        img.onerror = function () { reject(new Error(t('chat.imageFailed') + file.name)); };
+        img.src = dataUrl;
+      });
+    });
+  }
+  function cacheImage(record) {
+    return blobDataUrl(record.blob).then(function (dataUrl) {
+      var url = URL.createObjectURL ? URL.createObjectURL(record.blob) : dataUrl;
+      imageCache.set(record.id, {
+        blob: record.blob, dataUrl: dataUrl, url: url,
+        name: record.name, mime: record.mime, size: record.size
+      });
+      return imageCache.get(record.id);
+    });
+  }
+  function getImage(ref) {
+    var cached = imageCache.get(ref.id);
+    if (cached) return Promise.resolve(cached);
+    if (imageLoads.has(ref.id)) return imageLoads.get(ref.id);
+    var load = imageDbGet(ref.id).then(function (record) {
+      if (!record || !record.blob) throw new Error(t('chat.imageMissing'));
+      return cacheImage(record);
+    });
+    imageLoads.set(ref.id, load);
+    load.then(function () { imageLoads.delete(ref.id); },
+              function () { imageLoads.delete(ref.id); });
+    return load;
+  }
+  function hydrateImages(images) {
+    var unique = new Map();
+    (images || []).forEach(function (image) {
+      var ref = imageRef(image);
+      if (ref) unique.set(ref.id, ref);
+    });
+    return Promise.all(Array.from(unique.values()).map(getImage));
+  }
+  function hydrateSessionImages(session) {
+    return hydrateImages(sessionImages(session));
+  }
+  function imagePayload(ref) {
+    var cached = imageCache.get(ref.id);
+    if (!cached || !cached.dataUrl) throw new Error(t('chat.imageMissing'));
+    return {
+      url: cached.dataUrl,
+      base64: String(cached.dataUrl).split(',')[1] || '',
+      mime: ref.mime || cached.mime || 'image/jpeg'
+    };
+  }
+  function imageFigureHtml(image, draft) {
+    var ref = imageRef(image);
+    var meta = ref.width && ref.height ? ref.width + '×' + ref.height : fmtBytes(ref.size);
+    return '<figure class="msg-image loading" data-image-id="' + esc(ref.id) + '">' +
+      '<img hidden alt="' + esc(ref.name) + '">' +
+      (draft ? '<button type="button" class="image-remove" data-remove-image="' + esc(ref.id) +
+              '" aria-label="' + esc(t('chat.removeImage')) + '" title="' +
+              esc(t('chat.removeImage')) + '">×</button>' :
+       '<button type="button" class="image-remove" data-remove-history-image="' + esc(ref.id) +
+              '" aria-label="' + esc(t('chat.removeImage')) + '" title="' +
+              esc(t('chat.removeImage')) + '">×</button>') +
+      '<figcaption>' + esc(ref.name) + ' · ' + esc(meta) + '</figcaption></figure>';
+  }
+  function paintImageFigures(root, images) {
+    if (!root) return;
+    root.querySelectorAll('.msg-image[data-image-id]').forEach(function (figure) {
+      var ref = imageRef(images.filter(function (image) {
+        return image && image.id === figure.getAttribute('data-image-id');
+      })[0]);
+      if (!ref) return;
+      getImage(ref).then(function (cached) {
+        var img = figure.querySelector('img');
+        img.src = cached.url;
+        img.hidden = false;
+        figure.classList.remove('loading');
+      }).catch(function () {
+        figure.classList.remove('loading');
+        var caption = figure.querySelector('figcaption');
+        if (caption) caption.textContent = t('chat.imageMissing');
+      });
+    });
+  }
+  function renderDraftImages() {
+    var box = $('draftImages');
+    if (!box) return;
+    box.hidden = !state.draftImages.length;
+    box.innerHTML = state.draftImages.map(function (image) { return imageFigureHtml(image, true); }).join('');
+    box.querySelectorAll('.image-remove').forEach(function (button) {
+      button.disabled = state.busy || state.sending || state.imageBusy;
+    });
+    paintImageFigures(box, state.draftImages);
+  }
+  function removeDraftImage(id) {
+    var removed = state.draftImages.filter(function (image) { return image.id === id; });
+    state.draftImages = state.draftImages.filter(function (image) { return image.id !== id; });
+    renderDraftImages();
+    discardImages(removed);
+  }
+  function setHistoryImageControls() {
+    var box = $('messages');
+    if (!box) return;
+    box.querySelectorAll('[data-remove-history-image]').forEach(function (button) {
+      button.disabled = state.busy || state.sending;
+    });
+  }
+  function removeHistoryImage(id) {
+    if (state.busy || state.sending) return;
+    var s = current();
+    if (!s) return;
+    for (var i = 0; i < s.messages.length; i++) {
+      var m = s.messages[i];
+      if (!Array.isArray(m.images)) continue;
+      var removed = m.images.filter(function (image) { return image.id === id; });
+      if (!removed.length) continue;
+      m.images = m.images.filter(function (image) { return image.id !== id; });
+      if (!m.images.length) delete m.images;
+      saveSessions();
+      renderMessages();
+      discardImages(removed);
+      return;
+    }
+  }
+  function clearDraftImages() {
+    var removed = state.draftImages;
+    state.draftImages = [];
+    renderDraftImages();
+    discardImages(removed);
+  }
+  function restoreDraftImages(images, text) {
+    var seen = new Set(), merged = [];
+    (images || []).concat(state.draftImages).forEach(function (image) {
+      var ref = imageRef(image);
+      if (ref && !seen.has(ref.id)) { seen.add(ref.id); merged.push(ref); }
+    });
+    var dropped = merged.slice(MAX_DRAFT_IMAGES);
+    state.draftImages = merged.slice(0, MAX_DRAFT_IMAGES);
+    if (text && !$('input').value) $('input').value = text;
+    autoGrow();
+    renderDraftImages();
+    discardImages(dropped);
+  }
+  async function addImageFiles(files) {
+    if (state.busy || state.sending || state.imageBusy) return;
+    var list = Array.prototype.slice.call(files || []);
+    list = list.filter(function (file) {
+      return (file.type && file.type.indexOf('image/') === 0) || /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(file.name || '');
+    });
+    if (!list.length) { setStatus(t('chat.imageType')); return; }
+    var room = MAX_DRAFT_IMAGES - state.draftImages.length;
+    if (list.length > room) setStatus(t('chat.imageLimit'));
+    list = list.slice(0, Math.max(0, room));
+    state.imageBusy = true;
+    renderDraftImages();
+    setBusy(state.busy);
+    var added = 0, pendingId = null;
+    try {
+      for (var i = 0; i < list.length; i++) {
+        var small = await shrinkImageFile(list[i]);
+        var ref = imageRef({
+          id: uid(), name: list[i].name || 'image', mime: 'image/jpeg',
+          width: small.width, height: small.height, size: small.blob.size, createdAt: Date.now()
+        });
+        pendingId = ref.id;
+        await ensureImageCapacity(small.blob.size);
+        await imageDbWrite(function (store) {
+          store.put({ id: ref.id, name: ref.name, mime: ref.mime, width: ref.width,
+                      height: ref.height, size: ref.size, createdAt: ref.createdAt,
+                      blob: small.blob });
+        });
+        await cacheImage({ id: ref.id, name: ref.name, mime: ref.mime,
+                           size: ref.size, blob: small.blob });
+        state.draftImages.push(ref);
+        pendingId = null;
+        added++;
+        renderDraftImages();
+      }
+      if (added) setStatus(t('chat.imageAdded') + ' × ' + added);
+    } catch (e) {
+      if (pendingId) discardImages([{ id: pendingId }]);
+      setStatus(t(e && e.code === 'image-full' ? 'chat.imageFull' : 'chat.imageFailed') +
+                (e && e.code === 'image-full' ? '' : String(e && e.message ? e.message : e)));
+    } finally {
+      state.imageBusy = false;
+      renderDraftImages();
+      setBusy(state.busy);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* i18n — instant, no reload.                                          */
   /*                                                                     */
   /* Static text lives in the document as `data-i18n="key"`, and dynamic  */
@@ -112,11 +490,21 @@
       'view.settings.sub': '监控趋势与模型信息 · 自定义生成参数 · 切换本地模型 · 运行配置只读',
       'chat.emptyTitle': '在这台 Mac 上直接对话',
       'chat.emptyBody': '页面由 cwick 自己托管，请求发往同源的',
-      'chat.emptyBody2': '或',
-      'chat.emptyBody3': '（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。',
+      'chat.emptyBody2': '、',
+      'chat.emptyBody3': ' 或 ',
+      'chat.emptyBody4': '（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。',
       'chat.ex1': '解释 MoE 与低内存', 'chat.ex2': '写一段 C 代码', 'chat.ex3': '做一份计划',
       'chat.placeholder': '给 cwick 发消息…  Enter 发送 · Shift+Enter 换行',
+      'chat.attach': '添加本地图片（可多选，也可粘贴或拖入）',
+      'chat.removeImage': '移除图片', 'chat.imageLoading': '正在读取图片…',
+      'chat.imageMissing': '图片数据已不存在，请移除后重新添加',
+      'chat.imageAdded': '已添加图片', 'chat.imageFailed': '图片处理失败：',
+      'chat.imageType': '只支持图片文件', 'chat.imageLimit': '每轮最多添加 8 张图片',
+      'chat.imageFull': '本地图片存储已满（上限 64 MiB），请删除旧会话',
+      'chat.busyDelete': '当前会话正在生成，暂时不能删除',
+      'chat.imageTitle': '图片对话',
       'chat.api': '接口', 'chat.apiTip': '这一轮对话调用的接口：都走同一个引擎，只是请求/响应的信封不同',
+      'chat.systemQuestion': '决策问题', 'chat.systemOptions': '选项（逗号分隔）',
       'chat.effort': '思考强度', 'chat.maxOutput': '最大输出', 'chat.stream': '流式',
       'chat.tools': '示例工具', 'chat.toolsTip': '声明示例工具，模型调用时由页面在本地执行',
       'common.refresh': '刷新', 'common.loading': '读取中…',
@@ -159,11 +547,21 @@
       'view.settings.sub': 'Metric trends and model info · generation preferences · switch local models · read-only runtime config',
       'chat.emptyTitle': 'Talk to the model on this Mac',
       'chat.emptyBody': 'This page is served by cwick itself. Requests go to the same-origin',
-      'chat.emptyBody2': 'or',
-      'chat.emptyBody3': '(pick the API below). The model runs entirely on this machine, weights stream from SSD, and the conversation never leaves it.',
+      'chat.emptyBody2': ',',
+      'chat.emptyBody3': ' or ',
+      'chat.emptyBody4': '(pick the API below). The model runs entirely on this machine, weights stream from SSD, and the conversation never leaves it.',
       'chat.ex1': 'Explain MoE and low memory', 'chat.ex2': 'Write a C function', 'chat.ex3': 'Make a plan',
       'chat.placeholder': 'Message cwick…  Enter to send · Shift+Enter for a new line',
+      'chat.attach': 'Add local images (multiple, paste, or drag and drop)',
+      'chat.removeImage': 'Remove image', 'chat.imageLoading': 'Loading image…',
+      'chat.imageMissing': 'Image data is gone; remove it and add it again',
+      'chat.imageAdded': 'Image added', 'chat.imageFailed': 'Image processing failed: ',
+      'chat.imageType': 'Only image files are supported', 'chat.imageLimit': 'Up to 8 images per turn',
+      'chat.imageFull': 'Local image storage is full (64 MiB limit); delete older chats',
+      'chat.busyDelete': 'The current chat is generating and cannot be deleted yet',
+      'chat.imageTitle': 'Image chat',
       'chat.api': 'API', 'chat.apiTip': 'The endpoint this turn uses: all reach the same engine, only the request/response envelope differs',
+      'chat.systemQuestion': 'Decision question', 'chat.systemOptions': 'Options (comma separated)',
       'chat.effort': 'Reasoning', 'chat.maxOutput': 'Max output', 'chat.stream': 'Stream',
       'chat.tools': 'Sample tools', 'chat.toolsTip': 'Declare sample tools; the page executes them locally when the model calls them',
       'common.refresh': 'Refresh', 'common.loading': 'Loading…',
@@ -221,6 +619,7 @@
      * switching language cannot leave stale text in an active conversation. */
     if ($('emptyState')) EMPTY_HTML = $('emptyState').outerHTML;
     renderMessages();
+    renderDraftImages();
     renderModelInfoStrings();
     /* Content fade-in: re-trigger the animation on the main panel so the
      * change reads as a transition, not a jump. */
@@ -422,18 +821,31 @@
       if (raw) state.sessions = JSON.parse(raw) || [];
     } catch (e) { state.sessions = []; }
     if (!Array.isArray(state.sessions)) state.sessions = [];
+    state.sessions = state.sessions.filter(function (s) {
+      return s && typeof s === 'object' && Array.isArray(s.messages);
+    }).map(storedSession);
   }
   function saveSessions() {
-    /* 30 sessions is plenty for a GUI over a single local model; dropping the
-       oldest keeps the payload inside the 5 MB localStorage budget even with
-       long code-heavy answers. */
-    while (state.sessions.length > 30) state.sessions.pop();
+    /* Only image references reach localStorage; the blobs live in IndexedDB.
+       30 sessions plus a 64 MiB image-store ceiling keeps both stores bounded. */
+    var dropped = [];
+    while (state.sessions.length > 30) dropped.push(state.sessions.pop());
+    if (dropped.length) {
+      if (state.currentId && !state.sessions.some(function (s) { return s.id === state.currentId; }))
+        state.currentId = state.sessions[0] ? state.sessions[0].id : null;
+      discardImages(dropped.reduce(function (all, s) { return all.concat(sessionImages(s)); }, []));
+    }
     try {
-      localStorage.setItem(LS_SESSIONS, JSON.stringify(state.sessions));
+      localStorage.setItem(LS_SESSIONS, JSON.stringify(state.sessions.map(storedSession)));
     } catch (e) {
       /* Quota exceeded: drop the tail and retry once, then give up quietly. */
-      state.sessions = state.sessions.slice(0, Math.max(1, Math.floor(state.sessions.length / 2)));
-      try { localStorage.setItem(LS_SESSIONS, JSON.stringify(state.sessions)); } catch (e2) {}
+      var keep = Math.max(1, Math.floor(state.sessions.length / 2));
+      dropped = state.sessions.slice(keep);
+      state.sessions = state.sessions.slice(0, keep);
+      if (state.currentId && !state.sessions.some(function (s) { return s.id === state.currentId; }))
+        state.currentId = state.sessions[0] ? state.sessions[0].id : null;
+      discardImages(dropped.reduce(function (all, s) { return all.concat(sessionImages(s)); }, []));
+      try { localStorage.setItem(LS_SESSIONS, JSON.stringify(state.sessions.map(storedSession))); } catch (e2) {}
     }
   }
 
@@ -444,6 +856,7 @@
     return null;
   }
   function newSession() {
+    clearDraftImages();
     var s = { id: uid(), title: '新会话', messages: [], createdAt: Date.now() };
     state.sessions.unshift(s);
     state.currentId = s.id;
@@ -706,7 +1119,15 @@
     wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
 
     if (m.role === 'user') {
-      wrap.innerHTML = '<div class="body"><div class="bubble-user">' + esc(m.content) + '</div></div>';
+      var images = Array.isArray(m.images) ? m.images : [];
+      wrap.innerHTML = '<div class="body"><div class="bubble-user' + (images.length ? ' has-images' : '') + '">' +
+        (images.length ? '<div class="msg-images">' +
+          images.map(function (image) { return imageFigureHtml(image, false); }).join('') + '</div>' : '') +
+        '<div class="msg-text">' + esc(m.content) + '</div></div></div>';
+      wrap.querySelectorAll('[data-remove-history-image]').forEach(function (button) {
+        button.disabled = state.busy || state.sending;
+      });
+      paintImageFigures(wrap, images);
       return wrap;
     }
 
@@ -1057,10 +1478,43 @@
     return null;   /* message_stop, ping */
   }
 
+  function systemOneFull(data) {
+    var answer = data && data.answers && data.answers.decision;
+    var text = 'No decision returned';
+    if (answer) {
+      if (answer.type === 'choice') {
+        text = String(answer.choice || '');
+        if (answer.probabilities && answer.probabilities[answer.choice] != null)
+          text += ' (p=' + Number(answer.probabilities[answer.choice]).toFixed(4) + ')';
+      } else if (answer.type === 'score') text = 'score=' + Number(answer.score).toFixed(4);
+      else if (answer.type === 'noul') text = 'P(true)=' + Number(answer.noul).toFixed(4);
+    }
+    var usage = data && data.usage || {};
+    return {
+      id: data && data.model || 'systemone',
+      object: 'chat.completion', created: Math.floor(Date.now() / 1000),
+      model: data && data.model || apiModel(),
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: usage.input_tokens || 0,
+        completion_tokens: usage.output_tokens || 0,
+        total_tokens: usage.input_tokens || 0
+      }
+    };
+  }
+
   function normalizeApi(v) {
-    return v === 'responses' || v === 'messages' ? v : 'chat';
+    return v === 'responses' || v === 'messages' || v === 'systemone' ? v : 'chat';
   }
   function apiKind() { return normalizeApi(state.prefs.api); }
+  function updateApiMode() {
+    var system = apiKind() === 'systemone';
+    $('systemOneFields').hidden = !system;
+    $('streamToggle').disabled = system;
+    $('toolToggle').disabled = system;
+    $('effort').disabled = system;
+    $('maxTokens').disabled = system;
+  }
 
   /* One POST. Streaming requests are parsed as SSE; the caller only sees
      callbacks, so the tool loop and the single-shot path share this code. */
@@ -1068,6 +1522,7 @@
     var kind = apiKind();
     var path = kind === 'responses' ? '/responses'
              : kind === 'messages' ? '/messages'
+             : kind === 'systemone' ? '/systemone'
              : '/chat/completions';
     var mstate = msgStreamState();
     var ctrl = new AbortController();
@@ -1099,6 +1554,10 @@
         if (data && data.type === 'error')
           throw new ApiError(0, (data.error && data.error.message) || '生成失败');
         onEvent({ kind: 'full', data: msgFullToChat(data) });
+      } else if (kind === 'systemone') {
+        if (data && data.type === 'error')
+          throw new ApiError(0, (data.error && data.error.message) || '生成失败');
+        onEvent({ kind: 'full', data: systemOneFull(data) });
       } else {
         onEvent({ kind: 'full', data: data });
       }
@@ -1183,8 +1642,13 @@
         });
         return;
       }
-      input.push({ type: 'message', role: m.role,
-                   content: [{ type: 'input_text', text: m.content || '' }] });
+      var content = [];
+      if (m.content) content.push({ type: 'input_text', text: m.content });
+      (m.images || []).forEach(function (image) {
+        var data = imagePayload(image);
+        content.push({ type: 'input_image', image_url: data.url });
+      });
+      input.push({ type: 'message', role: m.role, content: content });
     });
     return { input: input, instructions: instructions.join('\n\n') };
   }
@@ -1271,7 +1735,15 @@
         out.push({ role: 'assistant', content: blocks });
         return;
       }
-      out.push({ role: 'user', content: [{ type: 'text', text: m.content || '' }] });
+      var blocks = [];
+      if (m.content) blocks.push({ type: 'text', text: m.content });
+      (m.images || []).forEach(function (image) {
+        var data = imagePayload(image);
+        blocks.push({ type: 'image', source: {
+          type: 'base64', media_type: data.mime, data: data.base64
+        } });
+      });
+      out.push({ role: 'user', content: blocks });
     });
     return { messages: out, system: system.join('\n\n') };
   }
@@ -1314,18 +1786,59 @@
         out.push(am);
         return;
       }
+      if (Array.isArray(m.images) && m.images.length) {
+        var parts = [];
+        if (m.content) parts.push({ type: 'text', text: m.content });
+        m.images.forEach(function (image) {
+          parts.push({ type: 'image_url', image_url: { url: imagePayload(image).url } });
+        });
+        out.push({ role: m.role, content: parts });
+        return;
+      }
       out.push({ role: m.role, content: m.content });
     });
     return out;
+  }
+
+  function systemOnePayload(session) {
+    var last = null;
+    for (var i = session.messages.length - 1; i >= 0; i--) {
+      if (session.messages[i].role === 'user') { last = session.messages[i]; break; }
+    }
+    var options = ($('systemOptions').value || '').split(',').map(function (s) {
+      return s.trim();
+    }).filter(Boolean);
+    if (options.length < 2 || options.length > 26)
+      throw new ApiError(0, 'System One needs 2..26 comma-separated options');
+    var criteria = {};
+    options.forEach(function (option) { criteria[option] = option; });
+    var payload = {
+      model: apiModel(),
+      state: last ? (last.content || (last.images && last.images.length ? 'Image input.' : '')) : '',
+      stream: false,
+      questions: { decision: {
+        type: 'choice',
+        instructions: $('systemQuestion').value || 'Which option best describes the input?',
+        criteria: criteria
+      } }
+    };
+    if (last && last.images && last.images.length)
+      payload.images = last.images.map(function (image) { return imagePayload(image).url; });
+    return payload;
   }
 
   /* ------------------------------------------------------------------ */
   /* one generation                                                      */
   /* ------------------------------------------------------------------ */
   async function generate(session, assistantMsg, streamEl) {
+    /* History is replayed on every turn. Resolve every referenced blob before
+       building any dialect so an image is never silently omitted. */
+    await hydrateSessionImages(session);
     var maxOut = Math.max(16, Number(state.prefs.maxTokens) || 2048);
     var payload;
-    if (apiKind() === 'responses') {
+    if (apiKind() === 'systemone') {
+      payload = systemOnePayload(session);
+    } else if (apiKind() === 'responses') {
       payload = responsesPayload(session, maxOut);
     } else if (apiKind() === 'messages') {
       payload = messagesPayload(session, maxOut);
@@ -1508,16 +2021,29 @@
   /* ------------------------------------------------------------------ */
   /* turn loop (send -> optional tool round trips -> final answer)        */
   /* ------------------------------------------------------------------ */
-  async function send(text) {
-    if (state.busy) return;
-    var s = current() || newSession();
-    if (!text.trim()) return;
+  async function send(text, images) {
+    if (state.busy || state.sending) return;
+    images = (images || []).map(imageRef).filter(Boolean);
+    if (!text.trim() && !images.length) return;
 
+    state.sending = true;
+    setBusy(state.busy);
+    try {
+      await hydrateImages(images);
+    } catch (e) {
+      restoreDraftImages(images, text);
+      setStatus(t('chat.imageFailed') + String(e && e.message ? e.message : e));
+      state.sending = false;
+      setBusy(false);
+      return;
+    }
+
+    var s = current() || newSession();
     if (!s.messages.length) {
-      s.title = text.trim().slice(0, 28) || '新会话';
+      s.title = text.trim().slice(0, 28) || (images[0] && images[0].name) || t('chat.imageTitle');
       renderSessions();
     }
-    s.messages.push({ role: 'user', content: text });
+    s.messages.push({ role: 'user', content: text, images: images });
     saveSessions();
 
     var box = $('messages');
@@ -1583,6 +2109,7 @@
     } finally {
       clearInterval(waitingTimer);
       $('queueNote').hidden = true;
+      state.sending = false;
       setBusy(false);
       state.abort = null;
       loadMetrics(true);
@@ -1591,10 +2118,14 @@
 
   function setBusy(b) {
     state.busy = b;
-    $('sendBtn').disabled = b;
-    $('sendBtn').hidden = b;
+    var locked = b || state.sending || state.imageBusy;
+    $('sendBtn').disabled = locked;
+    $('sendBtn').hidden = locked;
     $('stopBtn').hidden = !b;
     $('input').disabled = b;
+    $('attachBtn').disabled = locked;
+    renderDraftImages();
+    setHistoryImageControls();
   }
 
   function stop() {
@@ -3235,26 +3766,55 @@
     ta.style.height = Math.min(220, ta.scrollHeight) + 'px';
   }
 
+  function submitComposer() {
+    if (state.busy || state.sending || state.imageBusy) return;
+    var text = $('input').value;
+    var images = state.draftImages.slice();
+    if (!text.trim() && !images.length) return;
+    $('input').value = '';
+    state.draftImages = [];
+    autoGrow();
+    renderDraftImages();
+    send(text, images);
+  }
+
   function bind() {
-    $('sendBtn').addEventListener('click', function () {
-      var v = $('input').value;
-      $('input').value = '';
-      autoGrow();
-      send(v);
-    });
+    $('sendBtn').addEventListener('click', submitComposer);
     $('stopBtn').addEventListener('click', stop);
     $('leaveQueue').addEventListener('click', stop);
 
     $('input').addEventListener('keydown', function (e) {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        var v = $('input').value;
-        $('input').value = '';
-        autoGrow();
-        send(v);
+        submitComposer();
       }
     });
     $('input').addEventListener('input', autoGrow);
+    $('input').addEventListener('paste', function (e) {
+      var files = Array.prototype.slice.call((e.clipboardData && e.clipboardData.items) || [])
+        .filter(function (item) { return item.kind === 'file'; })
+        .map(function (item) { return item.getAsFile(); }).filter(Boolean);
+      if (files.length) { e.preventDefault(); addImageFiles(files); }
+    });
+
+    $('attachBtn').addEventListener('click', function () { $('imageInput').click(); });
+    $('imageInput').addEventListener('change', function () {
+      addImageFiles(this.files);
+      this.value = '';
+    });
+    $('draftImages').addEventListener('click', function (e) {
+      var button = e.target.closest('[data-remove-image]');
+      if (button && !button.disabled) removeDraftImage(button.getAttribute('data-remove-image'));
+    });
+    $('composer').addEventListener('dragover', function (e) {
+      if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0)
+        e.preventDefault();
+    });
+    $('composer').addEventListener('drop', function (e) {
+      if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+      e.preventDefault();
+      addImageFiles(e.dataTransfer.files);
+    });
 
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') stop();
@@ -3271,8 +3831,14 @@
       var row = e.target.closest('.session');
       if (!row || !row.dataset.id) return;
       if (del) {
+        if (state.busy && row.dataset.id === state.currentId) {
+          setStatus(t('chat.busyDelete'));
+          return;
+        }
+        var removed = state.sessions.filter(function (s) { return s.id === row.dataset.id; });
         state.sessions = state.sessions.filter(function (s) { return s.id !== row.dataset.id; });
         if (state.currentId === row.dataset.id) state.currentId = state.sessions[0] ? state.sessions[0].id : null;
+        discardImages(removed.reduce(function (all, s) { return all.concat(sessionImages(s)); }, []));
         saveSessions();
         renderSessions();
         renderMessages();
@@ -3284,6 +3850,11 @@
     });
 
     $('messages').addEventListener('click', function (e) {
+      var imageBtn = e.target.closest('[data-remove-history-image]');
+      if (imageBtn) {
+        removeHistoryImage(imageBtn.getAttribute('data-remove-history-image'));
+        return;
+      }
       var act = e.target.closest('.code-block button[data-act]');
       if (act) {
         var block = act.closest('.code-block');
@@ -3318,6 +3889,7 @@
       state.prefs.api = normalizeApi(this.value);
       savePrefs();
       $('setApi').value = state.prefs.api;
+      updateApiMode();
     });
     $('effort').addEventListener('change', function () {
       state.prefs.effort = this.value; savePrefs();
@@ -3394,6 +3966,7 @@
       state.prefs.api = normalizeApi(this.value);
       savePrefs();
       $('apiSel').value = state.prefs.api;
+      updateApiMode();
     });
     $('setEffort').addEventListener('change', function () {
       state.prefs.effort = this.value; savePrefs();
@@ -3462,6 +4035,7 @@
     $('setEffort').value = state.prefs.effort;
     $('setMaxTokens').value = state.prefs.maxTokens;
     $('setStream').checked = !!state.prefs.stream;
+    updateApiMode();
     $('setTools').checked = !!state.prefs.tools;
     $('pmRate').checked = !!pm.rate;
     pmSyncSelNote();
@@ -3480,6 +4054,7 @@
     pmLoad();
     loadLogPrefs();
     loadSessions();
+    pruneOrphanImages();
     restoreControls();
     restoreLogControls();
     bind();

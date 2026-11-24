@@ -38,9 +38,9 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   ImageIO / CoreGraphics) and the system `sqlite3` (`Makefile:15-16`). No third-party
   libraries, no Python, no weight-conversion step. One-off verification tools are plain C too
   (`tools/*.c`); shell only drives the compiler and the runs.
-- **Four model paths**: each owns its loader, forward pass and prompt template; they share
+- **Five model paths**: each owns its loader, forward pass and prompt template; they share
   only the process, the sampler and the server. Adding a model is one more entry, not a
-  rewrite of the others.
+  rewrite of the other four.
   - GLM-5.3-flash: `spine.c` (resident weights, memory plan), `engine.c` (request →
     prefill/decode), `attention.c` (MLA/GQA/DeltaNet), `moe.c` (routing + expert GEMV/GEMM);
   - DeepSeek-V4.1: `ds_model.c` / `ds_engine.c` / `ds_ops.c` / `ds_quant.c` / `ds_prompt.c`;
@@ -91,6 +91,11 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
     (`ABL=0..3`, `MODE`, `PF`, `RPF`, `TH`, `NSGV`), which is how its marginal row was traced
     to activation traffic rather than arithmetic. §62 is the verify and the drafter, §63 the
     per-row cost of the kernel that does it.
+  - Inkling-2-Mini: `ik.c` / `ik_engine.c` / `ik_prompt.c` / `ik_vision.c` (+ `ik.h`).
+    The complete 24-layer, three-pass loop model and its vision tower are resident and
+    wired; packed NVFP4/MXFP8 experts stay resident, image prefill dequantizes active
+    experts into temporary BF16 buffers, and decode uses packed Metal. Chat Completions,
+    Responses and Anthropic Messages share the same text/image/tool prompt path.
   Supporting a new model means a new loader + new dequantisation + a new prompt template
   + new kernels. **It is not a config change.**
 - **Quality rules are non-negotiable**: top-k comes from the checkpoint's own
@@ -111,6 +116,15 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
 - Three checkpoints end to end: load + `/v1/models` + generate + switch, verified
   numerically (DeepSeek is bit-exact across the whole chain; GLM gets a structural check
   from `doctor` — see `docs/PRECISION*.md`).
+- Inkling-2-Mini on Metal: full loop model + vision tower resident and wired, text and
+  image understanding through all three chat dialects and `/v1/systemone`, streaming and
+  buffered tool calls, tool-result replay, and Web image upload. Correctness anchors and
+  full-chain timings are in `docs/PERF.md`; forward fixes are in §117 and the packed/image
+  policy plus GPU-attention A/B are in §118 of `docs/DECISIONS.md`. GPU attention is
+  opt-in (`CWICK_IK_GPU_ATTN=1`); the default is the correctness-verified CPU path.
+- The bundled Web composer accepts multiple local images, stores bounded blobs in
+  IndexedDB, replays them through Chat Completions, Responses and Anthropic Messages,
+  and can submit image-only System One choices with a question and option list.
 - Realtime speech (`--rt`, `Sophon-Realtime-32B-Tag`): WebSocket `/v1/realtime`,
   audio frontend + 64-layer thinker + talker/flow/HiFT, streaming PCM16 replies
   and per-turn timing, verified end to end on Metal (53 audio deltas / 10.44 s
@@ -151,8 +165,9 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   `make jevprobe` prints the letter table from a tokenizer alone. The wire format
   follows the published decision protocol: `state` is a string or any JSON value,
   `noul`'s `criteria` names its two sides (true first, always), `instructions` is
-  required, `stream`/`reasoning_effort`/`thinking`/`images` are refused by name, and
-  the status is 422 for "not a decision request" against 400 for "will not serve it".
+  required, `stream`/`reasoning_effort`/`thinking` are refused by name, and Inkling
+  accepts ordered `image`/`images` inputs while text-only models refuse them. The
+  status is 422 for "not a decision request" against 400 for "will not serve it".
   Ten questions and 26 options are the deliberate differences (`docs/DECISIONS.md` §48).
 - Context: `--context` is KV capacity; `serve` defaults to 131072, `start.sh` uses 500000
   for GLM and DeepSeek and 32768 for MiniMax (its KV is 2.3 KiB per position per layer, so
@@ -227,7 +242,7 @@ ceiling, not a missing optimisation — the numbers and the arithmetic are in `d
   queued. `/v1/models` and `/v1/hub/models` report `supported` (cached at
   discovery, so the polled list does no I/O under the generation lock), and
   `cwick:model_loaded` is the live 1/0 gauge.
-- `make test`: **651 assertions, all PASS** (`./tests/test_cwick` prints one `ok:` per check).
+- `make test`: **869 assertions, all PASS** (`./tests/test_cwick` prints one `ok:` per check).
 - `cwick doctor` and `download_model.sh` (resume, >100 GiB, one progress line).
 
 ### ⚠️ Known, and still usable
@@ -293,7 +308,7 @@ apps/             two H5 apps + manifest.json
 models/           downloaded checkpoints (gitignored, scanned at startup)
 docs/             architecture, storage, performance, decisions, server, precision,
                   DeepSeek port (each in English and Chinese)
-tests/test_cwick.c 651 assertions
+tests/test_cwick.c 869 assertions
 tools/            standalone C probes: kernel benchmarks, layer tests, model runners
 start.sh          recommended entry point: prefix cache + web + LAN + three model dirs
                   + password
@@ -327,7 +342,7 @@ start.sh          recommended entry point: prefix cache + web + LAN + three mode
 
 ```sh
 git clone <repo> cwick && cd cwick
-make && make test                      # ~12 s, 651 checks
+make && make test                      # full regression, 869 checks
 
 ./download_model.sh deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     -o ./deepseek-ai/DeepSeek-V4.1-Flash-1017 \

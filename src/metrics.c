@@ -211,6 +211,7 @@ static _Atomic uint64_t g_context_window;
 static _Atomic uint64_t g_model_weight_bytes, g_model_resident_bytes;
 static _Atomic uint64_t g_model_target_bytes, g_model_wired;
 static _Atomic uint64_t g_model_loaded;
+static _Atomic uint64_t g_ik_gpu_calls;
 static _Atomic uint64_t g_started_ns;
 
 static const cwick_stream *g_stream;     /* sampled at render time */
@@ -253,6 +254,10 @@ void cwick_metrics_init(const cwick_metrics_info *info) {
 }
 
 /* See metrics.h: the live residency gauge, written by the model-switch path. */
+void cwick_metrics_set_ik_gpu_calls(uint64_t calls) {
+    atomic_store_explicit(&g_ik_gpu_calls, calls, memory_order_relaxed);
+}
+
 void cwick_metrics_set_model_loaded(bool loaded) {
     atomic_store_explicit(&g_model_loaded, loaded ? 1u : 0u,
                           memory_order_relaxed);
@@ -605,7 +610,8 @@ char *cwick_metrics_render(size_t *out_len) {
      * showed backend="cpu" while the same log said the Metal backend was up,
      * and there was no way to tell which of the two was stale. The predicate is
      * cached inside metal.c, so this costs a load, not a device probe. */
-    const char *backend = cwick_metal_gemv_on_gpu() ? "metal" : "cpu";
+    const char *backend = (atomic_load_explicit(&g_ik_gpu_calls, memory_order_relaxed) > 0 ||
+                           cwick_metal_gemv_on_gpu()) ? "metal" : "cpu";
 
     /* ---- static configuration (vLLM's *info* pattern) ---- */
     buf_reserve(&b, 1024);
@@ -700,6 +706,9 @@ char *cwick_metrics_render(size_t *out_len) {
      * named that way and no longer shadow a vLLM metric. */
     uint64_t hits = atomic_load_explicit(&m_expert_hits, memory_order_relaxed);
     uint64_t misses = atomic_load_explicit(&m_expert_misses, memory_order_relaxed);
+    emit_counter(&b, "cwick:ik_gpu_linear_calls_total",
+                 "Inkling linear projections completed by Metal.",
+                 atomic_load_explicit(&g_ik_gpu_calls, memory_order_relaxed));
     emit_counter(&b, "cwick:expert_cache_queries_total",
                  "Expert-weight lookups (hits + misses).", hits + misses);
     emit_counter(&b, "cwick:expert_cache_hits_total",

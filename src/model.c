@@ -635,6 +635,69 @@ static cwick_status q35_spec_fill(json_value *root, json_value *cfg,
     return CWICK_OK;
 }
 
+/* Inkling-2-Mini (inkling2_loop). The generic fields are filled from
+ * text_config so the server, the tokenizer and the metrics registry see the
+ * geometry they expect; the kernels themselves read their own ik_cfg out of
+ * the same file, because half of this architecture (the banked residual, the
+ * re-run core, the per-pass caches) has no place in a decoder-shaped spec. */
+static cwick_status ik_spec_fill(json_value *root, json_value *cfg,
+                                 const char *dir, cwick_model_spec *spec,
+                                 cwick_error *err) {
+    (void)dir;
+    spec->quant = CWICK_QUANT_BF16;   /* NVFP4/MXFP8 experts decode in ik.c */
+    snprintf(spec->dtype, sizeof(spec->dtype), "bfloat16");
+    spec->num_experts = ds_int(cfg, root, "n_routed_experts", 0);
+    spec->num_experts_per_token = ds_int(cfg, root, "num_experts_per_tok", 0);
+    if (spec->num_experts_per_token <= 0 || spec->num_experts <= 0) {
+        cwick_error_set(err, CWICK_ERR_CONTRACT,
+                        "inkling2 config is missing its MoE geometry");
+        return CWICK_ERR_CONTRACT;
+    }
+    spec->hidden_size = ds_int(cfg, root, "hidden_size", 0);
+    spec->num_hidden_layers = ds_int(cfg, root, "num_hidden_layers", 0);
+    spec->vocab_size = ds_int(cfg, root, "unpadded_vocab_size",
+                              ds_int(cfg, root, "vocab_size", 0));
+    spec->num_attention_heads = ds_int(cfg, root, "num_attention_heads", 0);
+    spec->num_key_value_heads = ds_int(cfg, root, "num_key_value_heads", 0);
+    spec->head_dim = ds_int(cfg, root, "head_dim", 0);
+    spec->qk_head_dim = spec->head_dim;
+    spec->intermediate_size = ds_int(cfg, root, "intermediate_size", 0);
+    spec->moe_intermediate_size = spec->intermediate_size;
+    spec->max_position_embeddings = ds_int(cfg, root, "model_max_length", 0);
+    spec->rms_norm_eps_f = (float)ds_num(cfg, root, "rms_norm_eps", 1e-6);
+    spec->rms_norm_eps = (int64_t)spec->rms_norm_eps_f;
+    spec->short_conv_kernel_size = ds_int(cfg, root, "sconv_kernel_size", 4);
+    spec->attn_res_block_size = ds_int(cfg, root, "n_layers_per_attn_res_block", 0);
+    spec->routed_scaling_factor = (float)ds_num(cfg, root, "route_scale", 1.0);
+    spec->activation_situ_beta = (float)ds_num(cfg, root, "mlp_gate_softcap", 4.0);
+    spec->activation_situ_linear_beta = (float)ds_num(cfg, root, "mlp_up_softcap", 25.0);
+    if (spec->hidden_size <= 0 || spec->num_hidden_layers <= 0 ||
+        spec->vocab_size <= 0) {
+        cwick_error_set(err, CWICK_ERR_CONTRACT,
+                        "inkling2 config has no usable geometry");
+        return CWICK_ERR_CONTRACT;
+    }
+    spec->layers = cwick_xmalloc((size_t)spec->num_hidden_layers *
+                                 sizeof(cwick_layer_kind));
+    for (int64_t i = 0; i < spec->num_hidden_layers; i++)
+        spec->layers[i] = CWICK_LAYER_GQA;
+
+    int64_t eos = ds_int(root, cfg, "eos_token_id", -1);
+    if (eos < 0) {
+        cwick_error_set(err, CWICK_ERR_CONTRACT,
+                        "inkling2 config is missing eos_token_id");
+        return CWICK_ERR_CONTRACT;
+    }
+    spec->eos_token_id = eos;
+    spec->bos_token_id = 199999;
+    spec->pad_token_id = 199999;
+    /* <|end_message|> separates reasoning, text and tool-call records inside
+     * one turn. Only the checkpoint EOS terminates generation. */
+    spec->n_eos = 0;
+    spec->eos_ids[spec->n_eos++] = eos;
+    return CWICK_OK;
+}
+
 cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
                                  cwick_error *err) {
     cwick_error_clear(err);
@@ -693,6 +756,15 @@ cwick_status cwick_model_spec_load(const char *path, cwick_model_spec *spec,
         char *slash = strrchr(dir, '/');
         if (slash) *slash = '\0';
         cwick_status st = q35_spec_fill(root, cfg, dir, spec, err);
+        cwick_json_free(root);
+        return st;
+    }
+    if (strncmp(model_type, "inkling2", 8) == 0) {
+        char dir[1152];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *slash = strrchr(dir, '/');
+        if (slash) *slash = '\0';
+        cwick_status st = ik_spec_fill(root, cfg, dir, spec, err);
         cwick_json_free(root);
         return st;
     }

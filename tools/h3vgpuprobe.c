@@ -110,6 +110,65 @@ int main(int argc, char **argv) {
         free(x); free(w); free(want); free(got); free(wb); free(wbf);
     }
 
+    /* Small activation tiles: routed experts usually contribute only a few
+     * rows, so the 16-row kernel must match the same BF16 reference. */
+    {
+        int rows = 13, k = 256, cols = 192;
+        float *x = f32((size_t)rows * k), *w = f32((size_t)cols * k);
+        float *want = f32((size_t)rows * cols), *got = f32((size_t)rows * cols);
+        fill(x, (size_t)rows * k); fill(w, (size_t)cols * k);
+        uint16_t *wb = bf((size_t)cols * k);
+        for (int i = 0; i < cols * k; i++) {
+            uint32_t u; memcpy(&u, &w[i], 4);
+            wb[i] = (uint16_t)(u >> 16);
+        }
+        for (int i = 0; i < cols * k; i++) w[i] = cwick_bf16_fast(wb[i]);
+        cpu_gemm(want, x, w, rows, k, cols, k, cols);
+        if (!h3v_gpu_gemm_bf16(x, wb, got, rows, k, cols, k, cols)) {
+            printf("gemm_bf16_small: dispatch failed\n"); rc = 1;
+        } else {
+            double d = worst_diff(want, got, (size_t)rows * cols);
+            printf("gemm_bf16_small worst=%.6g\n", d);
+            if (d > 0.05) { printf("  FAIL\n"); rc = 1; }
+        }
+        free(x); free(w); free(want); free(got); free(wb);
+    }
+
+    /* Mixed small/large items in one concurrent batch. */
+    {
+        int rows[2] = {13, 65}, k = 256, cols = 192;
+        h3v_gpu_bf16_item items[2];
+        float *x[2], *w = f32((size_t)cols * k), *want[2], *got[2];
+        uint16_t *wb = bf((size_t)cols * k);
+        fill(w, (size_t)cols * k);
+        for (int i = 0; i < cols * k; i++) {
+            uint32_t u; memcpy(&u, &w[i], 4);
+            wb[i] = (uint16_t)(u >> 16);
+            w[i] = cwick_bf16_fast(wb[i]);
+        }
+        for (int j = 0; j < 2; j++) {
+            x[j] = f32((size_t)rows[j] * k);
+            want[j] = f32((size_t)rows[j] * cols);
+            got[j] = f32((size_t)rows[j] * cols);
+            fill(x[j], (size_t)rows[j] * k);
+            cpu_gemm(want[j], x[j], w, rows[j], k, cols, k, cols);
+            items[j] = (h3v_gpu_bf16_item){x[j], wb, got[j], rows[j], k, cols, k, cols};
+        }
+        if (!h3v_gpu_gemm_bf16_batch(items, 2)) {
+            printf("gemm_bf16_batch: dispatch failed\n"); rc = 1;
+        } else {
+            double d = 0;
+            for (int j = 0; j < 2; j++) {
+                double dj = worst_diff(want[j], got[j], (size_t)rows[j] * cols);
+                if (dj > d) d = dj;
+            }
+            printf("gemm_bf16_batch worst=%.6g\n", d);
+            if (d > 0.05) { printf("  FAIL\n"); rc = 1; }
+        }
+        for (int j = 0; j < 2; j++) { free(x[j]); free(want[j]); free(got[j]); }
+        free(w); free(wb);
+    }
+
     /* Release-layout QKV: weight rows are [q|k|v] per head. The kernel must
      * select one plane per dispatch, not three contiguous thirds. */
     {

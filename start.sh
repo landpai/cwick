@@ -68,6 +68,12 @@ case "$1" in
         # of the expert cache, which is what the token rate actually runs on.
         ROOT=./models/MiniMaxAI/MiniMax-M3.1-Flash
         CTX=32768 ;;
+    ik)
+        # 32K positions, not 500K: this checkpoint's KV is bf16 GQA at 2.3 KiB
+        # per position per layer, so 500K would be 64 GiB of cache -- taken out
+        # of the expert cache, which is what the token rate actually runs on.
+        ROOT=./models/thinkingmachines/Inkling-2-Mini
+        CTX=32768 ;;
     ""|ds|deepseek|deepSeek-v4.1-flash-1017)
         ROOT=./models/deepseek-ai/DeepSeek-V4.1-Flash-1017
         CTX=500000 ;;

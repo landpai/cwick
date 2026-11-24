@@ -16,6 +16,8 @@
 #ifndef CWICK_H
 #define CWICK_H
 
+typedef struct cwick_tokenizer cwick_tokenizer;
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -65,6 +67,7 @@ typedef enum {
     CWICK_LAYER_MLA = 0,   /* full (softmax) attention with latent KV (legacy) */
     CWICK_LAYER_KDA = 1,   /* linear (recurrent) attention with short conv */
     CWICK_LAYER_DSA = 2,   /* deepseek sparse attention with indexer (GLM-5.3) */
+    CWICK_LAYER_GQA = 3,   /* full attention with dense K/V heads */
 } cwick_layer_kind;
 
 /* Released weight representation. The real GLM-5.3-Flash checkpoint ships as
@@ -527,6 +530,31 @@ int cwick_metal_bf16_batch_add(void *batch, const void *w_bf16,
                               const float *x, float *out,
                               int64_t k, int64_t cols);
 int cwick_metal_bf16_batch_end(void *batch);
+
+/* Resident Inkling packed-expert GEMVs. Each item is one activation row and
+ * one packed expert matrix; format is 1 for NVFP4 and 2 for MXFP8. `half` maps
+ * interleaved W13 rows to gate/up output halves (0 for W2). Weights and scales
+ * are bound as cached no-copy views, never copied into a staging buffer. */
+void cwick_metal_adopt(const void *base, size_t len);
+int cwick_metal_ik_packed_ready(void);
+void *cwick_metal_ik_packed_batch_begin(void);
+int cwick_metal_ik_packed_batch_add(void *batch, const void *packed,
+                                    const void *scale, float global_scale,
+                                    const float *x, float *out,
+                                    int64_t k, int64_t cols, int64_t half,
+                                    int format);
+int cwick_metal_ik_packed_batch_end(void *batch);
+
+/* Fused packed expert pair. W13, SiTU (including the routing weight and BF16
+ * boundary), and W2 run in one command buffer with one host wait. */
+void *cwick_metal_ik_pair_batch_begin(void);
+int cwick_metal_ik_pair_batch_add(void *batch,
+        const void *w13, const void *s13, float g13,
+        const void *w2, const void *s2, float g2,
+        const float *x, float *out, float gamma,
+        int64_t k, int64_t cols, int64_t k2, int64_t cols2,
+        int64_t half, int format, float gate_cap, float up_cap);
+int cwick_metal_ik_pair_batch_end(void *batch);
 
 /* ---- batched GEMV ---------------------------------------------------
  * One Metal dispatch per expert matrix costs far more in launch latency than
@@ -1102,6 +1130,48 @@ void cwick_engine_set_req_tag(cwick_engine *eng, const char *tag);
  * unlabelled form. */
 void cwick_engine_set_decode_phase(cwick_engine *eng, const char *phase);
 
+/* Hand a backend the vision tower's output for the turn about to be encoded.
+ * The placeholder tokens in the prompt are replaced, in order, by these
+ * `n_tokens` vectors of `spec.hidden_size` floats; every backend without a
+ * vision tower ignores it. The array is borrowed only until the generation
+ * call returns. */
+cwick_status cwick_engine_set_images(cwick_engine *eng, const float *embeds,
+                                     int64_t n_tokens,
+                                     const int64_t *image_tokens, size_t n_images,
+                                     cwick_error *err);
+/* Decode an image and run it through the resident vision tower. Returns one
+ * embedding per placeholder token the chat renderer emitted for that image. */
+int cwick_engine_vision_embed(cwick_engine *eng, const uint8_t *data, size_t len,
+                              float **embeds, int64_t *n_tokens, int64_t *rows,
+                              int64_t *cols, cwick_error *err);
+
+/* Reusable, owned vision batch. `image_tokens[i]` is the number of placeholder
+ * rows contributed by image i; the engine installs a copy for each prefill. */
+typedef struct cwick_image_batch {
+    float *embeds;
+    int64_t n_tokens;
+    int64_t *image_tokens;
+    size_t n_images;
+} cwick_image_batch;
+
+/* Decode normalized base64 payloads and run the vision tower once per image. */
+cwick_status cwick_engine_prepare_images(cwick_engine *eng,
+                                         const char *const *images,
+                                         size_t n_images,
+                                         cwick_image_batch *batch,
+                                         cwick_error *err);
+void cwick_image_batch_free(cwick_image_batch *batch);
+/* Resolve the real placeholder ID and verify it against the resident model. */
+cwick_status cwick_engine_image_token_id(cwick_engine *eng,
+                                         const cwick_tokenizer *tok,
+                                         uint32_t *id_out, cwick_error *err);
+/* Replace each placeholder with its image's span of identical token IDs. */
+cwick_status cwick_expand_image_placeholders(const uint32_t *ids, int64_t n_ids,
+                                             uint32_t image_token_id,
+                                             const cwick_image_batch *batch,
+                                             uint32_t **out, int64_t *n_out,
+                                             cwick_error *err);
+
 /* Ask the engine to snapshot the state right after its next prefill into
  * `out` (see pfx.h). `out == NULL` cancels. One capture per request: the
  * engine clears the pointer once it has filled it, so the caller owns the
@@ -1220,6 +1290,12 @@ cwick_status cwick_engine_prefill_logits_at(cwick_engine *eng,
                                             const uint32_t *prompt,
                                             int64_t prompt_len, int64_t start_pos,
                                             float *logits_out, cwick_error *err);
+
+/* Reset once, install a reusable vision batch, then run one full prefill.
+ * Fails if any image embedding was not consumed by a placeholder. */
+cwick_status cwick_engine_prefill_logits_with_images(
+    cwick_engine *eng, const uint32_t *prompt, int64_t prompt_len,
+    const cwick_image_batch *batch, float *logits_out, cwick_error *err);
 
 /* ------------------------------------------------------------------ */
 /* Tokenizer (BPE over vocab.json + merges.txt, byte fallback)         */
@@ -1347,6 +1423,8 @@ typedef struct {
      * unrelated control token, so the pair cannot be inferred from the text. */
     const char *open_mk;
     const char *close_mk;
+    bool inkling;          /* message/content control records, not <think> */
+    bool assistant_header; /* Inkling role marker: hold a possible tool name */
 } cwick_stream_state;
 
 /* Classify the next emit-ready slice of an accumulated answer. `st` carries the
@@ -1381,6 +1459,8 @@ void cwick_phase_account_mk(const cwick_tokenizer *tok, const uint32_t *tokens,
 
 void cwick_phase_account(const cwick_tokenizer *tok, const uint32_t *tokens,
                         size_t n, bool is_chat, size_t out[3]);
+void cwick_phase_account_ik(const cwick_tokenizer *tok, const uint32_t *tokens,
+                            size_t n, size_t out[3]);
 
 /* Thinking intensity ("思考强度"). Five client-facing levels — 低 / 中 / 高 /
  * 超高 / 极致 — plus off. The checkpoint's chat template was trained with

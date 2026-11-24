@@ -22,7 +22,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <mach/mach_time.h>
 
 #include "h3v_gpu.h"
 
@@ -38,6 +40,12 @@ using namespace metal;
 #define TG_K 16
 #define AM 64
 #define AK 16
+
+static float bf16_rn(float x) {
+    uint u = as_type<uint>(x);
+    u += ((u >> 15) & 1u) + ((u >> 16) & 1u);
+    return as_type<float>(u & 0xffff0000u);
+}
 
 /* ---- projection kernels ------------------------------------------- */
 struct gargs { int rows, k, cols, lda, ldc; long woff; int qpart, qhd; };
@@ -123,6 +131,80 @@ kernel void gemm_bf16(device const float *A [[buffer(0)]],
     threadgroup bfloat tA[TG_M][TG_K];
     threadgroup bfloat tB[TG_N][TG_K];
     gemm_core<bfloat, simdgroup_bfloat8x8>(A, Wr, C, a, tg, lid, sgi, tC, tA, tB);
+}
+
+template<typename T, typename F>
+static void gemm_core_small(device const float *A,
+                            device const T *Wr,
+                            device float *C,
+                            constant gargs &a,
+                            uint2 tg,
+                            uint2 lid,
+                            uint sgi,
+                            threadgroup float (*tC)[TG_N],
+                            threadgroup T (*tA)[TG_K],
+                            threadgroup T (*tB)[TG_K]) {
+    constexpr int TM = 16;
+    device const T *W = (device const T *)((device const char *)Wr + a.woff);
+    int m0 = (int)tg.y * TM, n0 = (int)tg.x * TG_N;
+    int mg = (int)(sgi >> 1) * 8, ng = (int)(sgi & 1) * 32;
+    int lin = (int)lid.x;
+    simdgroup_float8x8 acc[1][4];
+    for (int i = 0; i < 1; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k0 = 0; k0 < a.k; k0 += TG_K) {
+        for (int pass = 0; pass < 2; pass++) {
+            int idx = pass * 128 + lin;
+            int r = idx / TG_K, c = idx % TG_K;
+            int gm = m0 + r, gk = k0 + c;
+            tA[r][c] = (gm < a.rows) ? T(A[(long)gm * a.lda + gk]) : T(0.0f);
+        }
+        for (int pass = 0; pass < 8; pass++) {
+            int idx = pass * 128 + lin;
+            int r = idx / TG_K, c = idx % TG_K;
+            int gn = n0 + r, gk = k0 + c;
+            tB[r][c] = (gn < a.cols) ? W[(long)gn * a.k + gk] : T(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kf = 0; kf < TG_K / 8; kf++) {
+            F af[1], bf[4];
+            for (int mi = 0; mi < 1; mi++)
+                simdgroup_load(af[mi], &tA[mg + mi * 8][kf * 8], TG_K);
+            for (int ni = 0; ni < 4; ni++)
+                simdgroup_load(bf[ni], &tB[ng + ni * 8][kf * 8], TG_K,
+                               ulong2(0, 0), true);
+            for (int mi = 0; mi < 1; mi++)
+                for (int ni = 0; ni < 4; ni++)
+                    simdgroup_multiply_accumulate(acc[mi][ni], af[mi], bf[ni],
+                                                  acc[mi][ni]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int mi = 0; mi < 1; mi++)
+        for (int ni = 0; ni < 4; ni++)
+            simdgroup_store(acc[mi][ni], &tC[mg + mi * 8][ng + ni * 8], TG_N);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int pass = 0; pass < 32; pass++) {
+        int idx = pass * 128 + lin;
+        int r = idx / TG_N, c = idx % TG_N;
+        int gm = m0 + r, gn = n0 + c;
+        if (gm < a.rows && gn < a.cols) C[(long)gm * a.ldc + gn] = tC[r][c];
+    }
+}
+
+kernel void gemm_bf16_small(device const float *A [[buffer(0)]],
+                            device const bfloat *Wr [[buffer(1)]],
+                            device float *C [[buffer(2)]],
+                            constant gargs &a [[buffer(3)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint2 lid [[thread_position_in_threadgroup]],
+                            uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tC[16][TG_N];
+    threadgroup bfloat tA[16][TG_K];
+    threadgroup bfloat tB[TG_N][TG_K];
+    gemm_core_small<bfloat, simdgroup_bfloat8x8>(A, Wr, C, a, tg, lid, sgi,
+                                                tC, tA, tB);
 }
 
 kernel void gemm_bf16_qkv(device const float *A [[buffer(0)]],
@@ -375,19 +457,204 @@ kernel void attn64(device const float *Q [[buffer(0)]],
     attn_core<64, 8>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
                      tQ, tK, tV, u.s, u.o, tP, tSum, tMax);
 }
+
+struct dargs {
+    int pos, nh, kvh, d, dr, extent, window, nk, j0, score_stride, cache_rows;
+    float scale;
+};
+
+/* One threadgroup per query head. Each simdgroup computes 32 key logits;
+ * every lane then walks the compact score row for softmax and one output
+ * channel for the value sum. The sink is the extra logit-zero entry. */
+kernel void inkling_decode_attn(device const float *Q [[buffer(0)]],
+                                device const float *K [[buffer(1)]],
+                                device const float *V [[buffer(2)]],
+                                device const float *R [[buffer(3)]],
+                                device const float *Rel [[buffer(4)]],
+                                device const float *Sink [[buffer(5)]],
+                                device float *O [[buffer(6)]],
+                                device float *Scores [[buffer(7)]],
+                                constant dargs &a [[buffer(8)]],
+                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint2 lid [[thread_position_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    const int h = (int)tg.x;
+    const int kv = h / (a.nh / a.kvh);
+    const int ld = a.kvh * a.d;
+    device float *score = Scores + (ulong)h * a.score_stride;
+    int j = a.j0 + (int)sg * 32 + (int)lane;
+    float dot = 0.0f;
+    if (j <= a.pos) {
+        int slot = a.window > 0 ? j % a.cache_rows : j;
+        for (int d = 0; d < a.d; d++)
+            dot = fma(Q[(ulong)h * a.d + d],
+                      K[(ulong)slot * ld + kv * a.d + d], dot);
+    }
+    float logit = -INFINITY;
+    if (j <= a.pos) {
+        int dist = a.pos - j;
+        float b = 0.0f;
+        if (dist < a.extent) {
+            for (int r = 0; r < a.dr; r++)
+                b = fma(R[(ulong)h * a.dr + r],
+                        Rel[(ulong)r * a.extent + dist], b);
+            b = bf16_rn(b);
+        }
+        logit = dot * a.scale + b - Sink[h];
+        score[j - a.j0] = logit;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mx = 0.0f;
+    for (int i = (int)lane; i < a.nk; i += 128)
+        mx = max(mx, score[i]);
+    mx = simd_max(mx);
+    if (lane == 0u) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u && sg == 0u) {
+        float m = max(max(red[0], red[1]), max(red[2], red[3]));
+        red[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = red[0];
+
+    float sum = 0.0f;
+    for (int i = (int)lane; i < a.nk; i += 128) {
+        float p = exp(score[i] - mx);
+        score[i] = p;
+        sum += p;
+    }
+    sum = simd_sum(sum);
+    if (lane == 0u) red[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u && sg == 0u)
+        red[0] = red[0] + red[1] + red[2] + red[3] + exp(-mx);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = 1.0f / red[0];
+
+    int d = (int)lane;
+    if (d < a.d) {
+        float acc = 0.0f;
+        for (int i = 0; i < a.nk; i++) {
+            int key = a.j0 + i;
+            int slot = a.window > 0 ? key % a.cache_rows : key;
+            acc = fma(score[i] * inv, V[(ulong)slot * ld + kv * a.d + d], acc);
+        }
+        O[(ulong)h * a.d + d] = acc;
+    }
+}
+
+struct pargs {
+    int qstart, qrows, kvlen, nh, kvh, d, dr, extent, window, cache_rows;
+    float scale;
+};
+
+/* One threadgroup per head for a prefill tile. Scores live in a reusable
+ * device buffer so long contexts do not consume threadgroup memory. */
+kernel void inkling_prefill_attn(device const float *Q [[buffer(0)]],
+                                 device const float *K [[buffer(1)]],
+                                 device const float *V [[buffer(2)]],
+                                 device const float *R [[buffer(3)]],
+                                 device const float *Rel [[buffer(4)]],
+                                 device const float *Sink [[buffer(5)]],
+                                 device float *O [[buffer(6)]],
+                                 device float *Scores [[buffer(7)]],
+                                 constant pargs &a [[buffer(8)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint2 tid [[thread_position_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[64];
+    const int h = (int)tg.x;
+    const int kv = h / (a.nh / a.kvh);
+    const int ld = a.kvh * a.d;
+    device float *score = Scores + (ulong)h * a.qrows * a.kvlen;
+    device float *prob = Scores + (ulong)a.nh * a.qrows * a.kvlen +
+                         (ulong)h * a.qrows * a.kvlen;
+    for (int pair = (int)tid.x; pair < a.qrows * a.kvlen; pair += 256) {
+        int q = pair / a.kvlen, key = pair % a.kvlen;
+        int pos = a.qstart + q;
+        bool valid = key <= pos && (a.window <= 0 || key >= pos + 1 - a.window);
+        float dot = 0.0f;
+        if (valid) {
+            int slot = a.window > 0 ? key % a.cache_rows : key;
+            for (int d = 0; d < a.d; d++)
+                dot = fma(Q[((ulong)q * a.nh + h) * a.d + d],
+                          K[(ulong)slot * ld + kv * a.d + d], dot);
+        }
+        float logit = -INFINITY;
+        float bias = 0.0f;
+        if (valid) {
+            int dist = pos - key;
+            if (dist < a.extent) {
+                for (int r = 0; r < a.dr; r++)
+                    bias = fma(R[((ulong)q * a.nh + h) * a.dr + r],
+                               Rel[(ulong)r * a.extent + dist], bias);
+                bias = bf16_rn(bias);
+            }
+            logit = dot * a.scale + bias - Sink[(ulong)q * a.nh + h];
+        }
+        score[pair] = logit;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid.x < (uint)a.qrows) {
+        float mx = 0.0f;
+        for (int key = 0; key < a.kvlen; key++) mx = max(mx, score[(ulong)tid.x * a.kvlen + key]);
+        red[tid.x] = mx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid.x < (uint)a.qrows) {
+        float mx = red[tid.x], sum = exp(-mx);
+        device float *row = score + (ulong)tid.x * a.kvlen;
+        device float *prow = prob + (ulong)tid.x * a.kvlen;
+        for (int key = 0; key < a.kvlen; key++) {
+            float p = exp(row[key] - mx);
+            prow[key] = p;
+            sum += p;
+        }
+        red[tid.x] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid.x < (uint)a.qrows)
+        Scores[(ulong)a.nh * a.qrows * a.kvlen * 2 + (ulong)h * a.qrows + tid.x] = red[tid.x];
+
+    for (int out = (int)tid.x; out < a.qrows * a.d; out += 256) {
+        int q = out / a.d, d = out % a.d;
+        device float *row = prob + (ulong)q * a.kvlen;
+        float inv = 1.0f / red[q], acc = 0.0f;
+        for (int key = 0; key < a.kvlen; key++) {
+            int slot = a.window > 0 ? key % a.cache_rows : key;
+            acc = fma(row[key] * inv, V[(ulong)slot * ld + kv * a.d + d], acc);
+        }
+        O[((ulong)q * a.nh + h) * a.d + d] = acc;
+    }
+}
 )MSL";
 
 const char *h3v_gpu_shader_source(void) { return H3VM_MSL; }
+
+static double h3vm_now_s(void) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+}
 
 /* ---- device ------------------------------------------------------- */
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_q;
 static id<MTLComputePipelineState> p_gemm_bf16, p_gemm_f32, p_gemm_qkv;
+static id<MTLComputePipelineState> p_gemm_bf16_small;
 static id<MTLComputePipelineState> p_attn128, p_attn64;
+static id<MTLComputePipelineState> p_inkling_decode_attn;
+static id<MTLComputePipelineState> p_inkling_prefill_attn;
+static id<MTLBuffer> p_dec_scores;
+static size_t p_dec_scores_cap;
 static NSMutableArray<id<MTLBuffer>> *g_keep;
 static int g_bad;
 
-#define H3VM_SPANS 32
+#define H3VM_SPANS 128
 typedef struct {
     const char *base;
     size_t len;
@@ -462,6 +729,8 @@ int h3vm_init(void) {
         }
         p_gemm_bf16 = [g_dev newComputePipelineStateWithFunction:
                           [lib newFunctionWithName:@"gemm_bf16"] error:&err];
+        p_gemm_bf16_small = [g_dev newComputePipelineStateWithFunction:
+                          [lib newFunctionWithName:@"gemm_bf16_small"] error:&err];
         p_gemm_f32 = [g_dev newComputePipelineStateWithFunction:
                          [lib newFunctionWithName:@"gemm_f32"] error:&err];
         p_gemm_qkv = [g_dev newComputePipelineStateWithFunction:
@@ -470,7 +739,12 @@ int h3vm_init(void) {
                         [lib newFunctionWithName:@"attn128"] error:&err];
         p_attn64 = [g_dev newComputePipelineStateWithFunction:
                        [lib newFunctionWithName:@"attn64"] error:&err];
-        if (!p_gemm_bf16 || !p_gemm_f32 || !p_gemm_qkv || !p_attn128 || !p_attn64) {
+        p_inkling_decode_attn = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"inkling_decode_attn"] error:&err];
+        p_inkling_prefill_attn = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"inkling_prefill_attn"] error:&err];
+        if (!p_gemm_bf16 || !p_gemm_bf16_small || !p_gemm_f32 || !p_gemm_qkv ||
+            !p_attn128 || !p_attn64 || !p_inkling_decode_attn || !p_inkling_prefill_attn) {
             fprintf(stderr, "h3v gpu: pipeline creation failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             g_bad = 1; return 0;
@@ -482,7 +756,10 @@ int h3vm_init(void) {
 void h3vm_shutdown(void) {
     @autoreleasepool {
         p_gemm_bf16 = nil; p_gemm_f32 = nil; p_gemm_qkv = nil;
-        p_attn128 = nil; p_attn64 = nil;
+        p_gemm_bf16_small = nil;
+        p_attn128 = nil; p_attn64 = nil; p_inkling_decode_attn = nil;
+        p_inkling_prefill_attn = nil;
+        p_dec_scores = nil; p_dec_scores_cap = 0;
         g_q = nil;
         for (int i = 0; i < g_spans; i++) { g_span[i].buf = nil; g_span[i].base = NULL; }
         g_spans = 0;
@@ -520,8 +797,9 @@ static int h3vm_gemm(const float *a, const void *w, float *c,
         if (!ba || !bc) return 0;
 
         h3vm_args ar = {rows, k, cols, lda, ldc, woff, qpart, qhd};
+        int tile_rows = pipe == p_gemm_bf16_small ? 16 : 64;
         MTLSize grid = MTLSizeMake((NSUInteger)((cols + 63) / 64),
-                                   (NSUInteger)((rows + 63) / 64), 1);
+                                   (NSUInteger)((rows + tile_rows - 1) / tile_rows), 1);
         id<MTLCommandBuffer> cb = [g_q commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         [e setComputePipelineState:pipe];
@@ -539,10 +817,63 @@ static int h3vm_gemm(const float *a, const void *w, float *c,
     }
 }
 
+int h3vm_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n) {
+    if (!g_dev || !p_gemm_bf16 || !p_gemm_bf16_small || !items || n <= 0 || n > 64) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> ba[64], bw[64], bc[64];
+        NSUInteger ao[64], wo[64], co[64];
+        h3vm_args ar[64];
+        for (int i = 0; i < n; i++) {
+            const h3v_gpu_bf16_item *it = &items[i];
+            if (it->rows <= 0 || it->k <= 0 || it->cols <= 0 ||
+                it->k % 16 || it->lda < it->k || it->ldc < it->cols) return 0;
+            size_t wb = (size_t)it->k * (size_t)it->cols * sizeof(uint16_t);
+            int si = h3vm_span_idx(it->w, wb);
+            if (si >= 0) {
+                bw[i] = g_span[si].buf;
+                wo[i] = (NSUInteger)((uintptr_t)it->w - (uintptr_t)g_span[si].base);
+            } else {
+                bw[i] = h3vm_wrap(it->w, wb, &wo[i], 0);
+                if (!bw[i]) return 0;
+            }
+            ba[i] = h3vm_wrap(it->a, (size_t)it->lda * (size_t)it->rows * sizeof(float),
+                              &ao[i], 0);
+            bc[i] = h3vm_wrap(it->c, (size_t)it->ldc * (size_t)it->rows * sizeof(float),
+                              &co[i], 0);
+            if (!ba[i] || !bc[i]) return 0;
+            ar[i] = (h3vm_args){it->rows, it->k, it->cols, it->lda, it->ldc, 0, -1, 0};
+        }
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e;
+        if (@available(macOS 12.0, *))
+            e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        else
+            e = [cb computeCommandEncoder];
+        for (int i = 0; i < n; i++) {
+            [e setComputePipelineState:p_gemm_bf16];
+            [e setBuffer:ba[i] offset:ao[i] atIndex:0];
+            [e setBuffer:bw[i] offset:wo[i] atIndex:1];
+            [e setBuffer:bc[i] offset:co[i] atIndex:2];
+            [e setBytes:&ar[i] length:sizeof(ar[i]) atIndex:3];
+            MTLSize grid = MTLSizeMake((NSUInteger)((items[i].cols + 63) / 64),
+                                       (NSUInteger)((items[i].rows + 63) / 64), 1);
+            [e dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(H3VM_TG, 1, 1)];
+        }
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        int ok = [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
+        if (!ok)
+            fprintf(stderr, "h3v gpu: BF16 batch failed: %s\n",
+                    cb.error ? [[cb.error localizedDescription] UTF8String] : "command buffer error");
+        return ok;
+    }
+}
+
 int h3vm_gemm_bf16(const float *a, const void *w, float *c,
                    int rows, int k, int cols, int lda, int ldc) {
     return h3vm_gemm(a, w, c, rows, k, cols, cols, lda, ldc,
-                     p_gemm_bf16, 1, -1, 0);
+                     rows <= 16 ? p_gemm_bf16_small : p_gemm_bf16, 1, -1, 0);
 }
 
 int h3vm_gemm_bf16_qkv(const float *a, const void *w, float *c,
@@ -559,6 +890,14 @@ int h3vm_gemm_f32(const float *a, const float *w, float *c,
 }
 
 typedef struct { int seq, ld, hoff; float scale; } h3vm_aargs;
+typedef struct {
+    int pos, nh, kvh, d, dr, extent, window, nk, j0, score_stride, cache_rows;
+    float scale;
+} h3vm_dargs;
+typedef struct {
+    int qstart, qrows, kvlen, nh, kvh, d, dr, extent, window, cache_rows;
+    float scale;
+} h3vm_pargs;
 
 int h3vm_attention(const float *q, const float *k, const float *v, float *o,
                    int seq, int ld, int heads, int hd) {
@@ -585,12 +924,144 @@ int h3vm_attention(const float *q, const float *k, const float *v, float *o,
         [e setBuffer:bv offset:vo atIndex:2];
         [e setBuffer:bo offset:oo atIndex:3];
         [e setBytes:&ar length:sizeof(ar) atIndex:4];
-        /* Eight simdgroups, eight rows each: one threadgroup covers the
-         * kernel's 64 query rows. The GEMM uses four simdgroups instead. */
         [e dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [e endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
         return [cb status] == MTLCommandBufferStatusCompleted;
+    }
+}
+
+int h3vm_inkling_decode_attn(const float *q, const float *k, const float *v,
+                             const float *r, const float *rel, const float *sink,
+                             float *o, int pos, int cache_rows, int ld,
+                             int nh, int kvh, int d, int dr, int extent,
+                             int window) {
+    if (!g_dev || !p_inkling_decode_attn || pos < 0 ||
+        (window <= 0 && cache_rows <= pos) ||
+        d != 128 || dr <= 0 || nh <= 0 || kvh <= 0 || nh % kvh) return 0;
+    int j1 = window > 0 && pos + 1 > window ? pos + 1 - window : 0;
+    if (window <= 0) j1 = 0;
+    int j0 = j1, nk = pos - j0 + 1;
+    if (nk <= 0 || nk > cache_rows) return 0;
+    const bool prof_time = getenv("CWICK_H3V_TIME") != NULL;
+    const double prof_t0 = prof_time ? h3vm_now_s() : 0.0;
+    @autoreleasepool {
+        NSUInteger qo = 0, ko = 0, vo = 0, ro = 0, relo = 0, so = 0, oo = 0;
+        size_t kvbytes = (size_t)cache_rows * (size_t)ld * sizeof(float);
+        id<MTLBuffer> bq = h3vm_wrap(q, (size_t)nh * d * sizeof(float), &qo, 0);
+        id<MTLBuffer> bk = h3vm_wrap(k, kvbytes, &ko, 0);
+        id<MTLBuffer> bv = h3vm_wrap(v, kvbytes, &vo, 0);
+        id<MTLBuffer> br = h3vm_wrap(r, (size_t)nh * dr * sizeof(float), &ro, 0);
+        size_t relbytes = (size_t)dr * (size_t)extent * sizeof(float);
+        int si = h3vm_span_idx(rel, relbytes);
+        id<MTLBuffer> brel;
+        if (si >= 0) {
+            brel = g_span[si].buf;
+            relo = (NSUInteger)((uintptr_t)rel - (uintptr_t)g_span[si].base);
+        } else {
+            brel = h3vm_wrap(rel, relbytes, &relo, 0);
+        }
+        id<MTLBuffer> bs = h3vm_wrap(sink, (size_t)nh * sizeof(float), &so, 0);
+        id<MTLBuffer> bo = h3vm_wrap(o, (size_t)nh * d * sizeof(float), &oo, 0);
+        if (!bq || !bk || !bv || !br || !brel || !bs || !bo) return 0;
+        size_t score_bytes = (size_t)nh * (size_t)nk * sizeof(float);
+        if (!p_dec_scores || p_dec_scores_cap < score_bytes) {
+            size_t cap = p_dec_scores_cap ? p_dec_scores_cap : 65536;
+            while (cap < score_bytes) cap *= 2;
+            p_dec_scores = [g_dev newBufferWithLength:cap
+                                              options:MTLResourceStorageModeShared];
+            if (!p_dec_scores) return 0;
+            p_dec_scores_cap = cap;
+        }
+        h3vm_dargs ar = {pos, nh, kvh, d, dr, extent, window, nk, j0, nk, cache_rows,
+                         1.0f / sqrtf((float)d)};
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p_inkling_decode_attn];
+        [e setBuffer:bq offset:qo atIndex:0];
+        [e setBuffer:bk offset:ko atIndex:1];
+        [e setBuffer:bv offset:vo atIndex:2];
+        [e setBuffer:br offset:ro atIndex:3];
+        [e setBuffer:brel offset:relo atIndex:4];
+        [e setBuffer:bs offset:so atIndex:5];
+        [e setBuffer:bo offset:oo atIndex:6];
+        [e setBuffer:p_dec_scores offset:0 atIndex:7];
+        [e setBytes:&ar length:sizeof(ar) atIndex:8];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [e endEncoding];
+        const double prof_t1 = prof_time ? h3vm_now_s() : 0.0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (prof_time)
+            fprintf(stderr, "H3VATTN host=%.1fus wait=%.1fus gpu=%.1fus pos=%d\n",
+                    (prof_t1 - prof_t0) * 1e6,
+                    (h3vm_now_s() - prof_t1) * 1e6,
+                    (cb.GPUEndTime - cb.GPUStartTime) * 1e6, pos);
+        return [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
+    }
+}
+
+int h3vm_inkling_prefill_attn(const float *q, const float *k, const float *v,
+                              const float *r, const float *rel, const float *sink,
+                              float *o, int qstart, int qrows, int cache_rows,
+                              int ld, int nh, int kvh, int d, int dr,
+                              int extent, int window) {
+    if (!g_dev || !p_inkling_prefill_attn || qstart < 0 || qrows <= 0 ||
+        qrows > 64 || d != 128 || dr <= 0 || nh <= 0 || kvh <= 0 || nh % kvh)
+        return 0;
+    int kvlen = qstart + qrows;
+    if ((window <= 0 && cache_rows < kvlen) ||
+        (window > 0 && cache_rows <= 0)) return 0;
+    @autoreleasepool {
+        NSUInteger qo = 0, ko = 0, vo = 0, ro = 0, relo = 0, so = 0, oo = 0;
+        size_t kvbytes = (size_t)cache_rows * (size_t)ld * sizeof(float);
+        id<MTLBuffer> bq = h3vm_wrap(q, (size_t)qrows * nh * d * sizeof(float), &qo, 0);
+        id<MTLBuffer> bk = h3vm_wrap(k, kvbytes, &ko, 0);
+        id<MTLBuffer> bv = h3vm_wrap(v, kvbytes, &vo, 0);
+        id<MTLBuffer> br = h3vm_wrap(r, (size_t)qrows * nh * dr * sizeof(float), &ro, 0);
+        size_t relbytes = (size_t)dr * (size_t)extent * sizeof(float);
+        int si = h3vm_span_idx(rel, relbytes);
+        id<MTLBuffer> brel;
+        if (si >= 0) {
+            brel = g_span[si].buf;
+            relo = (NSUInteger)((uintptr_t)rel - (uintptr_t)g_span[si].base);
+        } else {
+            brel = h3vm_wrap(rel, relbytes, &relo, 0);
+        }
+        id<MTLBuffer> bs = h3vm_wrap(sink, (size_t)qrows * nh * sizeof(float), &so, 0);
+        id<MTLBuffer> bo = h3vm_wrap(o, (size_t)qrows * nh * d * sizeof(float), &oo, 0);
+        if (!bq || !bk || !bv || !br || !brel || !bs || !bo) return 0;
+        size_t score_bytes = (size_t)nh * (size_t)qrows *
+                             ((size_t)kvlen * 2 + 1) * sizeof(float);
+        if (!p_dec_scores || p_dec_scores_cap < score_bytes) {
+            size_t cap = p_dec_scores_cap ? p_dec_scores_cap : 65536;
+            while (cap < score_bytes) cap *= 2;
+            p_dec_scores = [g_dev newBufferWithLength:cap
+                                              options:MTLResourceStorageModeShared];
+            if (!p_dec_scores) return 0;
+            p_dec_scores_cap = cap;
+        }
+        h3vm_pargs ar = {qstart, qrows, kvlen, nh, kvh, d, dr, extent, window,
+                         cache_rows, 1.0f / sqrtf((float)d)};
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p_inkling_prefill_attn];
+        [e setBuffer:bq offset:qo atIndex:0];
+        [e setBuffer:bk offset:ko atIndex:1];
+        [e setBuffer:bv offset:vo atIndex:2];
+        [e setBuffer:br offset:ro atIndex:3];
+        [e setBuffer:brel offset:relo atIndex:4];
+        [e setBuffer:bs offset:so atIndex:5];
+        [e setBuffer:bo offset:oo atIndex:6];
+        [e setBuffer:p_dec_scores offset:0 atIndex:7];
+        [e setBytes:&ar length:sizeof(ar) atIndex:8];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
     }
 }

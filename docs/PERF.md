@@ -1274,3 +1274,102 @@ kernels against CPU loops with no weights: F32 GEMM 1.9e-5, BF16 GEMM 7.8e-3,
 strided F32 GEMM 7.6e-6, 64-wide attention 2.3e-4, 128-wide attention 2.7e-4.
 `CWICK_H3V_GPU=0` is the A/B escape hatch; any unsupported shape falls back
 per call, so a clip is never blocked by the GPU path.
+
+## Inkling-2-Mini on Metal: corrected forward and four endpoints (2026-11-24)
+
+Same M3 Max 12P+4E / 40-core GPU / 128 GiB machine, `--backend metal`,
+`--context 32768`, `temperature=0`, `max_tokens=64`. Requests set the effort
+record to `none`; the checkpoint can still choose to emit a thinking block.
+Cold start is 28.4 s, including 28.2 s to dequantize the checkpoint into the
+49.16 GiB resident arena. The arena and 2.32 GiB KV/convolution state are wired
+(51.48 GiB total). The source checkpoint mapping is dropped before wiring.
+
+`tools/apibench.sh` measures the complete HTTP round trip. For streams, `first`
+is the first non-empty content, reasoning or tool delta parsed from curl's
+incoming trace, not the HTTP header or the role-only frame. Prefill/decode are
+the engine's own access-log timings. Text means below are the mean of two runs;
+non-streaming and image rows are one run each.
+
+| endpoint | mode | input -> generated | first visible | client total | prefill | decode |
+|---|---|---:|---:|---:|---:|---:|
+| `/v1/systemone` | buffered | 550 tokens, 3 questions -> 0 | 62,396 ms | 62,396 ms | 8.7 tok/s | — |
+| `/v1/chat/completions` | stream | 86 -> 64 | 12,162 ms | 25,477 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/responses` | stream | 86 -> 64 | 12,297 ms | 24,920 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/messages` | stream | 86 -> 64 | 11,913 ms | 24,678 ms | 7.3 tok/s | 4.6 tok/s |
+| `/v1/chat/completions` | buffered | 86 -> 64 | 25,583 ms | 25,583 ms | 7.33 tok/s | 4.55 tok/s |
+| `/v1/responses` | buffered | 86 -> 64 | 25,737 ms | 25,737 ms | 7.26 tok/s | 4.54 tok/s |
+| `/v1/messages` | buffered | 86 -> 64 | 25,099 ms | 25,099 ms | 7.20 tok/s | 4.79 tok/s |
+| `/v1/chat/completions` | stream | 126 (96 image) -> 64 | 14,562 ms | 27,956 ms | 10.05 tok/s | 4.55 tok/s |
+| `/v1/responses` | stream | 126 (96 image) -> 64 | 15,034 ms | 28,909 ms | 9.76 tok/s | 4.39 tok/s |
+| `/v1/messages` | stream | 126 (96 image) -> 64 | 14,972 ms | 29,152 ms | 9.82 tok/s | 4.31 tok/s |
+
+The image fixture is the 450x308 corn JPEG. Decode plus the 23-layer vision
+tower takes 1.58 s and emits 96 merged vectors; placeholder expansion happens
+before text prefill. All rows returned HTTP 200. The decision request performs
+one prefill per question and generates no tokens.
+
+Memory was sampled after the full run: process physical footprint 55.71 GB,
+RSS about 52.0 GiB, writable regions 52.0 GiB resident and `swapped_out=0K`.
+The host compressor counter stayed at 2,427,260,575 for the entire run and host
+swap use stayed at 2,296,840,192 bytes; that swap predates cwick and is not
+attributed to this process. Cumulative counters were 4,116,892 Metal linear
+calls and 2,477 decode steps. No host-wide VM setting was changed.
+
+Correctness anchors for these numbers: the rendered 26-token arithmetic prompt
+has exactly the same IDs as the checkpoint tokenizer; the native forward's top
+token and cwick's top token are both `<|message_model|>`, with the same leading
+alternatives. Live requests return `4` for 2+2, `Corn` through all three image
+dialects, `carrot, corn` for two images, a `get_weather({"city":"Paris"})` call
+in all three tool envelopes, a correct tool-result follow-up, and a high-
+confidence System One choice. The 145-token long-prefill regression remains
+covered by §116.
+
+## Inkling-2-Mini packed experts and multimodal full-chain results (2026-11-24)
+
+This section supersedes the resident-memory and throughput rows above for
+Inkling-2-Mini. The final configuration keeps the checkpoint's packed NVFP4 /
+MXFP8 expert bytes resident: 20 NVFP4 layers and 4 MXFP8 layers, 128 experts,
+top-8, all 24 stored layers and all three loop passes. Nothing is pruned,
+skipped or converted to a lower-precision format.
+
+Cold start is **3.57 s**. The wired allocation is **18.19 GiB weights + 2.32 GiB
+KV/convolution state**. After the complete text/image benchmark run the process
+physical footprint was **22.4 GiB** (peak 22.5 GiB), RSS about 22.0 GiB, and
+writable regions reported `swapped_out=0K`. Host swap remained at roughly
+2.34 GiB, all of it predating cwick; no host-wide VM setting was changed.
+
+Text and image rows below are one streaming run per endpoint on the final
+build, `--backend metal --context 32768`, `temperature=0`, `max_tokens=64`.
+`first` is the first non-empty SSE delta; `total` is the complete HTTP round
+trip. Prefill/decode are engine timings from the same request.
+
+| input | endpoint | input -> generated | first visible | client total | prefill | decode |
+|---|---|---:|---:|---:|---:|---:|
+| text | `/v1/chat/completions` | 86 -> 64 | 3,933 ms | 11,111 ms | 23.25 tok/s | 8.52 tok/s |
+| text | `/v1/responses` | 86 -> 64 | 3,746 ms | 10,233 ms | 24.37 tok/s | 9.42 tok/s |
+| text | `/v1/messages` | 86 -> 64 | 3,692 ms | 10,187 ms | 24.78 tok/s | 9.40 tok/s |
+| text | `/v1/systemone` | 550, 3 questions -> 0 | 20,916 ms | 20,916 ms | 26.30 tok/s | — |
+| image | `/v1/chat/completions` | 126 (96 image) -> 64 | 15,795 ms | 22,495 ms | 8.89 tok/s | 9.11 tok/s |
+| image | `/v1/responses` | 126 (96 image) -> 64 | 15,244 ms | 22,763 ms | 9.32 tok/s | 8.09 tok/s |
+| image | `/v1/messages` | 126 (96 image) -> 64 | 16,224 ms | 23,174 ms | 8.69 tok/s | 8.71 tok/s |
+| image | `/v1/systemone` | 233, 1 question -> 0 | 32,810 ms | 32,810 ms | 7.10 tok/s | — |
+
+The image fixture is the 450x308 corn JPEG. Vision decoding plus the tower takes
+about 1.4–1.7 s and emits 96 merged vectors. Image prefill dequantizes only the
+active experts into temporary BF16 buffers and runs the same Metal BF16/FP32
+GEMM semantics as the correctness reference; decode returns to the packed Metal
+kernels. System One performs one prefill per question and generates no tokens.
+All rows returned HTTP 200.
+
+Correctness anchors on the final build: `2+2` returns `4`; the full image answer
+returns `Corn`; all three image dialects produce coherent corn/color reasoning;
+and image System One returns `corn` with probability 0.999928. The Web image
+upload, preview/removal, IndexedDB replay and all four request builders were
+verified in a real browser. `make test` and the standalone Metal numerical probe
+both pass.
+
+The requested 80 tok/s prefill / 40 tok/s decode targets are **not met**. The
+measured text path is about 24–26 / 8.5–9.4 tok/s; the image path is about
+7–9 / 8–9 tok/s. The remaining image cost is active-expert BF16 dequantization
+plus GEMM, and the remaining decode cost is packed expert bandwidth and host
+synchronization. These are full-chain numbers, not kernel-only estimates.

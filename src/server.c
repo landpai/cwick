@@ -28,6 +28,7 @@
 #include "ds_prompt.h"
 #include "mm_prompt.h"
 #include "q35_prompt.h"
+#include "ik_prompt.h"
 #include "json.h"
 #include "sample.h"
 #include "tools.h"
@@ -1205,8 +1206,9 @@ static int validate_body(json_value *root, gen_request *gr, char *errbuf,
                 snprintf(errbuf, errcap, "message role must be a string");
                 return 400;
             }
-            if (mc && mc->kind != JSON_STRING && mc->kind != JSON_NULL) {
-                snprintf(errbuf, errcap, "multimodal content is not supported (text-only server)");
+            if (mc && mc->kind != JSON_STRING && mc->kind != JSON_NULL &&
+                mc->kind != JSON_ARRAY) {
+                snprintf(errbuf, errcap, "content must be a string or an array of parts");
                 return 400;
             }
             const char *content = (mc && mc->kind == JSON_STRING) ? mc->string : "";
@@ -1403,6 +1405,7 @@ typedef struct {
     char call_id[96];        /* role "tool": the call this output answers */
     srv_buf text;
     srv_buf calls;           /* comma-joined function_call objects */
+    char *parts_json;        /* original content array, kept for vision */
     size_t ncalls;
 } resp_turn;
 
@@ -1412,6 +1415,7 @@ static void resp_turns_free(resp_turns *t) {
     for (size_t i = 0; i < t->n; i++) {
         free(t->v[i].text.p);
         free(t->v[i].calls.p);
+        free(t->v[i].parts_json);
     }
     free(t->v);
     t->v = NULL;
@@ -1433,10 +1437,16 @@ static resp_turn *resp_turn_last(resp_turns *t) {
     return t->n ? &t->v[t->n - 1] : NULL;
 }
 
-/* A Responses content field is either a string or an array of typed parts.
- * Only text parts exist here: this server has no vision or file input, and a
- * silently dropped image would be a wrong prompt rather than a smaller one. */
-static bool resp_text_of(json_value *v, srv_buf *out, char *err, size_t cap) {
+/* Only the Inkling renderer has a vision tower. Every other checkpoint must
+ * keep refusing image parts instead of silently dropping them: a missing
+ * attachment is a wrong prompt, not a smaller one. */
+static bool model_id_uses_ik(const char *id) {
+    return id && strncasecmp(id, "inkling2", 8) == 0;
+}
+
+/* A Responses content field is either a string or an array of typed parts. */
+static bool resp_text_of(json_value *v, srv_buf *out, char *err, size_t cap,
+                         bool allow_images) {
     if (!v || v->kind == JSON_NULL) return true;
     if (v->kind == JSON_STRING) {
         sbuf_puts(out, v->string);
@@ -1451,9 +1461,16 @@ static bool resp_text_of(json_value *v, srv_buf *out, char *err, size_t cap) {
         json_value *ty = cwick_json_get(part, "type");
         const char *t = (ty && ty->kind == JSON_STRING) ? ty->string : NULL;
         if (t && (strcmp(t, "input_image") == 0 || strcmp(t, "image") == 0 ||
-                  strcmp(t, "input_file") == 0 || strcmp(t, "file") == 0 ||
+                  strcmp(t, "image_url") == 0)) {
+            if (!allow_images) {
+                snprintf(err, cap, "%s content is not supported (text-only server)", t);
+                return false;
+            }
+            continue;   /* the raw part stays in parts_json for the vision tower */
+        }
+        if (t && (strcmp(t, "input_file") == 0 || strcmp(t, "file") == 0 ||
                   strcmp(t, "input_audio") == 0)) {
-            snprintf(err, cap, "%s content is not supported (text-only server)", t);
+            snprintf(err, cap, "%s content is not supported", t);
             return false;
         }
         json_value *tx = cwick_json_get(part, "text");
@@ -1462,10 +1479,67 @@ static bool resp_text_of(json_value *v, srv_buf *out, char *err, size_t cap) {
     return true;
 }
 
+static void resp_merge_content(resp_turn *turn, json_value *cv, char *err, size_t cap) {
+    if (!cv) return;
+    if (cv->kind == JSON_ARRAY) {
+        char *fresh = cwick_json_write(cv);
+        if (!fresh) {
+            snprintf(err, cap, "content cannot be serialized");
+            return;
+        }
+        if (!turn->parts_json && turn->text.len) {
+            char *text = cwick_json_stringify(turn->text.p);
+            size_t n = strlen(text) + strlen(fresh) + 64;
+            turn->parts_json = (char *)cwick_xmalloc(n);
+            snprintf(turn->parts_json, n,
+                     "[{\"type\":\"input_text\",\"text\":%s},%s]",
+                     text, fresh + 1);
+            free(text);
+        } else if (turn->parts_json) {
+            cwick_error e;
+            cwick_error_clear(&e);
+            json_value *old = cwick_json_parse(turn->parts_json,
+                                                strlen(turn->parts_json), &e);
+            if (old && old->kind == JSON_ARRAY) {
+                srv_buf merged = {0};
+                sbuf_puts(&merged, "[");
+                for (size_t i = 0; i < old->count; i++) {
+                    char *part = cwick_json_write(old->items[i]);
+                    if (i) sbuf_puts(&merged, ",");
+                    sbuf_puts(&merged, part);
+                    free(part);
+                }
+                if (old->count) sbuf_puts(&merged, ",");
+                sbuf_puts(&merged, fresh + 1);
+                free(turn->parts_json);
+                turn->parts_json = merged.p;
+            } else {
+                free(turn->parts_json);
+                turn->parts_json = fresh;
+                fresh = NULL;
+            }
+            cwick_json_free(old);
+        } else {
+            turn->parts_json = fresh;
+            fresh = NULL;
+        }
+        free(fresh);
+    } else if (cv->kind == JSON_STRING && turn->parts_json) {
+        char *text = cwick_json_stringify(cv->string);
+        size_t n = strlen(turn->parts_json) + strlen(text) + 64;
+        char *merged = (char *)cwick_xmalloc(n);
+        snprintf(merged, n, "%.*s,{\"type\":\"input_text\",\"text\":%s}]",
+                 (int)strlen(turn->parts_json) - 1, turn->parts_json, text);
+        free(text);
+        free(turn->parts_json);
+        turn->parts_json = merged;
+    }
+}
+
 /* One input item -> one turn. Assistant tool calls merge into the assistant
  * turn before them, because that is how both prompt templates expect a turn
  * with several calls to look. */
-static bool resp_add_item(resp_turns *t, json_value *item,
+static bool resp_add_item(resp_turns *t, json_value *item, bool allow_images,
                           char *err, size_t cap) {
     if (item->kind != JSON_OBJECT) {
         snprintf(err, cap, "input items must be objects");
@@ -1491,8 +1565,9 @@ static bool resp_add_item(resp_turns *t, json_value *item,
         resp_turn *turn = (!strcmp(role, "assistant") && last &&
                            !strcmp(last->role, "assistant")) ? last
                                                             : resp_turn_new(t, role);
-        if (!resp_text_of(cwick_json_get(item, "content"), &turn->text, err, cap))
-            return false;
+        json_value *cv = cwick_json_get(item, "content");
+        resp_merge_content(turn, cv, err, cap);
+        if (!resp_text_of(cv, &turn->text, err, cap, allow_images)) return false;
         return true;
     }
     if (strcmp(type, "function_call") == 0) {
@@ -1528,7 +1603,9 @@ static bool resp_add_item(resp_turns *t, json_value *item,
         }
         resp_turn *turn = resp_turn_new(t, "tool");
         snprintf(turn->call_id, sizeof(turn->call_id), "%s", cv->string);
-        return resp_text_of(cwick_json_get(item, "output"), &turn->text, err, cap);
+        json_value *output = cwick_json_get(item, "output");
+        resp_merge_content(turn, output, err, cap);
+        return resp_text_of(output, &turn->text, err, cap, allow_images);
     }
     if (strcmp(type, "reasoning") == 0) {
         /* The checkpoint's own hidden chain is not replayable input: it is
@@ -1548,16 +1625,18 @@ static char *resp_messages_json(const resp_turns *t) {
         if (i) sbuf_puts(&b, ",");
         char *role = cwick_json_stringify(r->role);
         char *text = cwick_json_stringify(r->text.p ? r->text.p : "");
+        const char *content = r->parts_json && *r->parts_json ? r->parts_json : text;
         if (!strcmp(r->role, "tool")) {
             char *cid = cwick_json_stringify(r->call_id);
+            const char *tool_content = r->parts_json ? r->parts_json : text;
             sbuf_putf(&b, "{\"role\":\"tool\",\"tool_call_id\":%s,"
-                          "\"content\":%s}", cid, text);
+                          "\"content\":%s}", cid, tool_content);
             free(cid);
         } else if (r->ncalls) {
             sbuf_putf(&b, "{\"role\":%s,\"content\":%s,\"tool_calls\":[%s]}",
-                      role, text, r->calls.p);
+                      role, content, r->calls.p);
         } else {
-            sbuf_putf(&b, "{\"role\":%s,\"content\":%s}", role, text);
+            sbuf_putf(&b, "{\"role\":%s,\"content\":%s}", role, content);
         }
         free(role);
         free(text);
@@ -1651,6 +1730,8 @@ static bool resp_tool_choice(json_value *tc, char *out, size_t cap,
 static int responses_parse(json_value *root, gen_request *gr,
                            const char *model_id, const cwick_model_entry *cur,
                            char *errbuf, size_t errcap) {
+    const bool allow_images = model_id_uses_ik(model_id) ||
+        model_id_uses_ik(cur ? cur->id : NULL);
     static const char *allowed[] = {
         "model", "input", "instructions", "tools", "tool_choice",
         "max_output_tokens", "max_tokens", "temperature", "top_p", "stream",
@@ -1741,7 +1822,8 @@ static int responses_parse(json_value *root, gen_request *gr,
         sbuf_puts(&t->text, input->string);
     } else if (input->kind == JSON_ARRAY) {
         for (size_t i = 0; i < input->count && ok; i++)
-            ok = resp_add_item(&turns, input->items[i], errbuf, errcap);
+            ok = resp_add_item(&turns, input->items[i], allow_images,
+                               errbuf, errcap);
     } else {
         snprintf(errbuf, errcap, "`input` must be a string or an array of items");
         ok = false;
@@ -1983,12 +2065,11 @@ static int responses_parse(json_value *root, gen_request *gr,
  * other two dialects build, so the prompt templates, the queue, the prefix
  * cache and the tool layer keep one implementation. */
 
-/* Anthropic content is a string or an array of blocks. Only text carries a
- * prompt; image/document/audio blocks are refused rather than dropped,
- * because a silently missing attachment is a wrong prompt, not a smaller
- * one. */
+/* Anthropic content is a string or an array of blocks. Text is collected for
+ * text-only messages; image blocks are refused unless the caller explicitly
+ * keeps the original content array for a vision-capable renderer. */
 static bool anth_blocks_text(json_value *v, srv_buf *out, char *err,
-                             size_t cap, const char *what) {
+                             size_t cap, const char *what, bool allow_images) {
     if (!v || v->kind == JSON_NULL) return true;
     if (v->kind == JSON_STRING) { sbuf_puts(out, v->string); return true; }
     if (v->kind != JSON_ARRAY) {
@@ -1999,6 +2080,7 @@ static bool anth_blocks_text(json_value *v, srv_buf *out, char *err,
         json_value *b = v->items[i];
         json_value *ty = cwick_json_get(b, "type");
         const char *t = (ty && ty->kind == JSON_STRING) ? ty->string : "text";
+        if (!strcmp(t, "image") && allow_images) continue;
         if (!strcmp(t, "image") || !strcmp(t, "document") ||
             !strcmp(t, "audio") || !strcmp(t, "video")) {
             snprintf(err, cap, "%s blocks are not supported (text-only server)", t);
@@ -2037,11 +2119,52 @@ static void anth_emit(srv_buf *b, size_t *n, const char *role, const char *text,
     (*n)++;
 }
 
+/* Like anth_emit but keeps the original content array, which is what the
+ * vision-capable renderer needs to see the image blocks. */
+static void anth_emit_raw(srv_buf *b, size_t *n, const char *role,
+                          const char *content_json) {
+    char *jr = cwick_json_stringify(role);
+    if (*n) sbuf_puts(b, ",");
+    sbuf_putf(b, "{\"role\":%s,\"content\":%s}", jr, content_json);
+    free(jr);
+    (*n)++;
+}
+
+static void anth_emit_tool_content(srv_buf *b, size_t *n, const char *call_id,
+                                   const char *content_json) {
+    char *jc = cwick_json_stringify(call_id);
+    if (*n) sbuf_puts(b, ",");
+    sbuf_putf(b, "{\"role\":\"tool\",\"tool_call_id\":%s,\"content\":%s}",
+              jc, content_json);
+    free(jc);
+    (*n)++;
+}
+
+static void anth_flush_user(srv_buf *msgs, size_t *n, srv_buf *text,
+                            srv_buf *parts, bool has_image) {
+    if (has_image && parts->len) {
+        size_t nbytes = parts->len + 3;
+        char *raw = (char *)cwick_xmalloc(nbytes);
+        raw[0] = '[';
+        memcpy(raw + 1, parts->p, parts->len);
+        raw[parts->len + 1] = ']';
+        raw[parts->len + 2] = '\0';
+        anth_emit_raw(msgs, n, "user", raw);
+        free(raw);
+    } else if (text->len) {
+        anth_emit(msgs, n, "user", text->p, NULL, NULL);
+    }
+    text->len = 0;
+    if (text->p) text->p[0] = '\0';
+    parts->len = 0;
+    if (parts->p) parts->p[0] = '\0';
+}
+
 /* One Anthropic message -> one or more chat messages. A user turn may carry
  * several `tool_result` blocks, each of which is its own `tool` role in the
  * chat form, so text and results are flushed in the order they appear. */
 static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
-                             char *err, size_t cap) {
+                             bool allow_images, char *err, size_t cap) {
     json_value *rv = cwick_json_get(m, "role");
     json_value *cv = cwick_json_get(m, "content");
     if (!rv || rv->kind != JSON_STRING) {
@@ -2050,6 +2173,7 @@ static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
     }
     const bool is_user = strcmp(rv->string, "user") == 0;
     const bool is_asst = strcmp(rv->string, "assistant") == 0;
+    bool has_image = false;
     if (!is_user && !is_asst) {
         snprintf(err, cap, "unsupported message role `%s`", rv->string);
         return false;
@@ -2069,6 +2193,7 @@ static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
 
     srv_buf text = {0};
     srv_buf calls = {0};
+    srv_buf pending_parts = {0};
     size_t ncalls = 0;
     bool ok = true;
     for (size_t i = 0; i < cv->count && ok; i++) {
@@ -2077,7 +2202,13 @@ static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
         const char *t = (ty && ty->kind == JSON_STRING) ? ty->string : "text";
         if (!strcmp(t, "text")) {
             json_value *tx = cwick_json_get(b, "text");
-            if (tx && tx->kind == JSON_STRING) sbuf_puts(&text, tx->string);
+            if (tx && tx->kind == JSON_STRING) {
+                sbuf_puts(&text, tx->string);
+                char *part = cwick_json_write(b);
+                if (pending_parts.len) sbuf_puts(&pending_parts, ",");
+                sbuf_puts(&pending_parts, part);
+                free(part);
+            }
             continue;
         }
         /* A hidden chain is not replayable input for any template; the chat
@@ -2116,26 +2247,43 @@ static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
                 break;
             }
             srv_buf out = {0};
-            if (!anth_blocks_text(cwick_json_get(b, "content"), &out, err, cap,
-                                  "tool_result content")) {
+            json_value *result_content = cwick_json_get(b, "content");
+            if (!anth_blocks_text(result_content, &out, err, cap,
+                                  "tool_result content", allow_images)) {
                 free(out.p);
                 ok = false;
                 break;
             }
-            /* Prose and the result keep their order: anything written before
-             * this block is its own user turn. */
-            if (text.len) {
-                anth_emit(msgs, n, "user", text.p, NULL, NULL);
-                text.len = 0;
-                if (text.p) text.p[0] = '\0';
+            anth_flush_user(msgs, n, &text, &pending_parts, has_image);
+            has_image = false;
+            if (result_content && result_content->kind == JSON_ARRAY) {
+                char *raw = cwick_json_write(result_content);
+                anth_emit_tool_content(msgs, n, idv->string, raw);
+                free(raw);
+            } else {
+                anth_emit(msgs, n, "tool", out.p ? out.p : "", NULL, idv->string);
             }
-            anth_emit(msgs, n, "tool", out.p ? out.p : "", NULL, idv->string);
             free(out.p);
+            continue;
+        }
+        if (!strcmp(t, "image") && is_user) {
+            if (!allow_images) {
+                snprintf(err, cap, "image blocks are not supported (text-only server)");
+                ok = false;
+                break;
+            }
+            has_image = true;
+            {
+                char *part = cwick_json_write(b);
+                if (pending_parts.len) sbuf_puts(&pending_parts, ",");
+                sbuf_puts(&pending_parts, part);
+                free(part);
+            }
             continue;
         }
         if (!strcmp(t, "image") || !strcmp(t, "document") ||
             !strcmp(t, "audio") || !strcmp(t, "video")) {
-            snprintf(err, cap, "%s blocks are not supported (text-only server)", t);
+            snprintf(err, cap, "%s blocks are not supported", t);
             ok = false;
             break;
         }
@@ -2145,16 +2293,15 @@ static bool anth_add_message(json_value *m, srv_buf *msgs, size_t *n,
                  is_asst ? "an assistant" : "a user");
         ok = false;
     }
-    if (ok) {
-        if (is_asst) {
-            /* One assistant turn: its prose plus every call it made. */
-            anth_emit(msgs, n, "assistant", text.p, calls.p, NULL);
-        } else if (text.len) {
-            anth_emit(msgs, n, "user", text.p, NULL, NULL);
-        }
+    if (ok && is_user) {
+        anth_flush_user(msgs, n, &text, &pending_parts, has_image);
+    } else if (ok && is_asst) {
+        /* One assistant turn: its prose plus every call it made. */
+        anth_emit(msgs, n, "assistant", text.p, calls.p, NULL);
     }
     free(text.p);
     free(calls.p);
+    free(pending_parts.p);
     return ok;
 }
 
@@ -2283,6 +2430,8 @@ static const char *anth_think_level(json_value *thinking, char *err, size_t cap,
 static int anthropic_parse(json_value *root, gen_request *gr,
                            const char *model_id, const cwick_model_entry *cur,
                            char *errbuf, size_t errcap) {
+    const bool allow_images = model_id_uses_ik(model_id) ||
+        model_id_uses_ik(cur ? cur->id : NULL);
     static const char *allowed[] = {
         "model", "messages", "system", "max_tokens", "temperature", "top_p",
         "top_k", "stop_sequences", "stream", "tools", "tool_choice",
@@ -2336,7 +2485,7 @@ static int anthropic_parse(json_value *root, gen_request *gr,
     json_value *sysv = cwick_json_get(root, "system");
     if (sysv && sysv->kind != JSON_NULL) {
         srv_buf sys = {0};
-        if (!anth_blocks_text(sysv, &sys, errbuf, errcap, "system")) {
+        if (!anth_blocks_text(sysv, &sys, errbuf, errcap, "system", false)) {
             free(sys.p);
             free(body.p);
             return 400;
@@ -2345,7 +2494,8 @@ static int anthropic_parse(json_value *root, gen_request *gr,
         free(sys.p);
     }
     for (size_t i = 0; i < msgs->count; i++) {
-        if (!anth_add_message(msgs->items[i], &body, &nmsg, errbuf, errcap)) {
+        if (!anth_add_message(msgs->items[i], &body, &nmsg, allow_images,
+                              errbuf, errcap)) {
             free(body.p);
             return 400;
         }
@@ -2900,26 +3050,27 @@ static void phase_trk_observe(phase_trk *pt, const cwick_stream_state *st,
 void cwick_phase_account(const cwick_tokenizer *tok, const uint32_t *tokens,
                         size_t n, bool is_chat, size_t out[3]);
 
-void cwick_phase_account_mk(const cwick_tokenizer *tok, const uint32_t *tokens,
-                           size_t n, bool is_chat, size_t out[3],
-                           const char *open_mk, const char *close_mk,
-                           bool closed_at_start) {
+static void phase_account_impl(const cwick_tokenizer *tok, const uint32_t *tokens,
+                               size_t n, bool is_chat, size_t out[3],
+                               const char *open_mk, const char *close_mk,
+                               bool closed_at_start, bool inkling) {
     if (!out) return;
     out[0] = out[1] = out[2] = 0;
     if (!tok || !tokens || n == 0) return;
     cwick_stream_state st;
     memset(&st, 0, sizeof(st));
-    st.after_think = !is_chat || closed_at_start;
+    st.after_think = !is_chat || closed_at_start || inkling;
     /* The markers are per checkpoint. Without them this replay looked for
      * `</think>` in a MiniMax answer that only ever writes `</mm:think>`, so
      * every access-log line reported think=<all tokens>, content=0 -- on
      * requests whose streamed phase log said "decode(content)". */
     st.open_mk = open_mk;
     st.close_mk = close_mk;
+    st.inkling = inkling;
     char *buf = cwick_xmalloc(64);
     size_t len = 0, cap = 64;
-    int ph = (is_chat && !closed_at_start) ? CWICK_PHASE_THINKING
-                                           : CWICK_PHASE_CONTENT;
+    int ph = (is_chat && !closed_at_start && !inkling) ? CWICK_PHASE_THINKING
+                                                      : CWICK_PHASE_CONTENT;
     for (size_t i = 0; i < n; i++) {
         cwick_error e;
         cwick_error_clear(&e);
@@ -2950,6 +3101,19 @@ void cwick_phase_account_mk(const cwick_tokenizer *tok, const uint32_t *tokens,
         out[ph]++;
     }
     free(buf);
+}
+
+void cwick_phase_account_mk(const cwick_tokenizer *tok, const uint32_t *tokens,
+                           size_t n, bool is_chat, size_t out[3],
+                           const char *open_mk, const char *close_mk,
+                           bool closed_at_start) {
+    phase_account_impl(tok, tokens, n, is_chat, out, open_mk, close_mk,
+                       closed_at_start, false);
+}
+
+void cwick_phase_account_ik(const cwick_tokenizer *tok, const uint32_t *tokens,
+                            size_t n, size_t out[3]) {
+    phase_account_impl(tok, tokens, n, true, out, NULL, NULL, false, true);
 }
 
 /* The engine hands us each token the moment it is decoded; here we turn it
@@ -3418,10 +3582,17 @@ static void stream_begin(stream_ctx *sc) {
  * marker? Holding exactly those back (rather than a fixed window) is what keeps
  * the stream incremental: normal text ends in no marker prefix, so every token
  * is forwarded the moment it arrives. */
-static size_t marker_prefix_tail(const char *s, size_t len, const char *close_mk) {
-    const char *marks[2] = { close_mk ? close_mk : "</think>", "<tool_call>" };
+static size_t marker_prefix_tail(const char *s, size_t len, const cwick_stream_state *st) {
+    const char *marks[6] = {
+        st->inkling ? "<|message_model|>"
+                    : (st->close_mk ? st->close_mk : "</think>"),
+        st->inkling ? "<|content_thinking|>" : "<tool_call>",
+        st->inkling ? "<|content_text|>" : "<|content_invoke_tool_json|>",
+        "<|content_invoke_tool_json|>", "<|end_message|>",
+        "<|content_model_end_sampling|>"
+    };
     size_t best = 0;
-    for (int m = 0; m < 2; m++) {
+    for (int m = 0; m < (st->inkling ? 6 : 2); m++) {
         size_t mlen = strlen(marks[m]);
         size_t maxk = len < mlen - 1 ? len : mlen - 1;
         for (size_t k = maxk; k > 0; k--) {
@@ -3454,9 +3625,68 @@ static size_t utf8_incomplete_tail(const char *s, size_t len) {
     return 0;
 }
 
+static bool ik_stream_segment(const char *raw, size_t raw_len, bool final,
+                              cwick_stream_state *st, cwick_segment_kind *kind,
+                              size_t *off, size_t *len) {
+    static const char *const marks[] = {
+        "<|message_model|>", "<|content_thinking|>", "<|content_text|>",
+        "<|content_invoke_tool_json|>", "<|end_message|>",
+        "<|content_model_end_sampling|>"
+    };
+    for (;;) {
+        if (st->tool_mode) return false;
+        const char *hit = NULL;
+        int which = -1;
+        for (int i = 0; i < 6; i++) {
+            const char *q = strstr(raw + st->sent, marks[i]);
+            if (q && (!hit || q < hit)) { hit = q; which = i; }
+        }
+        size_t lim = raw_len;
+        if (!final) {
+            size_t hold = marker_prefix_tail(raw, raw_len, st);
+            size_t uhold = utf8_incomplete_tail(raw, raw_len);
+            if (uhold > hold) hold = uhold;
+            lim = raw_len > hold ? raw_len - hold : 0;
+        }
+        if (hit && (size_t)(hit - raw) >= st->sent) {
+            size_t p = (size_t)(hit - raw);
+            if (p > st->sent) {
+                if (which == 3 && st->assistant_header) {
+                    st->sent = p;
+                } else {
+                    *kind = st->after_think ? CWICK_SEG_CONTENT : CWICK_SEG_REASONING;
+                    *off = st->sent;
+                    *len = p - st->sent;
+                    st->sent = p;
+                    st->content_started = true;
+                    return true;
+                }
+            }
+            st->sent = p + strlen(marks[which]);
+            st->assistant_header = which == 0;
+            st->after_think = which != 1;
+            if (which == 3) st->tool_mode = true;
+            if (which == 5) return false;
+            continue;
+        }
+        if (st->assistant_header && !final) return false;
+        if (lim > st->sent) {
+            *kind = st->after_think ? CWICK_SEG_CONTENT : CWICK_SEG_REASONING;
+            *off = st->sent;
+            *len = lim - st->sent;
+            st->sent = lim;
+            st->content_started = true;
+            return true;
+        }
+        return false;
+    }
+}
+
 bool cwick_stream_segment(const char *raw, size_t raw_len, bool final,
                          cwick_stream_state *st, cwick_segment_kind *kind,
                          size_t *off, size_t *len) {
+    if (st->inkling)
+        return ik_stream_segment(raw, raw_len, final, st, kind, off, len);
     for (;;) {
         if (st->tool_mode) return false;
 
@@ -3479,7 +3709,7 @@ bool cwick_stream_segment(const char *raw, size_t raw_len, bool final,
         const char *hit = strstr(raw, marker);
         size_t lim = raw_len;
         if (!final) {
-            size_t hold = marker_prefix_tail(raw, raw_len, close_mk);
+            size_t hold = marker_prefix_tail(raw, raw_len, st);
             size_t uhold = utf8_incomplete_tail(raw, raw_len);
             if (uhold > hold) hold = uhold;
             lim = raw_len > hold ? raw_len - hold : 0;
@@ -4670,6 +4900,13 @@ static bool model_uses_q35_template(const cwick_engine *eng) {
     return spec && strncmp(spec->model_type, "qwen3_5", 7) == 0;
 }
 
+/* Inkling-2-Mini renders its own turn markers and is the only backend with a
+ * vision tower, so all three chat dialects hand it the raw messages array. */
+static bool model_uses_ik_template(const cwick_engine *eng) {
+    const cwick_model_spec *spec = eng ? cwick_engine_spec(eng) : NULL;
+    return spec && model_id_uses_ik(spec->model_type);
+}
+
 /* Qwen3.5 renders with its own template. The thinking switch has no numeric
  * knob there either: "off" is the assistant header followed by an empty, closed
  * reasoning block, which is what the template itself writes. */
@@ -4889,6 +5126,40 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
     } else if (gr->is_chat && gr->messages_json && model_uses_mm_template(eng)) {
         st = mm_chat_encode(srv->tok, gr->messages_json, gr->tools_json,
                             gr->effort_level, &ids, &nids, err);
+    } else if (gr->is_chat && gr->messages_json && model_uses_ik_template(eng)) {
+        char **imgs = NULL;
+        size_t nimgs = 0;
+        st = ik_prompt_encode(srv->tok, gr->messages_json, gr->tools_json,
+                              gr->effort_level, &imgs, &nimgs, &ids, &nids, err);
+        if (st == CWICK_OK && nimgs) {
+            uint32_t image_token_id = 0;
+            cwick_image_batch batch;
+            memset(&batch, 0, sizeof(batch));
+            st = cwick_engine_image_token_id(eng, srv->tok, &image_token_id, err);
+            if (st == CWICK_OK)
+                st = cwick_engine_prepare_images(eng, (const char *const *)imgs,
+                                                 nimgs, &batch, err);
+            if (st == CWICK_OK) {
+                uint32_t *expanded = NULL;
+                int64_t n_expanded = 0;
+                st = cwick_expand_image_placeholders(ids, nids, image_token_id,
+                                                     &batch, &expanded,
+                                                     &n_expanded, err);
+                if (st == CWICK_OK)
+                    st = cwick_engine_set_images(eng, batch.embeds, batch.n_tokens,
+                                                 batch.image_tokens, batch.n_images,
+                                                 err);
+                if (st == CWICK_OK) {
+                    free(ids);
+                    ids = expanded;
+                    nids = n_expanded;
+                } else {
+                    free(expanded);
+                }
+            }
+            cwick_image_batch_free(&batch);
+        }
+        ik_prompt_free_images(imgs, nimgs);
     } else if (gr->is_chat && gr->messages_json && model_uses_q35_template(eng)) {
         st = q35_chat_encode(srv->tok, gr->messages_json, gr->tools_json,
                              gr->effort_level, &ids, &nids, err);
@@ -4899,7 +5170,11 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
     } else {
         st = cwick_tokenizer_encode(srv->tok, gr->prompt, &ids, &nids, err);
     }
-    if (st != CWICK_OK) { cwick_metrics_request_error("tokenize"); return; }
+    if (st != CWICK_OK) {
+        cwick_metrics_request_error("tokenize");
+        free(ids);
+        return;
+    }
     if (srv->trace) {
         char *rendered = NULL;
         cwick_error ignored;
@@ -4925,11 +5200,15 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * it wrong here is not cosmetic -- with the block closed in the prompt and
      * a splitter that starts in "thinking", a whole answer is delivered as
      * reasoning_content with an empty content. */
+    /* Inkling's template has no <think> block: its content markers are part
+     * of the message, not a reasoning envelope, so every generated token is
+     * answer content from the first step. */
     const bool pfx_closed_at_start =
-        gr->is_chat && srv->think_close_id >= 0 && nids > 0 &&
-        ((int64_t)ids[nids - 1] == srv->think_close_id ||
-         ((model_uses_mm_template(eng) || model_uses_q35_template(eng)) &&
-          prompt_token_near_end(ids, nids, srv->think_close_id, 4)));
+        (gr->is_chat && model_uses_ik_template(eng)) ||
+        (gr->is_chat && srv->think_close_id >= 0 && nids > 0 &&
+         ((int64_t)ids[nids - 1] == srv->think_close_id ||
+          ((model_uses_mm_template(eng) || model_uses_q35_template(eng)) &&
+           prompt_token_near_end(ids, nids, srv->think_close_id, 4))));
 
     /* ---- prefix cache: replay the part of the prompt already prefilled --
      * An agent client resends the same multi-thousand-token system prompt and
@@ -4941,7 +5220,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
     memset(&pfx_cap, 0, sizeof(pfx_cap));
     bool pfx_cap_on = false;
     pfx_store_ctx pfx_ctx;   /* read by the store callback during generation */
-    if (srv->pfx && nids > 1) {
+    if (srv->pfx && nids > 1 && !model_uses_ik_template(eng)) {
         pthread_mutex_lock(&srv->pfx_mtx);
         int64_t P = cwick_pfx_lookup(srv->pfx, ids, nids);
         pfx_hit = P;
@@ -5107,6 +5386,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
         sc.split.after_think = !gr->is_chat || pfx_closed_at_start;
         sc.split.open_mk = srv->think_open_mk;
         sc.split.close_mk = srv->think_close_mk;
+        sc.split.inkling = model_uses_ik_template(eng);
         sc.raw_cap = 256;
         sc.raw = cwick_xmalloc(sc.raw_cap);
         sc.raw[0] = '\0';
@@ -5140,6 +5420,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
         ptk.split.after_think = !gr->is_chat || pfx_closed_at_start;
         ptk.split.open_mk = srv->think_open_mk;
         ptk.split.close_mk = srv->think_close_mk;
+        ptk.split.inkling = model_uses_ik_template(eng);
         ptk.tok = srv->tok;
         ptk.cap = 64;
         ptk.buf = cwick_xmalloc(ptk.cap);
@@ -5200,7 +5481,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * generation leaves the state at a position no client will ever ask to
      * continue from, and a snapshot keyed on a truncated reply is dead weight
      * in the cache. */
-    if (srv->pfx && !res.interrupted)
+    if (srv->pfx && !res.interrupted && !model_uses_ik_template(eng))
         pfx_save_generated(srv, eng, ids, nids, res.tokens, res.n_tokens,
                            req_tag(gr->rid));
 
@@ -5221,9 +5502,60 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * GLM answers "<reasoning></think><visible answer>", exactly like the
      * OpenAI-compatible endpoint of the model: `reasoning_content` carries
      * the first half, `content` the second. */
+    const bool is_ik = gr->is_chat && model_uses_ik_template(eng);
     char *reasoning = NULL;
     char *answer = NULL;
-    if (gr->is_chat)
+    cwick_tool_call *calls = NULL;
+    size_t ncalls = 0;
+    char *visible = NULL;
+    bool ik_parsed = false;
+    if (is_ik) {
+        ik_output parsed;
+        if (ik_output_parse(text, &parsed, err) != CWICK_OK) {
+            if (stream_report_error(&sc, streaming, err))
+                snprintf(detail, detail_cap, "stream aborted: malformed Inkling output");
+            cwick_metrics_request_error("malformed_model_output");
+            stream_ctx_free(&sc); free(text); free(ids); cwick_gen_result_free(&res);
+            return;
+        }
+        reasoning = parsed.reasoning;
+        answer = parsed.content;
+        parsed.reasoning = NULL;
+        parsed.content = NULL;
+        ik_parsed = true;
+        if (parsed.n_calls) {
+            if (!gr->tools.present || !gr->tools.advertise) {
+                cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
+                                "model emitted a tool call but none were declared");
+                ik_output_free(&parsed);
+                if (stream_report_error(&sc, streaming, err))
+                    snprintf(detail, detail_cap, "stream aborted: undeclared tool");
+                cwick_metrics_request_error("undeclared_tool");
+                stream_ctx_free(&sc); free(text); free(reasoning); free(answer);
+                free(ids); cwick_gen_result_free(&res);
+                return;
+            }
+            calls = cwick_xmalloc(parsed.n_calls * sizeof(*calls));
+            memset(calls, 0, parsed.n_calls * sizeof(*calls));
+            ncalls = parsed.n_calls;
+            for (size_t i = 0; i < ncalls; i++) {
+                if (strlen(parsed.calls[i].name) >= sizeof(calls[i].name)) {
+                    cwick_error_set(err, CWICK_ERR_PARSE, "Inkling tool name is too long");
+                    ik_output_free(&parsed); cwick_tool_calls_free(calls, ncalls);
+                    if (stream_report_error(&sc, streaming, err))
+                        snprintf(detail, detail_cap, "stream aborted: malformed tool call");
+                    cwick_metrics_request_error("malformed_tool_call");
+                    stream_ctx_free(&sc); free(text); free(reasoning); free(answer);
+                    free(ids); cwick_gen_result_free(&res);
+                    return;
+                }
+                snprintf(calls[i].id, sizeof(calls[i].id), "call_%s_%zu", idbuf, i);
+                snprintf(calls[i].name, sizeof(calls[i].name), "%s", parsed.calls[i].name);
+                calls[i].arguments_json = cwick_strdup(parsed.calls[i].arguments_json);
+            }
+        }
+        ik_output_free(&parsed);
+    } else if (gr->is_chat)
         split_reasoning(text, srv->think_open_mk, srv->think_close_mk,
                         pfx_closed_at_start, &reasoning, &answer);
     else answer = cwick_strdup(text);
@@ -5248,7 +5580,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * function_call item the same way. */
     bool promoted = false;
     size_t promoted_n = 0;
-    if (gr->is_chat && gr->tools.present && gr->tools.advertise &&
+    if (!is_ik && gr->is_chat && gr->tools.present && gr->tools.advertise &&
         !pfx_closed_at_start && answer && !*answer &&
         !(srv->think_close_mk && strstr(text, srv->think_close_mk))) {
         size_t cut = 0, n = 0;
@@ -5284,10 +5616,7 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * answer is read back out of raw text. A malformed tool call is a
      * request we cannot honour, and it is refused rather than forwarded
      * half-parsed. */
-    cwick_tool_call *calls = NULL;
-    size_t ncalls = 0;
-    char *visible = NULL;
-    if (gr->tools.present && gr->tools.advertise) {
+    if (!ik_parsed && gr->tools.present && gr->tools.advertise) {
         if (cwick_tools_extract(answer, &calls, &ncalls, &visible, err) != 0) {
             if (stream_report_error(&sc, streaming, err))
                 snprintf(detail, detail_cap, "stream aborted: malformed tool call");
@@ -5346,6 +5675,46 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
             }
         }
     }
+    if (ik_parsed && calls) {
+        visible = cwick_strdup(answer ? answer : "");
+        for (size_t i = 0; i < ncalls; i++) {
+            char orig[192];
+            snprintf(orig, sizeof(orig), "%s", calls[i].name);
+            cwick_decl_match m = cwick_tool_decl_match(&calls[i], &gr->tools);
+            if (m == CWICK_DECL_FOLDED)
+                CWICK_TRAC(req_tag(gr->rid),
+                           "tool name `%s` folded to the declared spelling `%s`",
+                           orig, calls[i].name);
+            if (m == CWICK_DECL_UNKNOWN) {
+                cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
+                                "model emitted undeclared tool `%s`", calls[i].name);
+                if (stream_report_error(&sc, streaming, err))
+                    snprintf(detail, detail_cap, "stream aborted: undeclared tool");
+                cwick_metrics_request_error("undeclared_tool");
+                cwick_tool_calls_free(calls, ncalls);
+                stream_ctx_free(&sc); free(text); free(reasoning); free(answer);
+                free(visible); free(ids); cwick_gen_result_free(&res);
+                return;
+            }
+        }
+        if (strcmp(gr->tools.choice, "named") == 0) {
+            bool matched = false;
+            for (size_t i = 0; i < ncalls; i++)
+                if (strcmp(calls[i].name, gr->tools.forced) == 0) matched = true;
+            if (!matched) {
+                cwick_error_set(err, CWICK_ERR_UNSUPPORTED,
+                                "tool_choice asked for `%s` but the model did not call it",
+                                gr->tools.forced);
+                if (stream_report_error(&sc, streaming, err))
+                    snprintf(detail, detail_cap, "stream aborted: tool_choice not satisfied");
+                cwick_metrics_request_error("tool_choice");
+                cwick_tool_calls_free(calls, ncalls);
+                stream_ctx_free(&sc); free(text); free(reasoning); free(answer);
+                free(visible); free(ids); cwick_gen_result_free(&res);
+                return;
+            }
+        }
+    }
     char *tcalls = tool_calls_json(calls, ncalls, false);
     if (reasoning && *reasoning) {
         char buf[256];
@@ -5360,10 +5729,13 @@ static void run_generation(server_ctx *srv, gen_request *gr, int fd,
      * only adds the token counts that belong to the HTTP request itself,
      * including the decode-phase split (thinking / content / tools). */
     size_t ph_counts[3] = { 0, 0, 0 };
-    cwick_phase_account_mk(srv->tok, res.tokens, (size_t)res.n_tokens,
-                           gr->is_chat, ph_counts,
-                           srv->think_open_mk, srv->think_close_mk,
-                           pfx_closed_at_start);
+    if (is_ik)
+        cwick_phase_account_ik(srv->tok, res.tokens, (size_t)res.n_tokens, ph_counts);
+    else
+        cwick_phase_account_mk(srv->tok, res.tokens, (size_t)res.n_tokens,
+                               gr->is_chat, ph_counts,
+                               srv->think_open_mk, srv->think_close_mk,
+                               pfx_closed_at_start);
     /* The ceiling this turn ran under, and whether it had to be enforced.
      * The engine may have clamped the level's number to what the output budget
      * could honour, so report what it actually applied — a level of 8192

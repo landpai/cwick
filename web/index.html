@@ -86,7 +86,7 @@
           <div class="empty-logo">c</div>
           <h2 data-i18n="chat.emptyTitle">在这台 Mac 上直接对话</h2>
           <p><span data-i18n="chat.emptyBody">页面由 cwick 自己托管，请求发往同源的</span> <code>/v1/chat/completions</code>、
-             <code>/v1/responses</code> <span data-i18n="chat.emptyBody2">或</span> <code>/v1/messages</code><span data-i18n="chat.emptyBody3">（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。</span></p>
+             <code>/v1/responses</code><span data-i18n="chat.emptyBody2">、</span><code>/v1/messages</code><span data-i18n="chat.emptyBody3"> 或 </span><code>/v1/systemone</code><span data-i18n="chat.emptyBody4">（下方"接口"可选）。模型全程本地运行，权重走 SSD 流式，对话不出机器。</span></p>
           <div class="examples">
             <button class="example" data-i18n="chat.ex1" data-prompt="用三句话解释 Mixture-of-Experts 为什么能在低内存机器上跑大模型。">解释 MoE 与低内存</button>
             <button class="example" data-i18n="chat.ex2" data-prompt="写一个 C 函数，把 UTF-8 字符串按标点切分成句子，要求不破坏多字节字符。">写一段 C 代码</button>
@@ -101,8 +101,13 @@
           <button id="leaveQueue" class="link-btn">撤销</button>
         </div>
         <div class="composer" id="composer">
-          <textarea id="input" rows="1" data-i18n-ph="chat.placeholder" placeholder="给 cwick 发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+          <div class="composer-input">
+            <div id="draftImages" class="draft-images" hidden></div>
+            <textarea id="input" rows="1" data-i18n-ph="chat.placeholder" placeholder="给 cwick 发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+          </div>
           <div class="composer-side">
+            <input id="imageInput" type="file" accept="image/*" multiple hidden>
+            <button id="attachBtn" class="attach" type="button" data-i18n-title="chat.attach" title="添加图片" aria-label="添加图片">＋</button>
             <button id="sendBtn" class="send" title="发送 (Enter)">
               <span aria-hidden="true">↑</span>
             </button>
@@ -116,6 +121,7 @@
               <option value="chat" selected>chat/completions</option>
               <option value="responses">responses</option>
               <option value="messages">messages</option>
+              <option value="systemone">systemone</option>
             </select>
           </label>
           <label class="field">
@@ -135,6 +141,10 @@
           </label>
           <label class="switch"><input id="streamToggle" type="checkbox" checked><span data-i18n="chat.stream">流式</span></label>
           <label class="switch" data-i18n-title="chat.toolsTip" title="声明 get_current_time / add_numbers / system_info，模型调用时由页面在本地执行"><input id="toolToggle" type="checkbox"><span data-i18n="chat.tools">示例工具</span></label>
+          <div id="systemOneFields" class="systemone-fields" hidden>
+            <label class="field"><span data-i18n="chat.systemQuestion">决策问题</span><input id="systemQuestion" type="text" value="What is shown in the image?"></label>
+            <label class="field"><span data-i18n="chat.systemOptions">选项（逗号分隔）</span><input id="systemOptions" type="text" value="carrot,corn,other"></label>
+          </div>
           <span class="spacer"></span>
           <span id="genStats" class="gen-stats mono"></span>
         </div>
@@ -450,6 +460,7 @@
               <option value="chat">/v1/chat/completions</option>
               <option value="responses">/v1/responses</option>
               <option value="messages">/v1/messages</option>
+              <option value="systemone">/v1/systemone</option>
             </select>
           </label>
           <label class="row">

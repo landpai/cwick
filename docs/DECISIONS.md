@@ -6147,3 +6147,104 @@ points. As in §114, the running service predates this binary; new clips need a
 restart, and an existing MP4 cannot be repaired by remuxing alone because the
 wrong sync table is already written (a clean remux with the fixed muxer from
 the elementary streams would be needed).
+
+## §116 Inkling long prefill crashed because the logit scratch was chunk-sized
+
+A 145-token prompt died at `64/145` inside `_platform_memmove` called from
+`ik_layer_forward()`. The stack pointed at an unrelated memcpy; the fault was
+one frame earlier. `ik_attn_range()` wrote one logit per visible key into
+`ascores`, a buffer sized `IK_CHUNK + 1` (65 floats). A full-attention token at
+position 65 sees 66 keys, so the second chunk wrote one float past the end for
+every (token, head), and by token 127 it was 63 floats past. Heap damage then
+surfaced in the next memcpy. The same bug killed `/v1/systemone` on its first
+120-token question.
+
+Fix: size the logit rows by absolute position, not by chunk.
+`ik_scratch_scores()` grows `[IK_CHUNK][pos + n]` on demand, and the pool now
+dispatches one slice per *token* so a row has exactly one owner — the earlier
+(token, head) split let two heads of the same token write the same row
+concurrently. The capacity guard changed too: sliding attention keeps the
+unclamped absolute position and uses `j % cap` for the ring slot, while full
+attention clamps only the key range to `[0, cap)`. Clamping the query position
+made sliding relative distances wrong after the first window.
+
+Verified: the 145-token CLI prompt completes (9806 ms prefill, 14.79 tok/s),
+and `/v1/systemone` answers a 311-token prompt with HTTP 200 in 21.7 s.
+Image acceptance is now scoped to the Inkling model id: text-only checkpoints
+still return 400 naming the image part instead of silently dropping it, which
+the adapter tests verify. `make test` is PASS again after that scoping fix.
+
+## §117 Inkling loop controllers, convolution direction and BF16 boundaries
+
+The first real-model outputs were incoherent on both CPU and Metal. Tokenizer
+IDs were exact, so the defect was in the shared forward pass. A layer-by-layer
+comparison isolated the first large divergence to loop pass 2, layer 6: the
+prelude and first loop pass were close, and the retrieved cross-pass messages
+were close, but the controller output was not. `ik_control()` had
+`gain_weight` and `forget_weight` in the opposite projections. The formula is
+`(1 - tanh(forget)) * current + tanh(gain) * message`; swapping them changes the
+restart state and the error compounds through every later pass.
+
+Two independent orientation/storage errors were fixed at the same time.
+Sliding K/V convolution weights are stored oldest-tap-first `[channel][tap]`,
+while the kernel indexes newest-first `[lag][channel]`; loading now transposes
+and reverses that axis. The residual stack and normal sublayer outputs round
+to BF16 at the same boundaries as the checkpoint, while unnormalized AttnRes
+mixes, attention accumulation and controller blends remain FP32. Router logits
+also remain FP32 through sigmoid and selection. The vision tower uses the
+checkpoint's `(pixel - 0.5) / 0.5` normalization and BF16 boundaries, not a CLIP
+normalize/remap.
+
+Verification used the checkpoint's own tokenizer and an independent eager
+forward. The arithmetic prompt's IDs match exactly. Before the controller fix,
+layer 6 pass 2 had relative hidden-state error 0.62; after it, the same layer is
+0.021, and the leading logits match. Live Metal requests now answer `4`, identify
+corn and carrots, complete tool calls and answer System One choices. Focused
+regressions cover controller projection order, convolution tap order, BF16
+rounding, image normalization, prompt control-token isolation and the
+Responses string-form image URL.
+
+The expert weights are dequantized once to BF16 and remain resident. Activation
+quantization is not bit-exact with the optimized FP4 path; cwick keeps BF16
+activations, so this is a numerical difference, not pruning or reduced model
+precision.
+
+## §118 Inkling packed-only residency, on-demand image BF16, and attention A/B
+
+The packed expert path is the default. A 26-token prefill takes about 1.37 s and
+decode runs about 8–10 tok/s with an 18.19 GiB wired expert arena. Keeping a
+second full BF16 expert representation resident is opt-in through
+`CWICK_IK_DUAL_EXPERTS=1`; it is not a free correctness fallback. In the same
+process it increased the 26-token packed prefill from about 1.4 s to about
+58 s. The extra 45 GiB BF16 working set also made the small-expert Metal path
+take minutes, so dual residency is rejected as the default.
+
+Image prefill instead dequantizes only the experts selected by the current
+chunk into temporary BF16 buffers, in 64-item batches, and runs the existing
+Metal BF16 GEMM with FP32 accumulation. This preserves the checkpoint's packed
+resident bytes and the BF16/FP32 numerical boundaries without retaining a
+second model-sized copy. Decode uses packed Metal again. A CPU BLAS fallback
+exists for unsupported shapes, but it is not the normal Metal path: CPU BLAS
+does not stage activations to BF16 and its accumulation order changed long
+image outputs. The final image answer is `Corn`, and image System One selects
+`corn` at 0.999928.
+
+The 16-row BF16 GEMM tile passes its numerical probe, but selecting it for the
+real expert batch was slower than the 64-row tile at the measured 1–4 row expert
+shapes. The batch therefore keeps the 64-row tile. The small kernel remains for
+single-item callers. An attempt to replace per-expert bindings with one Metal
+argument-buffer dispatch was also rejected: the driver did not reliably pass
+the batched resources on this machine, while the existing per-expert command
+buffer passes the numerical probe and completes real requests.
+
+`CWICK_IK_GPU_ATTN=1` remains an explicit experiment, not the default. The GPU
+attention probe was close on shaped inputs, but a real 125-token image request
+diverged into mixed-language repetition shortly after position 128, exactly
+when automatic GPU decode attention turned on. With the same binary and
+`CWICK_IK_GPU_ATTN=0`, reasoning remained coherent and the final answer was
+`Corn`; image System One also returned `corn`. Correctness wins over the small
+attention saving, so automatic GPU attention is disabled until a real-model
+logit comparison explains and fixes the drift.
+
+The final full-chain results and the honest gap to the 80/40 tok/s targets are
+recorded in `docs/PERF.md` and `docs/PERF.zh-CN.md`.

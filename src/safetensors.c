@@ -269,6 +269,16 @@ static cwick_status saf_parse_shard(cwick_safetensors *saf, const char *shard,
                                  (int)(nlen - 7), name);
                     }
                 }
+                /* The Inkling-2 exporter uses `<name>_weight` beside
+                 * `<name>_weight_scale`; unlike the compressed-tensors naming
+                 * above there is no dot to strip. The paired scale is a U8
+                 * block-scale tensor and is read by the backend itself. */
+                if (!cwick_json_get(root, dname)) {
+                    size_t nlen = strlen(name);
+                    if (nlen > 7 && strcmp(name + nlen - 7, "_weight") == 0) {
+                        snprintf(dname, sizeof(dname), "%s_scale", name);
+                    }
+                }
                 /* A tensor that names itself a scale has no scale of its own.
                  * MiniMax-M3.1 stores the expert block scales as e4m3 -- a
                  * `*.weight_scale` beside a `*.weight_packed` -- so the byte

@@ -19,8 +19,8 @@ The name is the picture: a wick is the narrow thread that lets a large body of
 wax burn. Here the wax is an 18–475 GiB weight bank on the SSD, and the wick is
 the few gigabytes per token that actually cross the bus.
 
-Seven checkpoints are supported end to end today — not by design a closed list,
-but each needs its own loader, quantizers, prompt renderer and kernels. Four are
+Eight checkpoints are supported end to end today — not by design a closed list,
+but each needs its own loader, quantizers, prompt renderer and kernels. Five are
 text models, one generates images, one generates video and one is a full-duplex
 speech model:
 
@@ -30,11 +30,12 @@ speech model:
 | **DeepSeek-V4.1-Flash-1017** | ≈475 GiB, 48 shards | 40 layers, 384 routed experts top-6, MLA + FP4 experts + FP8 attention | the largest one that still fits a laptop |
 | **MiniMax-M3.1-Flash** | ≈233 GiB, 48 shards | 60 layers (3 dense), 128 experts top-4, NVFP4 experts + FP8 dense | the smallest of the MoE models |
 | **DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic** (Qwen3.5-9B) | ≈18 GiB, 4 shards | 32 layers: 24 Gated DeltaNet + 8 GQA, dense BF16, no experts | hybrid linear attention; the only dense text model, held wholly in RAM, and the fastest |
+| **Inkling-2-Mini** | ≈18.18 GiB, 1 shard | 24 stored layers, loop core run 3×, 128 experts top-8, NVFP4/MXFP8 + vision tower | complete text+image understanding with packed experts resident in 18.19 GiB |
 | **MiniMax-H3-Image** | ≈190 GiB, two trees | Qwen3-VL conditioner → 50-layer DiT → tiled ViT VAE | text-to-image and image editing behind the OpenAI image API |
 | **MiniMax-H3** | ≈72 GiB resident (Ref2VA subset) | 50-layer DiT (hidden 5376, 24 video latents) → tiled video VAE + audio VAE → mp4 | text- and reference-image-to-video behind the async `/v1/videos` job API |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64-layer FP8 thinker → talker → flow + HiFT, 24 kHz | full-duplex speech over a WebSocket, hearing and speaking in the same turn |
 
-One model is resident at a time across **all seven**: the image, video and
+One model is resident at a time across **all eight**: the image, video and
 speech pipelines are hot-switched through the same `/v1/models/switch` as the
 text backends, and each release the previous pipeline before loading. The quality
 rule is not negotiable and is enforced at load time for the text models:
@@ -50,6 +51,7 @@ instead of quietly running a smaller model.
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+  - [Text + image with Inkling-2-Mini](#text--image-with-inkling-2-mini)
 - [Configuration](#configuration)
 - [API](#api)
 - [Models, context and memory](#models-context-and-memory)
@@ -138,9 +140,10 @@ benchmark command — which is the actual point. A verdict is a file, not a feel
   compressor off the pages every token touches.
 * **Smaller Macs** work through the same path — SSD streaming is not a fallback
   mode, it is how every model larger than RAM runs.
-* **Metal** accelerates the GLM and DeepSeek backends (expert GEMV, batched
-  projections) and is the default on Apple Silicon; `--backend cpu` forces the
-  CPU path. At startup it raises the GPU wired-memory ceiling to 80% of RAM
+* **Metal** accelerates GLM, DeepSeek, Qwen3.5 and Inkling-2-Mini (expert GEMV,
+  batched projections and packed Inkling experts) and is the default on Apple
+  Silicon; `--backend cpu` forces the CPU path. At startup it raises the GPU
+  wired-memory ceiling to 80% of RAM
   and wires the inference state — KV cache, indexer pools, recurrent state — so
   the pages every token touches are neither compressed nor swapped. Expert blobs
   that live in the GPU arena are bound to the next dispatch without a copy, which
@@ -163,7 +166,8 @@ client (curl / coding agent / desktop chat app / web console / WebSocket)
         │              ├── GLM-5.3-flash : spine.c  attention.c  moe.c  pfx.c
         │              ├── DeepSeek-V4.1  : ds_model.c  ds_ops.c  ds_quant.c
         │              ├── MiniMax-M3.1   : mm_model.c  mm_prompt.c
-        │              └── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
+        │              ├── Qwen3.5-9B     : q35_model.c  q35_prompt.c  q35_gpu.c
+        │              └── Inkling-2-Mini : ik.c  ik_engine.c  ik_prompt.c  ik_vision.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► text encode → DiT → tiled VAE
         ├── /v1/videos ──► h3v.c ──► text encode → Ref2VA DiT → tiled video VAE + audio VAE → mp4
         ├── /v1/realtime (WebSocket) ──► ws.c + rt_realtime.c ──► VAD + session state
@@ -195,7 +199,7 @@ state on this machine
 - **The web console is compiled in** (`src/webui_embed.c`), so `--web` needs no
   assets on disk and no second process; the apps are files under `apps/`, served
   by the same server and stored in sqlite.
-- **One model resident at a time across all seven pipelines.** That is a bandwidth
+- **One model resident at a time across all eight pipelines.** That is a bandwidth
   decision, not a missing feature: two generations would halve each other's
   cache. Switching to the image, video or speech model releases the text engine
   first, and switching back releases it again.
@@ -206,11 +210,11 @@ state on this machine
 
 - macOS on Apple Silicon, and `clang`. Nothing else — see
   [Supported hardware](#supported-hardware) for the memory design point.
-- A checkpoint: ~18 GiB (Qwen3.5), ~233 GiB (MiniMax), ~306 GiB (GLM) or
-  ~475 GiB (DeepSeek) of SSD free for text; the image model needs ~190 GiB, the
-  video model ~72 GiB resident (Ref2VA subset; the full root holds both
-  partitions) and the speech model ~42 GiB. Download each as published — there
-  is no conversion step.
+- A checkpoint: ~18 GiB (Qwen3.5 or Inkling-2-Mini), ~233 GiB (MiniMax),
+  ~306 GiB (GLM) or ~475 GiB (DeepSeek) of SSD free for text; the image model
+  needs ~190 GiB, the video model ~72 GiB resident (Ref2VA subset; the full root
+  holds both partitions) and the speech model ~42 GiB. Download each as
+  published — there is no conversion step.
 
 ### 1. Build and test
 
@@ -241,6 +245,14 @@ A downloaded directory already *is* a model root: `config.json` plus shards is
 all the loader needs, and the contract validator will refuse a checkpoint whose
 quality knobs were tampered with.
 
+For the text+image model:
+
+```sh
+./download_model.sh thinkingmachines/Inkling-2-Mini \
+    -o ./models/thinkingmachines/Inkling-2-Mini \
+    --include '*.safetensors' '*.json' -j 2
+```
+
 ### 3. Serve
 
 ```sh
@@ -248,6 +260,10 @@ sh ./start.sh glm              # GLM-5.3-flash,      0.0.0.0:8001, 500K context
 sh ./start.sh deepseek         # DeepSeek-V4.1-Flash, same
 sh ./start.sh minimax          # MiniMax-M3.1-Flash, 32K context (its KV is 2.3 KiB/position/layer)
 sh ./start.sh qwen3.5-9b       # Qwen3.5-9B, 128K context (dense BF16, 18 GiB wired resident at load)
+
+# Inkling-2-Mini has its own multimodal server configuration.
+./cwick serve --root ./models/thinkingmachines/Inkling-2-Mini \
+  --backend metal --context 32768 --port 8001 --web --jev
 ```
 
 The Qwen3.5 checkpoint is announced to clients as
@@ -316,6 +332,67 @@ and both named API keys and `x-api-key` authenticate them. The built-in console
 speaks all three: its **接口** selector decides which endpoint the next turn goes
 to, and every dialect feeds the same bubbles, tool cards and stats line.
 
+### Text + image with Inkling-2-Mini
+
+`Inkling-2-Mini` accepts text and local images through all four interfaces. A
+turn may contain several images, and an image-only turn is valid. Image inputs
+are base64 data or `data:image/...;base64,...` URLs; remote HTTP URLs are
+rejected. The same vision tower and image-placeholder expansion are used by
+Chat Completions, Responses, Anthropic Messages and System One.
+
+```sh
+IMAGE=$(base64 -i corn.jpg | tr -d '\n')
+
+# OpenAI Chat Completions
+curl -s http://127.0.0.1:8001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_tokens\":128,
+       \"messages\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$IMAGE\"}}]}]}"
+
+# OpenAI Responses
+curl -s http://127.0.0.1:8001/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_output_tokens\":128,
+       \"input\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"input_text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,$IMAGE\"}]}]}"
+
+# Anthropic Messages
+curl -s http://127.0.0.1:8001/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"max_tokens\":128,
+       \"messages\":[{\"role\":\"user\",\"content\":[
+         {\"type\":\"text\",\"text\":\"What vegetable is shown? Reply with one word.\"},
+         {\"type\":\"image\",\"source\":{\"type\":\"base64\",
+           \"media_type\":\"image/jpeg\",\"data\":\"$IMAGE\"}}]}]}"
+
+# System One: one prefill, no generated tokens, stream/thinking stay disabled
+curl -s http://127.0.0.1:8001/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Inkling-2-Mini\",\"state\":\"Image input.\",
+       \"images\":[\"data:image/jpeg;base64,$IMAGE\"],
+       \"questions\":{\"vegetable\":{\"type\":\"choice\",
+         \"instructions\":\"What vegetable is shown in the image?\",
+         \"criteria\":[\"corn\",\"carrot\",\"potato\"]}}}"
+```
+
+The three chat dialects also stream image-bearing turns with their normal SSE
+event shapes. Tool results and function-call outputs can carry images in the
+same request history. The bundled Web console supports multi-image selection,
+paste, drag-and-drop, preview/removal and image-only turns; image blobs are kept
+in IndexedDB with a 64 MiB cap while localStorage stores only references, so
+history replays after reload. Its System One mode sends the same ordered image
+list and disables stream, tools and thinking.
+
+Inkling keeps the complete model: all 24 stored layers, the three loop passes,
+128 experts and top-8. Packed NVFP4/MXFP8 experts remain resident (18.19 GiB
+wired); image prefill materializes only active experts into temporary BF16
+buffers, and decode uses packed Metal. See
+[docs/PERF.md](docs/PERF.md) for full-chain measurements and
+[docs/DECISIONS.md](docs/DECISIONS.md) §118 for the numerical-policy rationale.
+
 ### Logs and metrics
 
 The server prints every diagnostic to **stdout**, one line per event, each with a
@@ -361,7 +438,10 @@ GEMMs plus tiled attention); `CWICK_H3V_GPU=0` forces the CPU path for A/B.
 no second process, same port as the API. Five tabs: **对话** chat (streamed over
 `/v1/chat/completions`, `/v1/responses` or `/v1/messages` — the composer's
 **接口** selector picks the dialect per turn, and all three are rendered by the
-same code path, with reasoning and tool calls shown separately),
+same code path, with reasoning and tool calls shown separately). The composer
+also accepts multiple images by file picker, paste or drag-and-drop, with
+preview/removal and IndexedDB-backed replay after reload. A System One mode
+sends image-bearing decisions and renders the choice/probability result;
 **应用** the app market, **模型** the model library, **日志** this process's own
 stdout and stderr (a bounded ring, so the browser follows a running serve), and
 **设置** — the console and the settings in one place: live `/v1/metrics` with
@@ -442,9 +522,9 @@ serve also have an environment twin:
 |---|---|---|
 | `--root DIR` | — | model root: `config.json` plus the published shards |
 | `--host` / `--port` | `127.0.0.1` / `8000` | `start.sh` binds `0.0.0.0:8001` |
-| `--context N` | 131072 | KV capacity in tokens (>100K); `run` defaults to 4096. `start.sh` uses 500000, or 32768 for MiniMax |
+| `--context N` | 131072 | KV capacity in tokens (>100K); `run` defaults to 4096. `start.sh` uses 500000, 32768 for MiniMax and the documented Inkling command uses 32768 |
 | `--max-tokens N` | 1000000 | default `max_tokens` for requests that omit it, clamped to whatever the window leaves; `start.sh` passes 8192 |
-| `--backend metal\|cpu` | metal on Apple Silicon | expert GEMV, batched projections, and the whole Qwen3.5 decode step on the GPU |
+| `--backend metal\|cpu` | metal on Apple Silicon | expert GEMV, batched projections, packed Inkling experts, and the whole Qwen3.5 decode step on the GPU |
 | `--mem-fraction PCT` | 80 | share of host RAM the process may occupy |
 | `--max-memory GiB` | — | absolute ceiling; wins when it is smaller |
 | `--allow-swap` | off | stop wiring the spine and the expert arena (debugging only) |
@@ -484,10 +564,10 @@ to `./models`; it is in `.gitignore`.
 | GET | `/v1/videos/{id}` | poll a job: `status`, `progress`, `phase`, `steps_done`/`steps_total`; when done, a `cwick` object with per-phase timings, `spatial_corr`, `snr_db`, `suspect_noise` |
 | GET | `/v1/videos/{id}/content` | stream the finished mp4 |
 | POST | `/v1/completions` | raw text completion, streaming or not |
-| POST | `/v1/chat/completions` | messages, `stream`, `tools`, `reasoning_effort` |
-| POST | `/v1/responses` | Responses dialect: `input` items in, a `response` object / `response.*` events out |
-| POST | `/v1/messages` | Anthropic dialect: `system` + content blocks in, a `message` object / `message_start…message_stop` out |
-| POST | `/v1/systemone` | typed decisions (choice / score / noul) read from one prefill; requires `--jev`; also `/inference/v1/systemone` |
+| POST | `/v1/chat/completions` | messages, `stream`, `tools`, `reasoning_effort`; Inkling adds ordered text+image content |
+| POST | `/v1/responses` | Responses dialect: `input` items in, a `response` object / `response.*` events out; Inkling accepts `input_image` parts |
+| POST | `/v1/messages` | Anthropic dialect: `system` + content blocks in, a `message` object / `message_start…message_stop` out; Inkling accepts base64 `image` blocks |
+| POST | `/v1/systemone` | typed decisions (choice / score / noul) read from one prefill; requires `--jev`; Inkling accepts ordered `image` / `images`; also `/inference/v1/systemone` |
 | GET | `/v1/systemone` | the live decision adapter: family, prompt grammar, readable letters, limits |
 | GET | `/v1/hub/models` | checkpoints already under `./models`, with size and completeness |
 | DELETE | `/v1/hub/models/<name>` | delete a downloaded checkpoint (recursive, confined to `./models`); 409 for the resident model or an active download |
@@ -539,18 +619,21 @@ every option; `score` returns the probability-weighted level index plus a legend
 `noul` returns the probability that the statement holds (its two sides are named
 by `criteria` — `{"true": …, "false": …}`). `state` may be a string or any JSON
 value. `instructions` is required on every question. Up to ten questions per
-request, up to 26 options each. The published path is `/inference/v1/systemone`;
-`/v1/systemone` is the short form.
+request, up to 26 options each. With `Inkling-2-Mini`, top-level `image` or
+`images` accepts the same local base64/data-URL inputs as the chat dialects;
+image-only state falls back to `Image input.`. The published path is
+`/inference/v1/systemone`; `/v1/systemone` is the short form.
 
 **It follows the model.** Each supported checkpoint gets its own prompt grammar
 and its own answer spelling: GLM and DeepSeek get the turn with the thinking
 block already closed (`glm-chat-closed`, `deepseek-chat-closed`), MiniMax gets
-its plain chat turn (`minimax-chat-plain`). The adapter is resolved when the
+its plain chat turn (`minimax-chat-plain`), and Inkling gets
+`inkling2-chat-plain`. The adapter is resolved when the
 tokenizer loads and again after every `POST /v1/models/switch`, so switching the
 model switches the interface underneath this endpoint — there is no path where a
 MiniMax prompt is read out of GLM logits. `GET /v1/systemone` publishes the live
 one; `make jevprobe` prints the per-letter token table for a tokenizer without
-loading any weights (all three shipped checkpoints: 26/26 letters, space-led).
+loading any weights (all five shipped text checkpoints: 26/26 letters, space-led).
 
 A request that names a model the server no longer serves is refused with a 400
 naming the resident one. That is deliberate: an app that cached a model id
@@ -569,7 +652,8 @@ same pass, so a nine-cell board costs the same as a two-way choice. On this
 machine a 550-token decision on MiniMax takes 95.5 s, and a three-question
 request on the 320B checkpoint takes 306 s — the prefill is essentially all of
 it, because the endpoint generates no tokens and there is nothing else to
-amortise.
+amortise. Inkling's 550-token three-question request takes 20.92 s (26.30 tok/s),
+and its 233-token image decision takes 32.81 s (7.10 tok/s including vision).
 
 **A request's questions share one prefill.** Every question in a request begins
 with the same `system` + `<state>` turn, so the endpoint encodes all of them
@@ -602,6 +686,7 @@ a local fallback for a refused or slow decision.
 | DeepSeek-V4.1-Flash-1017 | 500K | compressed MLA | 6 of 384 × 40 layers | 2.8 tok/s |
 | MiniMax-M3.1-Flash | 32K | bf16 GQA, 2.3 KiB/position/layer | 4 of 128 × 57 layers | 1.48 tok/s |
 | Qwen3.5-9B | 128K | f32 GQA 64 KiB/position + 50 MiB DeltaNet state | none — dense, held wholly in RAM | **20.0 tok/s** |
+| Inkling-2-Mini | 32K | 2.32 GiB KV + convolution state | 8 of 128, packed NVFP4/MXFP8 | **8.5–9.4 tok/s** |
 
 Context is not free and it is not abstract: 500K positions on MiniMax would be
 64 GiB of KV, which comes straight out of the expert cache and therefore out of
@@ -627,6 +712,13 @@ Staying under the ceiling is not enough on its own, so the spine and the expert
 arena are **wired** by default: the VM can neither compress nor page the bytes
 every token reads. `--allow-swap` opts out, and exists for debugging a plan that
 does not fit, not for running one.
+
+Inkling-2-Mini is small enough to keep whole: cold start is 3.57 s, with 18.19 GiB
+of packed weights plus 2.32 GiB of inference state wired. The final benchmark
+process had a 22.4 GiB physical footprint and `swapped_out=0K`. Image requests do
+not retain a second BF16 expert copy; they create temporary BF16 buffers only for
+the active experts. `CWICK_IK_DUAL_EXPERTS=1` is a debug-only opt-in, not the
+default, because the larger working set made packed prefill substantially slower.
 
 ## Long prompts and the prefix cache
 
@@ -776,6 +868,12 @@ decode is the default 21 GiB cache from the work in
 | Qwen3.5-9B | prefill, 14,060-token prompt | 184 s | **76.2** | flat: both attention passes are GEMMs (DECISIONS §54) |
 | Qwen3.5-9B | prefill, 30,970-token prompt | 436 s | **71.0** | 94% of the flat rate at 30K — a block spends 2.3 s in attention, 4.5 s in projections |
 | Qwen3.5-9B | decision, 3 questions / 525 tokens | 9.44 s | **55.6** | three prefills, no decode (see [docs/PERF.md](docs/PERF.md)) |
+| Inkling-2-Mini | text prefill, 86 tokens | 3.5–3.7 s | **23.3–24.8** | full-chain stream benchmark, `max_tokens=64` |
+| Inkling-2-Mini | text decode | 106–117 ms/token | **8.5–9.4** | same requests; packed Metal experts |
+| Inkling-2-Mini | image prefill, 126 tokens (96 image) | 13.5–14.5 s | **8.7–9.3** | vision + on-demand active-expert BF16 Metal GEMM |
+| Inkling-2-Mini | image decode | 110–124 ms/token | **8.1–9.1** | same requests; complete answer `Corn` |
+| Inkling-2-Mini | text decision, 3 questions / 550 tokens | 20.92 s | **26.3** | no decode |
+| Inkling-2-Mini | image decision, 1 question / 233 tokens | 32.81 s | **7.1** | `corn` p=0.999928, no decode |
 
 The three non-text pipelines have their own units — one rendered image, one
 mp4 or one spoken reply, not a token rate. All measured on the same M3 Max:
@@ -809,6 +907,7 @@ per step. Same method as the table above:
 | DeepSeek-V4.1 | 2.78 tok/s | ~18 GB, mostly bf16 dense | expert fp4 GEMV measures 58.5 GB/s |
 | MiniMax-M3.1 | 1.48 tok/s | ~5 GiB of misses | same-shard read ceiling; a cache above 30 GiB feeds the compressor |
 | Qwen3.5-9B | 20.0 tok/s | ~16.5 GB, all resident | the GPU's path to memory: 341 GB/s of a measured 368 (§61) |
+| Inkling-2-Mini | 9.4 tok/s | selected packed experts from an 18.19 GiB resident arena | expert bandwidth plus per-layer host synchronization |
 
 The limits are arithmetic rather than a missing optimisation: an MoE step moves 20–30 GB,
 the CPU cluster reads at most 123 GB/s, and the engine serves one token per weight read
@@ -845,8 +944,9 @@ kept, and the ones that lost are written down in
 [docs/DECISIONS.md](docs/DECISIONS.md) — including the ones that looked obvious.
 
 ```sh
-make test        # 804 checks: engines, sampler, prefix cache, server, web UI, apps, image, video, speech
+make test        # 869 checks: engines, sampler, prefix cache, server, web UI, apps, image, video, speech
 make bench       # kernel timings without loading a checkpoint
+make h3vgpuprobe # Metal GEMM/attention numerical probe, no checkpoint required
 make h3vprobe    # video pipeline prober (built separately, not part of make test)
 make h3vmuxprobe # mp4 container checks: avcC, ctts, stss
 ```
@@ -857,7 +957,8 @@ reference implementation to 1e-5 (the fp8 tiled GEMM measures 8.3e-6, the FP4
 grouped kernel is bit-identical to the single-row one). `cwick doctor` reads
 every resident byte plus a strided sample of the expert bank, so a corrupt shard
 is found before a request is, and `/v1/metrics` publishes the same state the logs
-print.
+print. Inkling's fixed arithmetic prompt returns `4`, all three image dialects
+return `Corn`, and image System One returns `corn` with probability 0.999928.
 
 ## Detailed Guides
 
@@ -913,6 +1014,7 @@ cwick/
 │   ├── ds_*.c         DeepSeek-V4.1 backend: FP4 experts, FP8 attention
 │   ├── q35_*.c        Qwen3.5 backend: Gated DeltaNet + gated GQA, dense BF16
 │   ├── mm_*.c         MiniMax-M3.1 backend: NVFP4 experts, bf16 GQA
+│   ├── ik_*.c         Inkling-2-Mini backend: loop MoE, packed experts, vision tower
 │   ├── h3*.c/.m       MiniMax-H3-Image: conditioner, DiT, tiled VAE
 │   ├── h3v*.c/.m      MiniMax-H3 video: Ref2VA DiT, temporal/tiled VAE, mp4
 │   ├── rt_*.c         speech: .pt reader, audio tower, thinker, talker, flow, HiFT, VAD
@@ -927,7 +1029,7 @@ cwick/
 ├── web/               console source: index.html, app.js, app.css, login.html
 ├── apps/              four H5 apps plus manifest.json (tic-tac-toe, kart, image, TeachMe)
 ├── docs/              architecture, storage, performance, decisions, server, precision, image, video, realtime
-├── tests/             test_cwick.c — 804 checks
+├── tests/             test_cwick.c — 869 checks
 ├── tools/             standalone C probes: kernels, layer tests, model runners
 ├── start.sh           recommended entry point (prefix cache + web + LAN + password)
 └── download_model.sh  resumable checkpoint download

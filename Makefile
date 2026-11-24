@@ -25,6 +25,7 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
        src/h3.c src/h3_gpu.c src/h3_gpu.m \
        src/h3v.c src/h3v_gpu.c src/h3v_gpu.m src/h3v_vae.c src/h3v_audio.c src/h3v_mp4.m \
+       src/ik.c src/ik_vision.c src/ik_engine.c src/ik_prompt.c \
        src/spine.c src/tensor.c src/pool.c \
        src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
        src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
@@ -38,6 +39,7 @@ HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/m
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
        src/mm.h src/mm_engine.h src/mm_prompt.h \
        src/q35.h src/q35_engine.h src/q35_prompt.h src/q35_gpu.h src/h3.h src/h3_gpu.h \
+       src/ik.h src/ik_engine.h src/ik_prompt.h \
        src/h3v.h src/h3v_gpu.h src/h3v_internal.h \
        src/rt_torch.h src/rt_thinker.h src/rt_audio.h src/rt_dsp.h src/rt_hift.h src/rt_flow.h \
        src/rt_talker.h src/rt_vad.h src/rt_realtime.h src/ws.h
@@ -66,6 +68,7 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
        src/q35_model.c src/q35_engine.c src/q35_prompt.c src/q35_gpu.c src/q35_shader.c \
             src/h3.c src/h3_gpu.c src/h3_gpu.m \
             src/h3v.c src/h3v_gpu.c src/h3v_gpu.m src/h3v_vae.c src/h3v_audio.c src/h3v_mp4.m \
+            src/ik.c src/ik_vision.c src/ik_engine.c src/ik_prompt.c \
             src/spine.c src/tensor.c src/pool.c \
             src/attention.c src/moe.c src/engine.c src/sample.c src/tokenizer.c src/tools.c \
             src/setup.c src/stream.c src/prof.c src/metrics.c src/pfx.c src/metal.c \
@@ -88,6 +91,11 @@ probe: tools/pf8probe.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
 # Text-only smoke test for the realtime decoder (see tools/rtthink.c).
 rtthink: tools/rtthink.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o tools/rtthink tools/rtthink.c \
+		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
+
+# Token golden-vector probe for the Inkling checkpoint (tokenizer only).
+iktok: tools/iktok.c $(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/iktok tools/iktok.c \
 		$(filter-out tests/test_cwick.c,$(TEST_SRCS)) $(LDFLAGS)
 
 # Ear smoke test: log-mel + audio tower + projector (see tools/rtear.c).

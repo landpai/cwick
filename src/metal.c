@@ -47,6 +47,23 @@ int   cwick_metal_bf16_batch_add_bridge(void *batch, const void *w_bf16,
                                        const float *x, float *out,
                                        uint32_t k, uint32_t cols);
 int   cwick_metal_bf16_batch_end_bridge(void *batch);
+void cwick_metal_adopt_bridge(const void *base, size_t len);
+int cwick_metal_ik_packed_ready_bridge(void);
+void *cwick_metal_ik_packed_batch_begin_bridge(int slot);
+int cwick_metal_ik_packed_batch_add_bridge(void *batch, const void *packed,
+                                          const void *scale, float global_scale,
+                                          const float *x, float *out,
+                                          uint32_t k, uint32_t cols,
+                                          uint32_t half, uint32_t format);
+int cwick_metal_ik_packed_batch_end_bridge(void *batch);
+void *cwick_metal_ik_pair_batch_begin_bridge(int slot);
+int cwick_metal_ik_pair_batch_add_bridge(void *batch,
+        const void *w13, const void *s13, float g13,
+        const void *w2, const void *s2, float g2,
+        const float *x, float *out, float gamma,
+        uint32_t k, uint32_t cols, uint32_t k2, uint32_t cols2,
+        uint32_t half, uint32_t format, float gate_cap, float up_cap);
+int cwick_metal_ik_pair_batch_end_bridge(void *batch);
 int cwick_metal_init(void);
 void *cwick_metal_arena_alloc(size_t bytes);
 int   cwick_metal_arena_free(void *p);
@@ -466,6 +483,69 @@ int cwick_metal_bf16_batch_add(void *batch, const void *w_bf16,
  * caller must redo the group itself (nothing was written). */
 int cwick_metal_bf16_batch_end(void *batch) {
     return batch ? cwick_metal_bf16_batch_end_bridge(batch) : 0;
+}
+
+/* Wrap a resident mapping once so all tensors carved from it share one cached
+ * no-copy view. The packed-expert batch refuses copied weights. */
+void cwick_metal_adopt(const void *base, size_t len) {
+    if (base && len && metal_probe()) cwick_metal_adopt_bridge(base, len);
+}
+
+int cwick_metal_ik_packed_ready(void) {
+    return metal_probe() ? cwick_metal_ik_packed_ready_bridge() : 0;
+}
+
+void *cwick_metal_ik_packed_batch_begin(void) {
+    if (!metal_probe()) return NULL;
+    return cwick_metal_ik_packed_batch_begin_bridge(g_tls_slot);
+}
+
+int cwick_metal_ik_packed_batch_add(void *batch, const void *packed,
+                                    const void *scale, float global_scale,
+                                    const float *x, float *out,
+                                    int64_t k, int64_t cols, int64_t half,
+                                    int format) {
+    if (!batch || !packed || !scale || !x || !out || k <= 0 || cols <= 0 ||
+        half < 0 || half > cols || (k & 63) != 0 ||
+        k > 0x7FFFFFFFl || cols > 0x7FFFFFFFl || half > 0x7FFFFFFFl)
+        return 0;
+    if ((format != 1 && format != 2) ||
+        (format == 1 && half > 0 && (cols & 1) != 0))
+        return 0;
+    return cwick_metal_ik_packed_batch_add_bridge(
+        batch, packed, scale, global_scale, x, out, (uint32_t)k,
+        (uint32_t)cols, (uint32_t)half, (uint32_t)format);
+}
+
+int cwick_metal_ik_packed_batch_end(void *batch) {
+    return batch ? cwick_metal_ik_packed_batch_end_bridge(batch) : 0;
+}
+
+void *cwick_metal_ik_pair_batch_begin(void) {
+    if (!metal_probe()) return NULL;
+    return cwick_metal_ik_pair_batch_begin_bridge(g_tls_slot);
+}
+
+int cwick_metal_ik_pair_batch_add(void *batch,
+        const void *w13, const void *s13, float g13,
+        const void *w2, const void *s2, float g2,
+        const float *x, float *out, float gamma,
+        int64_t k, int64_t cols, int64_t k2, int64_t cols2,
+        int64_t half, int format, float gate_cap, float up_cap) {
+    if (!batch || !w13 || !s13 || !w2 || !s2 || !x || !out ||
+        k <= 0 || k2 <= 0 || cols <= 0 || cols2 <= 0 || half <= 0 ||
+        cols != 2 * half || (k & 63) || (k2 & 63) ||
+        k > 0x7FFFFFFFl || k2 > 0x7FFFFFFFl || cols > 0x7FFFFFFFl ||
+        cols2 > 0x7FFFFFFFl || half > 0x7FFFFFFFl ||
+        (format != 1 && format != 2)) return 0;
+    return cwick_metal_ik_pair_batch_add_bridge(
+        batch, w13, s13, g13, w2, s2, g2, x, out, gamma,
+        (uint32_t)k, (uint32_t)cols, (uint32_t)k2, (uint32_t)cols2,
+        (uint32_t)half, (uint32_t)format, gate_cap, up_cap);
+}
+
+int cwick_metal_ik_pair_batch_end(void *batch) {
+    return batch ? cwick_metal_ik_pair_batch_end_bridge(batch) : 0;
 }
 
 void cwick_metal_cleanup(void) {

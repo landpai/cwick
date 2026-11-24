@@ -19,6 +19,7 @@ void h3vm_shutdown(void);
 void h3vm_adopt(const void *base, size_t len);
 int h3vm_gemm_bf16(const float *a, const void *w, float *c,
                    int rows, int k, int cols, int lda, int ldc);
+int h3vm_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n);
 int h3vm_gemm_bf16_qkv(const float *a, const void *w, float *c,
                        int rows, int k, int cols, int wrows, int lda, int ldc,
                        int part, int hd);
@@ -26,6 +27,16 @@ int h3vm_gemm_f32(const float *a, const float *w, float *c,
                   int rows, int k, int cols, int lda, int ldc);
 int h3vm_attention(const float *q, const float *k, const float *v, float *o,
                    int seq, int ld, int heads, int hd);
+int h3vm_inkling_decode_attn(const float *q, const float *k, const float *v,
+                             const float *r, const float *rel, const float *sink,
+                             float *o, int pos, int cache_rows, int ld,
+                             int nh, int kvh, int d, int dr, int extent,
+                             int window);
+int h3vm_inkling_prefill_attn(const float *q, const float *k, const float *v,
+                              const float *r, const float *rel, const float *sink,
+                              float *o, int qstart, int qrows, int cache_rows,
+                              int ld, int nh, int kvh, int d, int dr,
+                              int extent, int window);
 
 static int g_state = -1;   /* -1 untried, 0 unavailable, 1 ready */
 
@@ -75,6 +86,16 @@ int h3v_gpu_gemm_bf16(const float *a, const void *w, float *c,
     return h3vm_gemm_bf16(a, w, c, rows, k, cols, lda, ldc);
 }
 
+int h3v_gpu_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n) {
+    if (g_state != 1 || !items || n <= 0 || n > 64) return 0;
+    for (int i = 0; i < n; i++) {
+        if (!items[i].a || !items[i].w || !items[i].c ||
+            !gemm_shape_ok(items[i].rows, items[i].k, items[i].cols,
+                           items[i].lda, items[i].ldc)) return 0;
+    }
+    return h3vm_gemm_bf16_batch(items, n);
+}
+
 int h3v_gpu_gemm_f32(const float *a, const float *w, float *c,
                      int rows, int k, int cols, int lda, int ldc) {
     if (g_state != 1 || !a || !w || !c) return 0;
@@ -101,4 +122,31 @@ int h3v_gpu_attention(const float *q, const float *k, const float *v, float *o,
     if (hd != 64 && hd != 128) return 0;
     if ((long)ld < (long)heads * hd) return 0;
     return h3vm_attention(q, k, v, o, seq, ld, heads, hd);
+}
+
+int h3v_gpu_inkling_decode_attn(const float *q, const float *k, const float *v,
+                                const float *r, const float *rel,
+                                const float *sink, float *o, int pos,
+                                int cache_rows, int ld, int nh, int kvh,
+                                int d, int dr, int extent, int window) {
+    if (g_state != 1 || !q || !k || !v || !r || !rel || !sink || !o) return 0;
+    if (pos < 0 || cache_rows <= 0 || nh <= 0 || kvh <= 0 || nh % kvh ||
+        d != 128 || dr <= 0 || extent <= 0 || window < 0 ||
+        ld < kvh * d) return 0;
+    return h3vm_inkling_decode_attn(q, k, v, r, rel, sink, o, pos, cache_rows,
+                                    ld, nh, kvh, d, dr, extent, window);
+}
+
+int h3v_gpu_inkling_prefill_attn(const float *q, const float *k, const float *v,
+                                 const float *r, const float *rel,
+                                 const float *sink, float *o, int qstart,
+                                 int qrows, int cache_rows, int ld, int nh,
+                                 int kvh, int d, int dr, int extent, int window) {
+    if (g_state != 1 || !q || !k || !v || !r || !rel || !sink || !o) return 0;
+    if (qstart < 0 || qrows <= 0 || qrows > 64 || cache_rows <= 0 ||
+        nh <= 0 || kvh <= 0 || nh % kvh || d != 128 || dr <= 0 ||
+        extent <= 0 || window < 0 || ld < kvh * d) return 0;
+    return h3vm_inkling_prefill_attn(q, k, v, r, rel, sink, o, qstart, qrows,
+                                     cache_rows, ld, nh, kvh, d, dr,
+                                     extent, window);
 }

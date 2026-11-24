@@ -83,6 +83,7 @@ bool cwick_model_served_alias(const char *root, char *out, size_t cap) {
         {"DeepSeek-V4.1-Flash-1017", "deepSeek-v4.1-flash-1017"},
         {"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash"},
         {"Sophon-Realtime-32B-Tag", "Sophon-Realtime-32B-Tag"},
+        {"Inkling-2-Mini", "Inkling-2-Mini"},
         /* The Qwen3.5 hybrid's config.json carries a training-run artifact as
          * its inner model_type ("qwen3_5_text") — that string is the kernel
          * selector, not a name any client should have to guess. Its release
@@ -294,6 +295,9 @@ bool cwick_model_type_supported(const char *mt) {
     if (TYPE_HAS_PREFIX(mt, "minimax_m3")) return true;
     /* Qwen3.5 hybrid: Gated DeltaNet + GQA layers, dense BF16. */
     if (TYPE_HAS_PREFIX(mt, "qwen3_5")) return true;
+    /* Inkling-2: banked attention residual, a re-run core, NVFP4 experts,
+     * plus the vision tower that feeds the three chat endpoints. */
+    if (TYPE_HAS_PREFIX(mt, "inkling2")) return true;
     if (strcmp(mt, "glm5_next") == 0 ||
         strcmp(mt, "glm-5.3-flash") == 0) return true;
     /* Full-duplex speech: a listening decoder plus a speaking stack, driven by
@@ -342,8 +346,8 @@ bool cwick_model_root_supported(const char *root, char *why, size_t whycap) {
     if (!ok && why && whycap)
         snprintf(why, whycap,
                  "unsupported model_type \"%s\": this build implements the "
-                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 kernels and "
-                 "the Sophon-Realtime speech pipeline only",
+                 "GLM-5.3 / DeepSeek-V4.1 / MiniMax-M3.1 / Qwen3.5 / Inkling-2 "
+                 "kernels and the Sophon-Realtime speech pipeline only",
                  mt ? mt : "(missing)");
     cwick_json_free(j);
     return ok;

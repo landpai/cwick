@@ -30,6 +30,7 @@
 #include "log.h"
 #include "mm_prompt.h"
 #include "q35_prompt.h"
+#include "ik_prompt.h"
 #include "models.h"
 #include "tools.h"
 #include "util.h"
@@ -116,6 +117,8 @@ typedef struct {
     double temperature;
     jev_q *q;
     size_t nq;
+    char **images;
+    size_t n_images;
 } jev_req;
 
 static void jev_q_free(jev_q *q) {
@@ -134,6 +137,7 @@ static void jev_req_free(jev_req *r) {
     free(r->model);
     for (size_t i = 0; i < r->nq; i++) jev_q_free(&r->q[i]);
     free(r->q);
+    ik_prompt_free_images(r->images, r->n_images);
     memset(r, 0, sizeof(*r));
 }
 
@@ -312,9 +316,11 @@ static int parse_request(json_value *root, jev_req *r, char *err, size_t cap) {
             return fail(err, cap, "body.thinking must be off: a decision reads "
                         "one distribution, there is no reasoning pass");
     }
-    if (cwick_json_get(root, "image") || cwick_json_get(root, "images"))
-        return fail(err, cap, "body.images is not supported: the readout is "
-                    "one letter token, so the decision is text only");
+    cwick_error image_err;
+    cwick_error_clear(&image_err);
+    if (ik_prompt_normalize_images(root, &r->images, &r->n_images,
+                                   &image_err) != CWICK_OK)
+        return fail(err, cap, "body.images: %s", cwick_error_message(&image_err));
 
     /* `state` is the material to judge. The reference takes a string as-is and
      * serializes an object; every other JSON value is serialized the same way,
@@ -449,7 +455,8 @@ static char *render_user(const jev_req *r, const jev_q *q) {
  * fails inside the encoder with a tokenizer error the caller can act on
  * instead of being refused by this endpoint for a name it did not choose. */
 typedef enum {
-    JEV_FAMILY_GLM = 0, JEV_FAMILY_DS = 1, JEV_FAMILY_MM = 2, JEV_FAMILY_Q35 = 3
+    JEV_FAMILY_GLM = 0, JEV_FAMILY_DS = 1, JEV_FAMILY_MM = 2, JEV_FAMILY_Q35 = 3,
+    JEV_FAMILY_IK = 4
 } jev_family;
 
 static jev_family family_of(const cwick_model_spec *spec) {
@@ -457,6 +464,7 @@ static jev_family family_of(const cwick_model_spec *spec) {
     if (strncasecmp(t, "deepseek", 8) == 0) return JEV_FAMILY_DS;
     if (strncasecmp(t, "minimax", 7) == 0) return JEV_FAMILY_MM;
     if (strncasecmp(t, "qwen3_5", 7) == 0) return JEV_FAMILY_Q35;
+    if (strncasecmp(t, "inkling2", 8) == 0) return JEV_FAMILY_IK;
     return JEV_FAMILY_GLM;
 }
 
@@ -465,6 +473,7 @@ const char *jev_family_name(const cwick_model_spec *spec) {
     case JEV_FAMILY_DS: return "deepseek";
     case JEV_FAMILY_MM: return "minimax";
     case JEV_FAMILY_Q35: return "qwen3_5";
+    case JEV_FAMILY_IK: return "inkling2";
     default: return "glm";
     }
 }
@@ -486,6 +495,11 @@ void jev_adapter_default(const cwick_model_spec *spec, jev_adapter *out) {
     case JEV_FAMILY_MM:
         out->prompt = "minimax-chat-plain";
         break;
+    case JEV_FAMILY_IK:
+        /* The decision encoder appends the assistant content record; the very
+         * next token is the answer slot the decision readout samples. */
+        out->prompt = "inkling2-chat-plain";
+        break;
     case JEV_FAMILY_Q35:
         /* q35_prompt_encode(thinking=false) writes `<think>\n\n</think>\n\n`
          * after the assistant header, so the answer is the next token. */
@@ -501,33 +515,79 @@ void jev_adapter_default(const cwick_model_spec *spec, jev_adapter *out) {
 /* Build the OpenAI-shaped messages array the two JSON-driven prompt encoders
  * take. The strings are escaped by the same routine that escapes SSE payloads,
  * so a state containing quotes cannot break out of the array. */
-static json_value *messages_json(const char *system, const char *user, cwick_error *err) {
+static json_value *messages_json(const char *system, const char *user,
+                                 const char *const *images, size_t n_images,
+                                 cwick_error *err) {
     char *es = cwick_json_stringify(system);
     char *eu = cwick_json_stringify(user);
-    size_t cap = strlen(es) + strlen(eu) + 128;
-    char *text = cwick_xmalloc(cap);
-    snprintf(text, cap,
-             "[{\"role\":\"system\",\"content\":%s},"
-             "{\"role\":\"user\",\"content\":%s}]", es, eu);
+    jb b = {0};
+    jb_put(&b, "[{\"role\":\"system\",\"content\":");
+    jb_put(&b, es);
+    jb_put(&b, "},{\"role\":\"user\",\"content\":");
+    if (!n_images) {
+        jb_put(&b, eu);
+    } else {
+        jb_put(&b, "[{\"type\":\"text\",\"text\":");
+        jb_put(&b, eu);
+        jb_put(&b, "}");
+        for (size_t i = 0; i < n_images; i++) {
+            char *url = cwick_json_stringify(images[i]);
+            jb_put(&b, ",{\"type\":\"image_url\",\"image_url\":{\"url\":");
+            jb_put(&b, url);
+            jb_put(&b, "}}");
+            free(url);
+        }
+        jb_put(&b, "]");
+    }
+    jb_put(&b, "}]");
     free(es);
     free(eu);
-    json_value *arr = cwick_json_parse(text, strlen(text), err);
-    free(text);
+    json_value *arr = cwick_json_parse(b.p, b.len, err);
+    free(b.p);
     return arr;
 }
 
 static cwick_status encode_prompt(const cwick_tokenizer *tok,
                                   const cwick_model_spec *spec,
                                   const char *system, const char *user,
+                                  const char *const *images, size_t n_images,
+                                  char ***encoded_images, size_t *n_encoded,
                                   uint32_t **ids, int64_t *n, cwick_error *err) {
+    if (encoded_images) *encoded_images = NULL;
+    if (n_encoded) *n_encoded = 0;
     switch (family_of(spec)) {
     case JEV_FAMILY_DS:
     case JEV_FAMILY_MM:
-    case JEV_FAMILY_Q35: {
-        json_value *msgs = messages_json(system, user, err);
+    case JEV_FAMILY_Q35:
+    case JEV_FAMILY_IK: {
+        json_value *msgs = messages_json(system, user, images, n_images, err);
         if (!msgs) return CWICK_ERR_PARSE;
         char *text = NULL;
-        if (family_of(spec) == JEV_FAMILY_DS) {
+        if (family_of(spec) == JEV_FAMILY_IK) {
+            char *ik_msgs = cwick_json_write(msgs);
+            char **imgs = NULL;
+            size_t nimg = 0;
+            cwick_status st = ik_prompt_encode_decision_images(tok, ik_msgs, NULL,
+                                                               &imgs, &nimg,
+                                                               ids, n, err);
+            free(ik_msgs);
+            cwick_json_free(msgs);
+            if (st != CWICK_OK) return st;
+            if (nimg != n_images) {
+                ik_prompt_free_images(imgs, nimg);
+                cwick_error_set(err, CWICK_ERR_ARGUMENT,
+                                "decision encoder returned %zu images for %zu inputs",
+                                nimg, n_images);
+                return CWICK_ERR_ARGUMENT;
+            }
+            if (encoded_images) {
+                *encoded_images = imgs;
+                if (n_encoded) *n_encoded = nimg;
+            } else {
+                ik_prompt_free_images(imgs, nimg);
+            }
+            return CWICK_OK;
+        } else if (family_of(spec) == JEV_FAMILY_DS) {
             ds_prompt_opts o;
             ds_prompt_opts_default(&o);
             /* The thinking block is closed right after the assistant header:
@@ -780,6 +840,12 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
         return -1;
     }
 
+    if (req.n_images && family_of(spec) != JEV_FAMILY_IK) {
+        fail(err, errcap, "body.images is supported only by the resident Inkling-2-Mini model");
+        jev_req_free(&req);
+        return -1;
+    }
+
     /* The resident adapter, resolved now: a switch replaces the engine and the
      * tokenizer between requests, and this is where that lands. */
     jev_adapter adapter;
@@ -801,6 +867,11 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
     float *logits = cwick_xmalloc(vocab * sizeof(float));
     jev_out *outs = jev_calloc(req.nq, sizeof(jev_out));
     int *letters = jev_calloc(JEV_MAX_OPTIONS, sizeof(int));
+    cwick_image_batch image_batch;
+    memset(&image_batch, 0, sizeof(image_batch));
+    char **encoded_images = NULL;
+    size_t n_encoded_images = 0;
+    uint32_t image_token_id = 0;
     int rc = -1;
 
     /* Two passes. The first encodes every question and finds the longest token
@@ -833,8 +904,11 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
         }
 
         char *user = render_user(&req, q);
-        if (encode_prompt(tok, spec, JEV_SYSTEM, user, &ids_all[qi],
-                          &len_all[qi], &e) != CWICK_OK) {
+        if (encode_prompt(tok, spec, JEV_SYSTEM, user,
+                          (const char *const *)req.images, req.n_images,
+                          qi == 0 ? &encoded_images : NULL,
+                          qi == 0 ? &n_encoded_images : NULL,
+                          &ids_all[qi], &len_all[qi], &e) != CWICK_OK) {
             fail(err, errcap, "question %s: cannot encode the prompt: %s", q->name,
                  cwick_error_message(&e));
             free(user);
@@ -851,6 +925,44 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
         }
         free(user);
     }
+
+    /* Inkling images are encoded once into a reusable vision batch. Every
+     * question's prompt still gets its own full prefill, but the tower and image
+     * decode do not run again for questions sharing the same input images. */
+    if (req.n_images) {
+        if (n_encoded_images != req.n_images) {
+            fail(err, errcap, "decision encoder returned %zu images for %zu inputs",
+                 n_encoded_images, req.n_images);
+            goto done;
+        }
+        if (cwick_engine_prepare_images(eng, (const char *const *)encoded_images,
+                                        n_encoded_images, &image_batch, &e) != CWICK_OK) {
+            fail(err, errcap, "cannot prepare images: %s", cwick_error_message(&e));
+            goto done;
+        }
+        if (cwick_engine_image_token_id(eng, tok, &image_token_id, &e) != CWICK_OK) {
+            fail(err, errcap, "cannot resolve image token: %s", cwick_error_message(&e));
+            goto done;
+        }
+        for (size_t qi = 0; qi < req.nq; qi++) {
+            uint32_t *expanded = NULL;
+            int64_t n_expanded = 0;
+            if (cwick_expand_image_placeholders(ids_all[qi], len_all[qi],
+                                                image_token_id, &image_batch,
+                                                &expanded, &n_expanded, &e) != CWICK_OK) {
+                free(expanded);
+                fail(err, errcap, "question %s: %s", req.q[qi].name,
+                     cwick_error_message(&e));
+                goto done;
+            }
+            free(ids_all[qi]);
+            ids_all[qi] = expanded;
+            len_all[qi] = n_expanded;
+        }
+    }
+    ik_prompt_free_images(encoded_images, n_encoded_images);
+    encoded_images = NULL;
+    n_encoded_images = 0;
 
     /* Longest common token prefix. It can never reach the shortest prompt:
      * the readout sits at each prompt's own last position, so at least one
@@ -887,7 +999,8 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
      *
      * CWICK_JEV_REUSE_ALL=1 measures a backend that has been made resumable;
      * CWICK_JEV_NO_PREFIX_REUSE=1 forces the old path. */
-    if (family_of(spec) != JEV_FAMILY_MM && !getenv("CWICK_JEV_REUSE_ALL"))
+    if ((family_of(spec) != JEV_FAMILY_MM && !getenv("CWICK_JEV_REUSE_ALL")) ||
+        req.n_images)
         prefix = 0;
     if (getenv("CWICK_JEV_NO_PREFIX_REUSE")) prefix = 0;
 
@@ -909,8 +1022,12 @@ int jev_decide(cwick_engine *eng, const cwick_tokenizer *tok,
                        qi + 1, req.nq, q->name, (long long)slice);
 
         cwick_error_clear(&e);
-        if (cwick_engine_prefill_logits_at(eng, ids_all[qi] + from, slice, from,
-                                           logits, &e) != CWICK_OK) {
+        cwick_status pst = image_batch.n_images
+            ? cwick_engine_prefill_logits_with_images(eng, ids_all[qi], slice,
+                                                       &image_batch, logits, &e)
+            : cwick_engine_prefill_logits_at(eng, ids_all[qi] + from, slice, from,
+                                             logits, &e);
+        if (pst != CWICK_OK) {
             fail(err, errcap, "question %s: prefill failed: %s", q->name,
                  cwick_error_message(&e));
             goto done;
@@ -1013,6 +1130,8 @@ done:
     for (size_t di = 0; di < req.nq; di++) free(ids_all[di]);
     free(ids_all);
     free(len_all);
+    ik_prompt_free_images(encoded_images, n_encoded_images);
+    cwick_image_batch_free(&image_batch);
     {
         struct timeval dec_t1;
         gettimeofday(&dec_t1, NULL);

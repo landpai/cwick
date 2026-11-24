@@ -38,6 +38,17 @@ int h3v_gpu_gemm_bf16(const float *a, const void *w, float *c,
 int h3v_gpu_gemm_f32(const float *a, const float *w, float *c,
                      int rows, int k, int cols, int lda, int ldc);
 
+typedef struct {
+    const float *a;
+    const void *w;
+    float *c;
+    int rows, k, cols, lda, ldc;
+} h3v_gpu_bf16_item;
+
+/* Independent BF16 GEMMs in one command buffer. Every item must use the same
+ * BF16 pipeline; activation/result strides remain per-item. */
+int h3v_gpu_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n);
+
 /* Fused QKV projection from the release layout: weight rows are grouped per
  * head as [q | k | v] and `part` selects one of the three output planes.
  * `wrows` is the weight's full row count (3 * cols); `ldc` is the plane pitch. */
@@ -49,6 +60,21 @@ int h3v_gpu_gemm_qkv(const float *a, const void *w, float *c,
  * Returns 1 when the GPU wrote all heads. */
 int h3v_gpu_attention(const float *q, const float *k, const float *v, float *o,
                       int seq, int ld, int heads, int hd);
+
+/* Causal single-token Inkling attention with GQA, relative bias and sink.
+ * K/V use absolute rows for full attention and a ring for window > 0. */
+int h3v_gpu_inkling_decode_attn(const float *q, const float *k, const float *v,
+                                const float *r, const float *rel,
+                                const float *sink, float *o, int pos,
+                                int cache_rows, int ld, int nh, int kvh,
+                                int d, int dr, int extent, int window);
+
+/* Causal prefill tile with the same relative bias, sink and ring semantics. */
+int h3v_gpu_inkling_prefill_attn(const float *q, const float *k, const float *v,
+                                 const float *r, const float *rel,
+                                 const float *sink, float *o, int qstart,
+                                 int qrows, int cache_rows, int ld, int nh,
+                                 int kvh, int d, int dr, int extent, int window);
 
 /* Exposed for the shader-probe test, which compiles every kernel in the
  * production source rather than trusting a kernel-count constant. */

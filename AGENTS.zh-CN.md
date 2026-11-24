@@ -30,8 +30,8 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   只有 macOS 系统框架（Accelerate / Metal / CoreImage / ImageIO / CoreGraphics）
   与系统 `sqlite3`（`Makefile:15-16`）。不引入第三方库、不用 Python、没有权重转换步骤。
   一次性验证工具也写纯 C（`tools/*.c`），shell 只负责驱动编译与运行。
-- **四条模型路径**：各自持有加载器、前向与 prompt 模板，只共享进程、采样器和服务器。
-  加一个模型是「再加一条」，不是重写其它三条。
+- **五条模型路径**：各自持有加载器、前向与 prompt 模板，只共享进程、采样器和服务器。
+  加一个模型是「再加一条」，不是重写其它四条。
   - GLM-5.3-flash：`spine.c`（常驻权重/内存计划）、`engine.c`（请求→prefill/decode）、
     `attention.c`（MLA/GQA/DeltaNet）、`moe.c`（路由 + 专家 GEMV/GEMM）；
   - DeepSeek-V4.1：`ds_model.c` / `ds_engine.c` / `ds_ops.c` / `ds_quant.c` / `ds_prompt.c`；
@@ -72,6 +72,11 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
     走部分接受那条路。校验内核的激活直接从 device 内存读、线程组是 128 线程；它由
     `tools/q35gemab` 做消融测量（`ABL=0..3`、`MODE`、`PF`、`RPF`、`TH`、`NSGV`），边际行的成本
     正是这样被追到激活流量而不是算术上的。§62 是校验与草稿，§63 是这个内核的每行成本。
+  - Inkling-2-Mini：`ik.c` / `ik_engine.c` / `ik_prompt.c` / `ik_vision.c`（+ `ik.h`）。
+    完整的 24 层、三轮循环模型和视觉塔常驻并 wired；NVFP4/MXFP8 打包专家保持
+    常驻，图像 prefill 把激活专家即时反量化到临时 BF16 缓冲，decode 使用打包
+    Metal。Chat Completions、Responses 和 Anthropic Messages 共用同一套文本/图像/工具
+    prompt 路径。
   接一个新模型 = 新加载器 + 新反量化 + 新 prompt 模板 + 新内核，**不是改一个 config**。
 - **质量铁律**：top-k 取 checkpoint 自己的 `num_experts_per_token`，专家不剪、
   embedding 不共享、缺分片 fail closed（宁可起不来，也不悄悄跑小一号的模型）。
@@ -86,6 +91,14 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
 
 - 三个 checkpoint 端到端：加载 + `/v1/models` + 生成 + 切换，逐位验证过
   （DeepSeek 全链路 0 误差；GLM 走 `doctor` 结构校验，见 `docs/PRECISION*.md`）。
+- Inkling-2-Mini 走 Metal：完整循环模型与视觉塔常驻并 wired，三种聊天方言和
+  `/v1/systemone` 支持文本/图像理解，支持流式/非流式工具调用、工具结果回放和
+  Web 图片上传。正确性锚点与全链路数据见 `docs/PERF.md`；前向修复见
+  `docs/DECISIONS.md` §117，打包/图像策略与 GPU attention A/B 见 §118。GPU
+  attention 仅显式开启（`CWICK_IK_GPU_ATTN=1`），默认走已验证正确性的 CPU 路径。
+- 内置 Web 输入区支持多张本地图片，使用有容量上限的 IndexedDB 保存 blob，并在
+  Chat Completions、Responses、Anthropic Messages 中回放；也可提交仅含图片的
+  System One 选择题，问题和选项由页面配置。
 - Realtime 语音（`--rt`，`Sophon-Realtime-32B-Tag`）：WebSocket `/v1/realtime`，
   音频前端 + 64 层 thinker + talker/flow/HiFT，流式 PCM16 回复并逐轮给耗时；
   Metal 实机端到端验证（53 个音频 delta / 10.44 s 非静音语音，热轮 prefill
@@ -120,8 +133,9 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   后重新解析，所以切模型同时切接口；请求里写过期模型名会被 400 点名拒绝。
   `make jevprobe` 只读 tokenizer 打印字母表。报文格式按发布协议：`state` 可以是字符串
   或任意 JSON 值，`noul` 的 `criteria` 指定陈述两侧（真的一侧永远在前），`instructions`
-  必填，`stream`/`reasoning_effort`/`thinking`/`images` 一律点名拒绝，状态码区分
-  422（根本不是决策请求）与 400（合法但不提供）。十个问题与 26 个选项是有意保留的差异
+  必填，`stream`/`reasoning_effort`/`thinking` 一律点名拒绝；Inkling 接受有序的
+  `image`/`images` 输入，纯文本模型则拒绝。状态码区分 422（根本不是决策请求）与
+  400（合法但不提供）。十个问题与 26 个选项是有意保留的差异
   （`docs/DECISIONS.zh-CN.md` §48）。
 - 决策 prefill（`jev.c` + `engine.c`，`docs/DECISIONS.zh-CN.md` §44）：一个请求里的问题
   先全部编码，取 token 级最长公共前缀只 prefill 一次，每个问题从那里续算。MiniMax：
@@ -177,7 +191,7 @@ MiniMax-M3.1-Flash（≈233 GiB）：一个 C 二进制，按发布原样读 che
   config 不合法返回 400 且常驻模型不动；生成或排队中返回 409。`/v1/models` 与
   `/v1/hub/models` 都报 `supported`（发现目录时算好缓存，轮询不会在生成锁内读文件），
   `cwick:model_loaded` 是实时 1/0 指标。
-- `make test`：**651 项断言，当前全 PASS**（`./tests/test_cwick` 每项一行 `ok:`）。
+- `make test`：**869 项断言，当前全 PASS**（`./tests/test_cwick` 每项一行 `ok:`）。
 - `cwick doctor`、`download_model.sh`（断点续传、>100 GiB、一行进度）。
 
 ### ⚠️ 已知但还算能用
@@ -234,7 +248,7 @@ web/              控制台源码：index.html / app.js / app.css / login.html
 apps/             两个 H5 应用 + manifest.json
 models/           在线下载的权重（gitignore，启动时扫描）
 docs/             架构、存储、性能、决策、服务端、精度、DeepSeek 移植（中英各一份）
-tests/test_cwick.c 651 项断言
+tests/test_cwick.c 869 项断言
 tools/            独立 C 探针：内核基准、分层测试、模型运行器
 start.sh          推荐入口：前缀缓存 + web + 局域网 + 三个模型目录 + 密码
 ```
@@ -261,7 +275,7 @@ start.sh          推荐入口：前缀缓存 + web + 局域网 + 三个模型�
 
 ```sh
 git clone <repo> cwick && cd cwick
-make && make test                      # 约 12 s，651 项
+make && make test                      # 完整回归，869 项
 
 ./download_model.sh deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     -o ./deepseek-ai/DeepSeek-V4.1-Flash-1017 \

@@ -79,6 +79,14 @@ typedef struct {
     uint32_t pad2;
 } cwick_metal_bf16_args;
 
+typedef struct {
+    uint32_t k;
+    uint32_t cols;
+    uint32_t half;
+    uint32_t format;
+    float global_scale;
+} cwick_metal_ik_packed_args;
+
 static id<MTLDevice>                g_dev;
 static id<MTLCommandQueue>          g_queue;
 static id<MTLComputePipelineState>  g_pso;      // FP8 expert GEMV v1
@@ -87,6 +95,9 @@ static id<MTLComputePipelineState>  g_pso_v3;   // FP8 expert GEMV v3 (LUT decod
 static id<MTLComputePipelineState>  g_pso_v3d;  // v3 without the LUT (diagnostic)
 static id<MTLComputePipelineState>  g_pso_v4;   // v3 slicing + arithmetic decode (opt-in, slower)
 static id<MTLComputePipelineState>  g_pso_bf16; // resident BF16 linear GEMV
+static id<MTLComputePipelineState>  g_pso_ik_nvfp4;
+static id<MTLComputePipelineState>  g_pso_ik_mxfp8;
+static id<MTLComputePipelineState>  g_pso_ik_situ;
 /* DeepSeek's two weight formats: e2m1 with a 32-element e8m0 scale (routed and
  * shared experts) and bf16 with the same block scale (every dense projection).
  * Optional: if either function is missing the DeepSeek backend simply keeps the
@@ -384,6 +395,15 @@ static int cwick_metal_compile(void) {
         if (!bf16_fn) return 0;
         g_pso_bf16 = [g_dev newComputePipelineStateWithFunction:bf16_fn error:&err];
         if (!g_pso_bf16) return 0;
+        id<MTLFunction> iknv_fn = [lib newFunctionWithName:@"kernel_cwick_ik_nvfp4_gemv"];
+        if (iknv_fn)
+            g_pso_ik_nvfp4 = [g_dev newComputePipelineStateWithFunction:iknv_fn error:&err];
+        id<MTLFunction> ikmx_fn = [lib newFunctionWithName:@"kernel_cwick_ik_mxfp8_gemv"];
+        if (ikmx_fn)
+            g_pso_ik_mxfp8 = [g_dev newComputePipelineStateWithFunction:ikmx_fn error:&err];
+        id<MTLFunction> iksitu_fn = [lib newFunctionWithName:@"kernel_cwick_ik_situ"];
+        if (iksitu_fn)
+            g_pso_ik_situ = [g_dev newComputePipelineStateWithFunction:iksitu_fn error:&err];
         id<MTLFunction> dsfp4_fn = [lib newFunctionWithName:@"kernel_cwick_ds_fp4_gemv"];
         if (dsfp4_fn)
             g_pso_ds_fp4 = [g_dev newComputePipelineStateWithFunction:dsfp4_fn
@@ -802,6 +822,13 @@ static int view_of(const void *p, size_t len, id<MTLBuffer> __strong *buf,
 }
 
 /* Does [p, p+len) live inside one of our arenas? */
+void cwick_metal_adopt_bridge(const void *base, size_t len) {
+    if (!g_dev || !base || !len) return;
+    id<MTLBuffer> b = nil;
+    size_t off = 0;
+    (void)view_of(base, len, &b, &off);
+}
+
 static int arena_view(const void *p, size_t len, id<MTLBuffer> __strong *buf, size_t *off) {
     uintptr_t addr = (uintptr_t)p;
     if (g_hint >= 0 && g_hint < g_arena_n) {
@@ -1399,7 +1426,7 @@ int cwick_metal_gemm_f32_bridge(const float *w, const float *x, float *out,
  * batch cannot serve (a non-arena, non-view weight pointer) marks it bad
  * and the caller redoes that group on the serial path, so a mistake costs
  * a fallback, not a wrong answer. */
-#define CWICK_BF16_BATCH_MAX 8
+#define CWICK_BF16_BATCH_MAX 128
 
 struct cwick_bf16_batch_s {
     id<MTLCommandBuffer>         cb;
@@ -1566,6 +1593,353 @@ int cwick_metal_bf16_batch_end_bridge(void *vb) {
         for (int i = 0; i < b->n; i++)
             memcpy(b->it[i].dst, (uint8_t *)b->bo.contents + b->it[i].ooff,
                    b->it[i].obytes);
+    b->n = 0;
+    return ok;
+}
+
+/* ---- Inkling packed NVFP4 / MXFP8 expert batches --------------------
+ * One item is one token row. A 32-lane simdgroup owns one output row, and all
+ * items are encoded concurrently into one command buffer. The expert bytes and
+ * scales stay in the resident arena; only activations and results are staged. */
+#define CWICK_IK_BATCH_MAX 128
+#define CWICK_IK_BATCH_SLOTS 4
+
+struct cwick_ik_batch_s {
+    id<MTLCommandBuffer>         cb;
+    id<MTLComputeCommandEncoder> enc;
+    id<MTLBuffer>                args;
+    NSUInteger                   args_cap;
+    id<MTLBuffer>                bx, bo;
+    size_t                       bx_cap, bo_cap, bx_used, bo_used;
+    int                          n, bad;
+    struct {
+        __unsafe_unretained id<MTLBuffer> wb, sb;
+        size_t                  woff, soff, xoff, ooff;
+        void                   *dst;
+        size_t                  obytes;
+        uint32_t                k, cols, half, format;
+        float                   global_scale;
+    } it[CWICK_IK_BATCH_MAX];
+};
+
+static struct cwick_ik_batch_s *g_ik_batch[CWICK_IK_BATCH_SLOTS];
+
+int cwick_metal_ik_packed_ready_bridge(void) {
+    return (g_queue && g_pso_ik_nvfp4 && g_pso_ik_mxfp8) ? 1 : 0;
+}
+
+void *cwick_metal_ik_packed_batch_begin_bridge(int slot) {
+    if (!cwick_metal_ik_packed_ready_bridge()) return NULL;
+    if (slot < 0) slot = 0;
+    if (slot >= CWICK_IK_BATCH_SLOTS) slot = CWICK_IK_BATCH_SLOTS - 1;
+    if (!g_ik_batch[slot]) {
+        g_ik_batch[slot] = calloc(1, sizeof(struct cwick_ik_batch_s));
+        if (!g_ik_batch[slot]) return NULL;
+    }
+    struct cwick_ik_batch_s *b = g_ik_batch[slot];
+    b->cb = nil; b->enc = nil;
+    b->bx_used = b->bo_used = 0;
+    b->n = 0; b->bad = 0;
+    return b;
+}
+
+int cwick_metal_ik_packed_batch_add_bridge(void *vb, const void *packed,
+                                          const void *scale, float global_scale,
+                                          const float *x, float *out,
+                                          uint32_t k, uint32_t cols,
+                                          uint32_t half, uint32_t format) {
+    struct cwick_ik_batch_s *b = (struct cwick_ik_batch_s *)vb;
+    if (!b || b->bad || !packed || !scale || !x || !out || !k || !cols ||
+        (k & 63u) || (format != 1u && format != 2u) || half > cols ||
+        (format == 1u && half && (cols & 1u)) || b->n >= CWICK_IK_BATCH_MAX)
+        return 0;
+    if (((uintptr_t)packed & 3u) || (format == 2u && ((uintptr_t)packed & 7u))) {
+        b->bad = 1;
+        return 0;
+    }
+
+    const size_t row_values = (size_t)cols * k;
+    const size_t wbytes = format == 1u ? row_values / 2u : row_values;
+    const size_t sbytes = format == 1u ? row_values / 16u : row_values / 32u;
+    const size_t xbytes = (size_t)k * sizeof(float);
+    const size_t obytes = (size_t)cols * sizeof(float);
+
+    id<MTLBuffer> bw = nil, bs = nil;
+    size_t woff = 0, soff = 0;
+    if (!arena_view(packed, wbytes, &bw, &woff) &&
+        !view_of(packed, wbytes, &bw, &woff)) {
+        b->bad = 1;
+        return 0;
+    }
+    if (!arena_view(scale, sbytes, &bs, &soff) &&
+        !view_of(scale, sbytes, &bs, &soff)) {
+        b->bad = 1;
+        return 0;
+    }
+
+    size_t xoff = (b->bx_used + 63u) & ~(size_t)63u;
+    size_t ooff = (b->bo_used + 63u) & ~(size_t)63u;
+    size_t xneed = xoff + xbytes, oneed = ooff + obytes;
+    if (!b->bx || b->bx_cap < xneed) {
+        size_t want = b->bx_cap ? b->bx_cap * 2 : (1u << 20);
+        if (want < xneed) want = xneed;
+        id<MTLBuffer> nb = [g_dev newBufferWithLength:want
+                                             options:MTLResourceStorageModeShared];
+        if (!nb) { b->bad = 1; return 0; }
+        b->bx = nb; b->bx_cap = want;
+    }
+    if (!b->bo || b->bo_cap < oneed) {
+        size_t want = b->bo_cap ? b->bo_cap * 2 : (1u << 20);
+        if (want < oneed) want = oneed;
+        id<MTLBuffer> nb = [g_dev newBufferWithLength:want
+                                             options:MTLResourceStorageModeShared];
+        if (!nb) { b->bad = 1; return 0; }
+        b->bo = nb; b->bo_cap = want;
+    }
+    b->bx_used = xneed; b->bo_used = oneed;
+    memcpy((uint8_t *)b->bx.contents + xoff, x, xbytes);
+
+    b->it[b->n].wb = bw; b->it[b->n].sb = bs;
+    b->it[b->n].woff = woff; b->it[b->n].soff = soff;
+    b->it[b->n].xoff = xoff; b->it[b->n].ooff = ooff;
+    b->it[b->n].dst = out; b->it[b->n].obytes = obytes;
+    b->it[b->n].k = k; b->it[b->n].cols = cols;
+    b->it[b->n].half = half; b->it[b->n].format = format;
+    b->it[b->n].global_scale = global_scale;
+    b->n++;
+    return 1;
+}
+
+int cwick_metal_ik_packed_batch_end_bridge(void *vb) {
+    struct cwick_ik_batch_s *b = (struct cwick_ik_batch_s *)vb;
+    if (!b) return 0;
+    if (b->bad) return 0;
+    if (b->n == 0) return 1;
+    if (!b->args || b->args_cap < (NSUInteger)b->n) {
+        NSUInteger cap = b->args_cap ? b->args_cap : 16;
+        while (cap < (NSUInteger)b->n) cap *= 2;
+        id<MTLBuffer> na = [g_dev newBufferWithLength:(size_t)cap * CWICK_ARGS_STRIDE
+                                             options:MTLResourceStorageModeShared];
+        if (!na) { b->bad = 1; return 0; }
+        b->args = na; b->args_cap = cap;
+    }
+
+    b->cb = [g_queue commandBuffer];
+    if (!b->cb) { b->bad = 1; return 0; }
+    b->enc = cwick_concurrent_encoder(b->cb);
+    if (!b->enc) { b->bad = 1; return 0; }
+    for (int i = 0; i < b->n; i++) {
+        cwick_metal_ik_packed_args *ap =
+            (cwick_metal_ik_packed_args *)((uint8_t *)b->args.contents +
+                                          (size_t)i * CWICK_ARGS_STRIDE);
+        ap->k = b->it[i].k; ap->cols = b->it[i].cols;
+        ap->half = b->it[i].half; ap->format = b->it[i].format;
+        ap->global_scale = b->it[i].global_scale;
+        [b->enc setComputePipelineState:(b->it[i].format == 1u
+                                         ? g_pso_ik_nvfp4 : g_pso_ik_mxfp8)];
+        [b->enc setBuffer:b->args offset:(NSUInteger)i * CWICK_ARGS_STRIDE atIndex:0];
+        [b->enc setBuffer:b->it[i].wb offset:b->it[i].woff atIndex:1];
+        [b->enc setBuffer:b->it[i].sb offset:b->it[i].soff atIndex:2];
+        [b->enc setBuffer:b->bx offset:b->it[i].xoff atIndex:3];
+        [b->enc setBuffer:b->bo offset:b->it[i].ooff atIndex:4];
+        [b->enc dispatchThreadgroups:MTLSizeMake(b->it[i].cols, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [b->enc endEncoding];
+    b->enc = nil;
+    double t0 = 0, t1 = 0;
+    if (getenv("CWICK_METAL_TIME")) t0 = cwick_metal_now_s();
+    [b->cb commit];
+    [b->cb waitUntilCompleted];
+    if (getenv("CWICK_METAL_TIME")) {
+        t1 = cwick_metal_now_s();
+        fprintf(stderr, "Tik n=%d wait=%.1fus gpu=%.1fus\n", b->n,
+                (t1 - t0) * 1e6, (b->cb.GPUEndTime - b->cb.GPUStartTime) * 1e6);
+    }
+    int ok = (b->cb.status == MTLCommandBufferStatusCompleted && !b->cb.error);
+    if (ok)
+        for (int i = 0; i < b->n; i++)
+            memcpy(b->it[i].dst, (uint8_t *)b->bo.contents + b->it[i].ooff,
+                   b->it[i].obytes);
+    b->n = 0;
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Inkling fused packed expert pairs: W13 -> SiTU -> W2 in one command  */
+/* ------------------------------------------------------------------ */
+#define CWICK_IK_PAIR_MAX 128
+#define CWICK_IK_PAIR_SLOTS 4
+
+typedef struct { uint inter; float gate_cap; float up_cap; } cwick_ik_situ_args;
+
+struct cwick_ik_pair_batch_s {
+    id<MTLCommandBuffer> cb;
+    id<MTLBuffer> args, bx, bgu, bact, bo, gammas;
+    NSUInteger args_cap, gammas_cap;
+    size_t bx_cap, bgu_cap, bact_cap, bo_cap;
+    size_t bx_used, bgu_used, bact_used, bo_used;
+    int n, bad;
+    struct {
+        __unsafe_unretained id<MTLBuffer> w13b, s13b, w2b, s2b;
+        size_t w13off, s13off, w2off, s2off;
+        size_t xoff, guoff, actoff, ooff, obytes;
+        void *dst;
+        uint32_t k, cols, k2, cols2, half, format;
+        float g13, g2, gamma, gate_cap, up_cap;
+    } it[CWICK_IK_PAIR_MAX];
+};
+
+static struct cwick_ik_pair_batch_s *g_ik_pair[CWICK_IK_PAIR_SLOTS];
+
+void *cwick_metal_ik_pair_batch_begin_bridge(int slot) {
+    if (!g_queue || !g_pso_ik_nvfp4 || !g_pso_ik_mxfp8 || !g_pso_ik_situ) return NULL;
+    if (slot < 0) slot = 0;
+    if (slot >= CWICK_IK_PAIR_SLOTS) slot = CWICK_IK_PAIR_SLOTS - 1;
+    if (!g_ik_pair[slot]) {
+        g_ik_pair[slot] = calloc(1, sizeof(struct cwick_ik_pair_batch_s));
+        if (!g_ik_pair[slot]) return NULL;
+    }
+    struct cwick_ik_pair_batch_s *b = g_ik_pair[slot];
+    b->cb = nil;
+    b->bx_used = b->bgu_used = b->bact_used = b->bo_used = 0;
+    b->n = 0; b->bad = 0;
+    return b;
+}
+
+static int cwick_ik_pair_reserve(id<MTLBuffer> __strong *buf, size_t *cap,
+                                 size_t *used, size_t bytes, size_t *off) {
+    *off = (*used + 63u) & ~(size_t)63u;
+    if (!*buf || *cap < *off + bytes) {
+        size_t want = *cap ? *cap : (1u << 20);
+        while (want < *off + bytes) want *= 2;
+        id<MTLBuffer> nb = [g_dev newBufferWithLength:want
+                                              options:MTLResourceStorageModeShared];
+        if (!nb) return 0;
+        *buf = nb; *cap = want;
+    }
+    *used = *off + bytes;
+    return 1;
+}
+
+int cwick_metal_ik_pair_batch_add_bridge(void *vb,
+        const void *w13, const void *s13, float g13,
+        const void *w2, const void *s2, float g2,
+        const float *x, float *out, float gamma,
+        uint32_t k, uint32_t cols, uint32_t k2, uint32_t cols2,
+        uint32_t half, uint32_t format, float gate_cap, float up_cap) {
+    struct cwick_ik_pair_batch_s *b = (struct cwick_ik_pair_batch_s *)vb;
+    if (!b || b->bad || !w13 || !s13 || !w2 || !s2 || !x || !out ||
+        !k || !k2 || !cols || !cols2 || !half || cols != 2u * half ||
+        (format != 1u && format != 2u) || (k & 63u) || (k2 & 63u) ||
+        b->n >= CWICK_IK_PAIR_MAX) return 0;
+    size_t r13 = (size_t)cols * k, r2 = (size_t)cols2 * k2;
+    size_t w13bytes = format == 1u ? r13 / 2u : r13;
+    size_t s13bytes = format == 1u ? r13 / 16u : r13 / 32u;
+    size_t w2bytes = format == 1u ? r2 / 2u : r2;
+    size_t s2bytes = format == 1u ? r2 / 16u : r2 / 32u;
+    id<MTLBuffer> bw13 = nil, bs13 = nil, bw2 = nil, bs2 = nil;
+    size_t w13off = 0, s13off = 0, w2off = 0, s2off = 0;
+    if ((!arena_view(w13, w13bytes, &bw13, &w13off) && !view_of(w13, w13bytes, &bw13, &w13off)) ||
+        (!arena_view(s13, s13bytes, &bs13, &s13off) && !view_of(s13, s13bytes, &bs13, &s13off)) ||
+        (!arena_view(w2, w2bytes, &bw2, &w2off) && !view_of(w2, w2bytes, &bw2, &w2off)) ||
+        (!arena_view(s2, s2bytes, &bs2, &s2off) && !view_of(s2, s2bytes, &bs2, &s2off))) {
+        b->bad = 1; return 0;
+    }
+    size_t xoff, guoff, actoff, ooff;
+    if (!cwick_ik_pair_reserve(&b->bx, &b->bx_cap, &b->bx_used,
+                               (size_t)k * sizeof(float), &xoff) ||
+        !cwick_ik_pair_reserve(&b->bgu, &b->bgu_cap, &b->bgu_used,
+                               (size_t)cols * sizeof(float), &guoff) ||
+        !cwick_ik_pair_reserve(&b->bact, &b->bact_cap, &b->bact_used,
+                               (size_t)k2 * sizeof(float), &actoff) ||
+        !cwick_ik_pair_reserve(&b->bo, &b->bo_cap, &b->bo_used,
+                               (size_t)cols2 * sizeof(float), &ooff)) {
+        b->bad = 1; return 0;
+    }
+    memcpy((uint8_t *)b->bx.contents + xoff, x, (size_t)k * sizeof(float));
+    b->it[b->n] = (typeof(b->it[b->n])){
+        .w13b = bw13, .s13b = bs13, .w2b = bw2, .s2b = bs2,
+        .w13off = w13off, .s13off = s13off, .w2off = w2off, .s2off = s2off,
+        .xoff = xoff, .guoff = guoff, .actoff = actoff, .ooff = ooff,
+        .obytes = (size_t)cols2 * sizeof(float), .dst = out,
+        .k = k, .cols = cols, .k2 = k2, .cols2 = cols2,
+        .half = half, .format = format, .g13 = g13, .g2 = g2,
+        .gamma = gamma, .gate_cap = gate_cap, .up_cap = up_cap};
+    b->n++;
+    return 1;
+}
+
+int cwick_metal_ik_pair_batch_end_bridge(void *vb) {
+    struct cwick_ik_pair_batch_s *b = (struct cwick_ik_pair_batch_s *)vb;
+    if (!b || b->bad || b->n == 0) return 0;
+    if (!b->args || b->args_cap < (NSUInteger)b->n * 2u) {
+        NSUInteger cap = b->args_cap ? b->args_cap : 32;
+        while (cap < (NSUInteger)b->n * 2u) cap *= 2;
+        b->args = [g_dev newBufferWithLength:(size_t)cap * CWICK_ARGS_STRIDE
+                                      options:MTLResourceStorageModeShared];
+        if (!b->args) { b->bad = 1; return 0; }
+        b->args_cap = cap;
+    }
+    if (!b->gammas || b->gammas_cap < (NSUInteger)b->n) {
+        NSUInteger cap = b->gammas_cap ? b->gammas_cap : 32;
+        while (cap < (NSUInteger)b->n) cap *= 2;
+        b->gammas = [g_dev newBufferWithLength:cap * sizeof(float)
+                                         options:MTLResourceStorageModeShared];
+        if (!b->gammas) { b->bad = 1; return 0; }
+        b->gammas_cap = cap;
+    }
+    b->cb = [g_queue commandBuffer];
+    if (!b->cb) { b->bad = 1; return 0; }
+    for (int i = 0; i < b->n; i++) {
+        cwick_metal_ik_packed_args *a13 = (cwick_metal_ik_packed_args *)((uint8_t *)b->args.contents + (size_t)(2 * i) * CWICK_ARGS_STRIDE);
+        cwick_metal_ik_packed_args *a2 = (cwick_metal_ik_packed_args *)((uint8_t *)b->args.contents + (size_t)(2 * i + 1) * CWICK_ARGS_STRIDE);
+        *a13 = (cwick_metal_ik_packed_args){b->it[i].k, b->it[i].cols, b->it[i].half, b->it[i].format, b->it[i].g13};
+        *a2 = (cwick_metal_ik_packed_args){b->it[i].k2, b->it[i].cols2, 0, b->it[i].format, b->it[i].g2};
+        ((float *)b->gammas.contents)[i] = b->it[i].gamma;
+    }
+    id<MTLComputeCommandEncoder> e = cwick_concurrent_encoder(b->cb);
+    if (!e) { b->bad = 1; return 0; }
+    for (int i = 0; i < b->n; i++) {
+        [e setComputePipelineState:(b->it[i].format == 1u ? g_pso_ik_nvfp4 : g_pso_ik_mxfp8)];
+        [e setBuffer:b->args offset:(NSUInteger)(2 * i) * CWICK_ARGS_STRIDE atIndex:0];
+        [e setBuffer:b->it[i].w13b offset:b->it[i].w13off atIndex:1];
+        [e setBuffer:b->it[i].s13b offset:b->it[i].s13off atIndex:2];
+        [e setBuffer:b->bx offset:b->it[i].xoff atIndex:3];
+        [e setBuffer:b->bgu offset:b->it[i].guoff atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(b->it[i].cols, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [e endEncoding];
+    cwick_ik_situ_args sa = {b->it[0].k2, b->it[0].gate_cap, b->it[0].up_cap};
+    e = [b->cb computeCommandEncoder];
+    [e setComputePipelineState:g_pso_ik_situ];
+    [e setBuffer:b->bgu offset:0 atIndex:0];
+    [e setBuffer:b->gammas offset:0 atIndex:1];
+    [e setBuffer:b->bact offset:0 atIndex:2];
+    [e setBytes:&sa length:sizeof(sa) atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)b->n * b->it[0].k2 + 127u) / 128u, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [e endEncoding];
+    e = cwick_concurrent_encoder(b->cb);
+    if (!e) { b->bad = 1; return 0; }
+    for (int i = 0; i < b->n; i++) {
+        [e setComputePipelineState:(b->it[i].format == 1u ? g_pso_ik_nvfp4 : g_pso_ik_mxfp8)];
+        [e setBuffer:b->args offset:(NSUInteger)(2 * i + 1) * CWICK_ARGS_STRIDE atIndex:0];
+        [e setBuffer:b->it[i].w2b offset:b->it[i].w2off atIndex:1];
+        [e setBuffer:b->it[i].s2b offset:b->it[i].s2off atIndex:2];
+        [e setBuffer:b->bact offset:b->it[i].actoff atIndex:3];
+        [e setBuffer:b->bo offset:b->it[i].ooff atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(b->it[i].cols2, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [e endEncoding];
+    [b->cb commit];
+    [b->cb waitUntilCompleted];
+    int ok = b->cb.status == MTLCommandBufferStatusCompleted && !b->cb.error;
+    if (ok)
+        for (int i = 0; i < b->n; i++)
+            memcpy(b->it[i].dst, (uint8_t *)b->bo.contents + b->it[i].ooff, b->it[i].obytes);
     b->n = 0;
     return ok;
 }
@@ -1886,9 +2260,30 @@ void cwick_metal_bridge_cleanup(void) {
     g_f32_x_cap = g_f32_o_cap = 0;
     g_pso = nil;
     g_pso_bf16 = nil;
+    g_pso_ik_nvfp4 = nil;
+    g_pso_ik_mxfp8 = nil;
+    g_pso_ik_situ = nil;
     g_pso_f32_gemm = nil;
     g_pso_ds_fp4 = nil;
     g_pso_ds_bf16 = nil;
+    for (int i = 0; i < CWICK_IK_BATCH_SLOTS; i++) {
+        if (g_ik_batch[i]) {
+            g_ik_batch[i]->cb = nil; g_ik_batch[i]->enc = nil;
+            g_ik_batch[i]->args = nil; g_ik_batch[i]->bx = nil; g_ik_batch[i]->bo = nil;
+        }
+        free(g_ik_batch[i]);
+        g_ik_batch[i] = NULL;
+    }
+    for (int i = 0; i < CWICK_IK_PAIR_SLOTS; i++) {
+        if (g_ik_pair[i]) {
+            g_ik_pair[i]->cb = nil; g_ik_pair[i]->args = nil;
+            g_ik_pair[i]->bx = g_ik_pair[i]->bgu = nil;
+            g_ik_pair[i]->bact = g_ik_pair[i]->bo = nil;
+            g_ik_pair[i]->gammas = nil;
+        }
+        free(g_ik_pair[i]);
+        g_ik_pair[i] = NULL;
+    }
     for (int i = 0; i < CWICK_DS_BATCH_SLOTS; i++) {
         if (g_ds_batch[i]) { g_ds_batch[i]->stg = nil; g_ds_batch[i]->args = nil; }
         free(g_ds_batch[i]);
