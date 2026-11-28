@@ -6248,3 +6248,341 @@ logit comparison explains and fixes the drift.
 
 The final full-chain results and the honest gap to the 80/40 tok/s targets are
 recorded in `docs/PERF.md` and `docs/PERF.zh-CN.md`.
+
+## §119 Music3 generation, source-audio format understanding, and the two-row batch overflow
+
+`--music DIR` registers the Music3 pipeline and `--ace DIR` registers the
+source-audio understanding pipeline. Both join the same single-model slot as
+text/image/video/realtime: `POST /v1/models/switch` loads either one on demand,
+and a valid `/v1/generate` or `/v1/generate/format` request switches before it
+runs, releasing the previous pipeline first. The format route reads a WAV from
+the request, returns caption, lyrics and metadata, and the next generation
+request switches back to Music3. The H5 music app drives that exact sequence.
+
+The first full-length reference job ended in `SIGTRAP` inside an allocation
+from the token sampler. The cause was not the sampler: both the global LM head
+and the RVQ depth heads called `music_linear_bf16_batch(..., rows=2, copies=2)`
+while their output buffers held only two rows. Each call wrote twice the
+allocated space, corrupting heap metadata before the next allocation. The depth
+projection had a second layout bug: the decoder reads rows at `(b*8+t)*D`, but
+the projection wrote two batches contiguously. The heads now use `copies=1`
+with two rows in one GEMM, and the depth projection scatters each batch row to
+its own 8-row stride. An AddressSanitizer build that previously trapped in
+`cblas_sgemm` now completes a 1 s / 2-step generation cleanly, and the 10 s
+cover job completes through the HTTP API.
+
+Measured full-chain numbers for both pipelines are in `docs/PERF.md` and
+`docs/PERF.zh-CN.md`.
+
+A second real-model check caught silent output: a translated Chinese caption
+produced a valid WAV at −91 dBFS, while the same job with the original English
+caption reached −43 dBFS. This is a tokenizer/prompt-domain limit, not a
+renderer failure, and hiding it would have made the H5 flow useless. The format
+response now preserves the pre-translation `prompt_en` / `caption_en` /
+`lyrics_en`, and the music app submits those fields for generation while still
+displaying the requested language. No audio transcription is added to the
+format route: its lyrics remain model-generated, not ASR.
+
+## §120 Layer-by-layer audio-pooler comparison and the acoustic projection stride bug
+
+A dump hook on the acoustic understanding path exports the pooled transformer's
+projection input, every layer's Q/K/V, norm, RoPE, attention scores and outputs,
+MLP intermediates, final CLS vector and quantizer logits. Feeding the same
+projection input to the reference computation gives correlation 1.000000 on every
+layer (RMSE 1e-4–0.16; layer-0 RMSNorm is bit-identical). The pooler itself is
+therefore correct; the first-stage projection that feeds it was not.
+
+`ace_fsq_encode` staged the 64-channel VAE latents in a `[frames,2048]` buffer
+but called the GEMM with `k=64`. The GEMM reads rows with stride 64, so it
+consumed 63 unrelated floats per row. A secondary layout error prepended the
+silence-latent frames, whereas the checkpoint appends them to reach a whole
+pooling group. The C path now stages a compact `[frames,64]` array for the
+acoustic projection and appends the silence frames. On a 20 s vocal excerpt the
+first 100 codes are 90/100 identical to the reference codes; the remaining
+differences are single FSQ digits caused by VAE numerical drift (latent
+correlation 0.9986), not by a structural layout error.
+
+The corrected native chain still returned `[Instrumental]` on the 212.51 s
+sample at that point, and the reference LM reproduced that from the same code
+string. The observation was right; the conclusion drawn from it was not. The
+code string itself was wrong for any upload longer than a single VAE window,
+because the tiled encode read the wrong channel offset (§121). With that fixed
+the same upload returns full Chinese lyrics.
+
+## §121 Tiled VAE encode read the wrong channel offset, so long uploads got broken codes
+
+A 212.51 s upload analysed to `[Instrumental]` while a 20 s excerpt of the same
+song analysed normally. The difference is the number of VAE windows, and two
+independent errors lived only on the multi-window path.
+
+`ace_wav_load` writes planar stereo: `audio[0..frames-1]` is the left channel and
+`audio[frames..2*frames-1]` is the right one. Two places assumed something else.
+`ace_vae_window` took `audio[c * actual + t]` with `actual` being the *window*
+length, and `ace_vae_encode` sliced the next window with `audio + win_start * 2`.
+For a single window `actual == frames` and `win_start == 0`, so both expressions
+degenerate to the correct ones — which is why every layer-by-layer comparison on
+a 20 s excerpt passed.
+
+The tiling geometry was also wrong. It advanced by 28 s and trimmed 2 s only on
+the left, so the last 2 s of every window were encoded without future context
+and kept as-is. The checkpoint's own encode keeps a 30 s window, advances 26 s,
+and trims 2 s on both sides. `ACE_CORE_SAMPLES` is now 26 s, `ACE_OVERLAP_SAMPLES`
+2 s, and `ace_vae_window` receives two channel pointers instead of a base pointer
+plus a stride.
+
+Measured against a reference tiled encode of the same 212.51 s file: latent
+correlation 0.999756 globally and RMSE 0.0215, with 1.000000 correlation on every
+26 s segment after the first; frame 0 differs by 0.42 because of convolutional
+edge padding. The single-window path is unchanged bit for bit (max absolute
+difference 0.0 against the previous 20 s dump).
+
+The same upload now produces Chinese lyrics instead of `[Instrumental]`:
+`language zh`, `genres Mandopop EDM`, `bpm 130`, `keyscale E♭ major`, 1063 codes,
+1092 prompt tokens, 516 output tokens. `POST /v1/generate/format` returned HTTP
+200 in 158.3 s wall (VAE 78.0 s, FSQ 1.8 s, prefill 7.5 s, LM 66.6 s, parse 9 ms).
+
+One decode artifact surfaced with the longer output: the LM occasionally drops a
+literal `<|audio_code_N|>` token into the middle of a lyric line. The reference
+parser leaves it in place. `ace_strip_audio_markers` removes those tokens from
+caption, lyrics and genres after parsing, which is why the returned line reads
+`你都会带着色的玫瑰` rather than carrying a control token.
+
+## §122 Lyric tags from the format step are mapped onto the renderer's documented set
+
+The format-understanding model writes section tags in its own vocabulary, and
+they are not the tags the renderer documents. The checkpoint lists a closed set
+of single-word tags — `[Intro]`, `[Verse]`, `[Pre-Chorus]`, `[Chorus]`,
+`[Post-Chorus]`, `[Bridge]`, `[Instrumental]`, `[Solo]`, `[Outro]` — and asks
+for one tag per line. A 212.51 s sample came back with `[Verse 1]`, `[Verse 2]`
+and `[Instrumental Drop 1]` plus arrangement annotations in brackets, such as
+`[Synth arpeggio and pads]`, `[Synth lead melody with heavy beat]` and
+`[Beat and melody fade out]`. Those annotations are prose, not sections; sent as
+tags they consume a section slot and say nothing about structure that the caption
+does not already say.
+
+`music_normalize_lyrics` now resolves each bracketed name through
+`music_canonical_tag` before emitting it. The lookup lowercases, collapses
+whitespace, strips a trailing index (`verse 1`, `chorus2`), and then matches in
+three steps: the whole name, its first token (`instrumental drop`), and its
+spaced spelling rewritten with hyphens (`pre chorus`). A name that resolves is
+emitted as the documented tag. A name that does not resolve and contains a space
+is treated as an annotation, and a line that held only annotations is dropped
+whole, so it leaves no empty marker behind. A single-token unknown tag is kept
+verbatim: the checkpoint ships reference lyrics with ad-hoc tags such as
+`[bass-quartet-rumbles-in]`, and the space rule distinguishes those from prose
+without needing a whitelist of every phrase a model might invent.
+
+On the real 594-character result this turns 15 bracketed names into 10 documented
+tags: `[verse]` twice, `[pre-chorus]` twice, `[chorus]` twice, plus `[intro]`,
+`[instrumental]`, `[bridge]` and `[outro]`. Five annotation lines disappear. The
+normalized text is 1005 bytes, 327 tokens, and the assembled Music 3 prompt is
+457 of the 5000-token budget, so the reduction is about correctness rather than
+length.
+
+`music_lyrics_selftest` covers both halves: the sample shape above, and the
+spelling variants `[Pre Chorus 2]`, `[Chorus3]`, `[Verse 10]` collapsing to their
+documented tags while `[Whisper]` and `[bass-quartet-rumbles-in]` survive.
+
+## §123 The WAV resampler read interleaved samples as planar, so any non-48 kHz upload was analysed as a different song
+
+The music app analysed a 212.51 s upload as `[Instrumental]` while the same file
+through the probe produced full Chinese lyrics. The server log narrowed it down:
+`1063 codes, 330 output tokens` against `1063 codes, 516 output tokens` from the
+probe. The code count matched, so the duration and the frame geometry were right;
+the code *values* were not.
+
+The difference was the sample rate. The H5 app rendered its WAV through
+`new OfflineAudioContext(2, ..., 44100)`, and the upload was 35.75 MiB, which is
+exactly 212.51 s of 44.1 kHz stereo 16-bit. `ace_resample` has a fast path for
+`rate == 48000` that reads `in[i * channels + c]` — interleaved, which is what
+`ace_wav_load` builds in `raw`. Its polyphase path read
+`in + c * frames + left + lo` instead, i.e. channel-major. For 44.1 kHz input
+that treats the interleaved stream as two half-length planes: the left channel
+becomes a 2x time-compressed L/R mix and the right channel starts halfway through
+the file. Nothing failed; the VAE simply encoded 212 s of something that was not
+the song.
+
+Measured: the 44.1 kHz upload produced **0 of 1063** codes equal to the 48 kHz
+encode of the same audio, `language zxx`, 177 output tokens and an `[Instrumental]`
+lyric field. After changing the polyphase read to interleaved
+(`in + (left + lo) * channels + c`, `incX = channels`), the same upload returns
+`language zh` and 879 output tokens, with **935 of 1063** codes equal to the
+48 kHz baseline. The remaining 12% come from the 48 -> 44.1 -> 48 round trip, and
+they matter: that run wrote its lyrics as `[zh] feng1 yue4 bu4 guo4 ...` pinyin
+instead of characters. A codec that flips one FSQ code per 8 samples is enough to
+change which language the LM writes in.
+
+`ace_resample_selftest` now guards the contract: a stereo resample must equal two
+mono resamples of its own channels, and the two channels must stay distinct. The
+test fails on the old read (`FAIL: ... (line 6468)`) and passes on the new one,
+so the planar/interleaved mix cannot come back silently.
+
+The app also renders at **48 kHz** now instead of 44.1 kHz. That removes the
+browser's downsample and the server's upsample entirely; a 48 kHz PCM input takes
+the exact-rate fast path, and the codes match the 48 kHz encode bit for bit.
+Verified end to end against a fresh build: `POST /v1/generate/format` with the
+48 kHz payload returned HTTP 200 in 193.2 s, `language zh`,
+`genres Mandopop EDM`, `bpm 130`, `keyscale E♭ major`, and 503 characters of
+Chinese lyrics with `[Intro]`/`[Verse 1]`/`[Pre-Chorus]` structure. The VAE stage
+took 105.2 s in that run because a resident text model shared the machine; 78.0 s
+is the uncontended figure from §121.
+
+## §124 Source-audio understanding was removed from the runtime
+
+Sections §119–§123 record measurements and fixes from the source-audio
+understanding pipeline. That pipeline is no longer part of the runtime:
+`src/ace.c`, `src/ace.h`, the `--ace` / `CWICK_ACE_MODEL` options, the
+`/v1/generate/format` route, its `/v1/models` entry, its metrics and the
+`aceprobe` tool were all removed. The earlier sections are kept as a decision
+record only; none of their endpoints or environment variables can be used on a
+current build.
+
+Music generation itself is unchanged: `/v1/generate` still renders a complete
+track through the MiniMax-Music3 pipeline. The built-in music studio now asks
+the resident text model for a title, an English Structured Caption and lyrics,
+then submits that text to `/v1/generate`; it no longer decodes or uploads a
+source recording. §125 replaces the older English-tag contract from §123.
+
+## §125 Noisy, voiceless Music3 output: reversed flow time and a caption with no vocal contract
+
+Two independent input-side faults made `/v1/generate` return chaotic, mostly
+instrumental audio. Neither was fixed by changing scheduling parameters.
+
+1. **Flow time ran backwards.** The checkpoint scheduler is configured with
+   `invert_sigmas: true`; `set_timesteps(sigmas=linspace(1, 1/N, N))` first builds
+   `linspace(1, 1/N, N)` and then inverts it, so the transformer receives
+   `t = step / N` (`0` = noise, `(N-1)/N` = data) and Euler takes `dt = +1/N`.
+   The engine used `t = 1 - step/N` and `dt = -1/N`: a pure-noise latent was fed
+   to the data end of the Fourier timestep embedding and integrated towards
+   noise. The reference's overlap prompt uses the same time value, so the old
+   sign also blended the wrong way. `music_flow_time()` / `music_flow_step_size()`
+   now follow the checkpoint grid; `CWICK_MUSIC_FLOW_LEGACY=1` reproduces the old
+   behaviour for A/B, and `music_flow_scheduler_selftest()` pins the new grid.
+2. **The music studio never asked for a singer.** The old idea prompt asked the
+   text model for ≤180 characters of style tags and did not require a vocal
+   section or a lead voice. A caption that never names a lead vocal gives the
+   autoregressive stage no reason to sing. The app now asks for the checkpoint's
+   three-section English Structured Caption — Global Metadata / Vocal Details /
+   Arrangement — with a mandatory "Vocal Gender & Timbre" line, 900–1800
+   characters, and 8+ short lyric lines with section tags. `style` used to be
+   capped at 1000 bytes both in the app and in `/v1/generate`, which cut a valid
+   caption off before Arrangement; both limits are now 4000 bytes, well below
+   the 5000-token prompt budget. Lyrics still go through
+   `music_normalize_lyrics()` so tags land on their own lines.
+
+The window carry was also aligned with the reference: only `[T-344, T-172)` is
+held for the next chunk and 172 latent frames are blended, instead of carrying
+the trailing 344 frames and blending all of them. With a 100-frame hop the next
+window regenerates its leading 172 frames from scratch, so carrying those frames
+only smeared the seam.
+
+Same-seed, same-prompt A/B at 2 s / 8 steps (32 kHz stereo WAV):
+
+| flow grid | RMS | envelope \|dRMS\| | mean autocorr peak | weak-periodicity frames |
+|-----------|-----|-------------------|--------------------|-------------------------|
+| legacy `1→1/N` | 0.0563 | 0.0065 | 0.287 | 21 / 39 |
+| fixed `0→(N-1)/N` | 0.0950 | 0.0252 | 0.415 | 16 / 39 |
+
+These are signal statistics, not a claim that the checkpoints now produce a
+hit record. They show the reversed grid was measurably less periodic and less
+dynamic with the same weights and the same prompt. A longer 6 s / 12 step run
+with the official-style caption is recorded in `docs/PERF.md`.
+
+## §126. Layer-by-layer numerical audit of the whole music chain
+
+A follow-up report that generated tracks were still noisy and voiceless
+triggered a full numerical audit rather than another round of speculative
+tuning. Each stage was run on identical inputs in the C engine and, separately,
+in PyTorch using the released checkpoint weights and the reference formulas;
+intermediate tensors were dumped under a diagnostic environment flag (removed
+afterwards) and compared element by element.
+
+| stage | comparison | result |
+|-------|------------|--------|
+| tokenizer | prompt ids for the assembled caption+lyrics contract | identical special-token ids |
+| global LM | first-step logits for the 524-token conditional/unconditional prompt pair | cosine 0.977 / 0.981, top-1 token identical on both branches |
+| condition encoder | 172-frame hidden → 2048-dim condition | identical |
+| DiT | input concat, `proj_in`, all 36 blocks, `proj_out`, `postprocess` | every checkpoint cos 1.00000, output cos 1.0000 (max abs diff 0.011, fp32 rounding) |
+| Flow-VAE vocoder | reference WAV → encode → vocoder → WAV | autocorrelation peak 0.731 → 0.761, periodicity preserved |
+
+The one apparent discrepancy found during the audit was in the comparison
+harness, not the engine: the DiT consumes latents as `[batch, channels, time]`
+while the on-disk dump is `[batch, time, channels]`, and the first reference
+script reshaped instead of transposing the output. Once the layouts were
+matched, the C DiT matched the PyTorch reference exactly at every layer.
+
+The practical conclusion is negative but important: within fp32 rounding the
+C implementation is numerically equivalent to the reference on all five
+stages. The residual quality gap against the published `minimax_ttm.wav`
+(≈0.73 mean autocorrelation peak versus ≈0.48 for a 6 s generation) is not a
+weight-loading, layout, sampling, CFG, time-grid or vocoder defect. It comes
+from generation length and sampling variance: the published sample is a
+carefully seeded ~285 s track, while a 6 s job mostly covers the instrumental
+intro before the vocal entry. Comparisons must therefore use the same song
+section and duration; short-window statistics alone do not indicate a bug.
+
+## §127. Lyric length controls song length — the app's real defect
+
+The 60 s studio default exposed a concrete application-layer defect. A job
+requesting 60 s with the checkpoint's own five-line reference lyrics emitted
+an end-of-audio token after **261 frames (10.4 s)**, not 1500 frames: the
+language model stops once the sung text is exhausted. Re-running at 30 s with
+19 lyric lines produced the full **750 frames**, confirming that lyric length,
+not the `duration` field, decides how long the model actually sings.
+
+That 261-frame sample already measured 0.627–0.643 mean autocorrelation peak
+(versus 0.744 for the reference's first 10 s), markedly better than the 0.481 of
+earlier six-second jobs — the extra seconds contain the vocal entry that a
+6 s probe never reached. The perceived "voiceless" track was therefore a short
+instrumental intro caused by under-length lyrics, not a synthesis failure.
+
+`apps/music/app.js` now sizes the generated lyric to the requested duration
+(roughly one short line per two seconds, 12–120 lines) and requires a complete
+Intro/Verse/Pre-Chorus/Chorus/Verse/Chorus/Bridge/Chorus/Outro structure with
+the chorus repeated verbatim, so the singer has enough text to fill the whole
+track. The `style` caption was already aligned in §125; this fixes the other
+half of the input contract.
+
+## §128. Multi-window volume-collapse hypothesis disproved; caption detail sets quality
+
+The suspected "more windows, quieter output" regression was tested with a
+matched A/B and **rejected**. Holding prompt, lyrics, seed (7) and CFG (1.7)
+fixed, a per-window RMS probe was added permanently to the vocoder stitch loop
+in `src/music.c`. A 10 s / 8-step job (2 windows) measured 0.01282 and 0.01205
+RMS on its two chunks; a 6 s / 8-step job (1 window, no overlap at all) with the
+same inputs measured 0.01489. The first window is identical in both paths —
+no overlap, no carry — so a splice/carry bug cannot be the cause. The earlier
+30 s / 20-step sample at −43 dBFS was a confound of short caption, few steps
+and long lyrics, not a window-count defect. Window crop/carry was re-derived
+against the reference: 200-frame window, 100-frame hop (344 latent), carry
+[T−344, T−172), overlap 172, crop left 86 / right 258 — all aligned.
+
+Two input variables were then isolated with single-window 6 s / seed 7 jobs:
+
+| caption | steps | RMS | dBFS |
+|---------|------:|-----:|-----:|
+| hand-written 350-character summary | 8 | 0.01096 | −39.2 |
+| same 350-character summary | 30 | 0.03609 | −28.9 |
+| checkpoint's 3492-character three-section caption | 30 | **0.13082** | **−17.7** |
+
+The step count is worth roughly 3×; the caption's detail is worth another ~3.6×
+and is the dominant factor. Only the full three-section Structured Caption
+(Global Metadata / Vocal Details / Arrangement, with an explicit lead vocal)
+reaches the reference sample's 0.137 RMS. Its spectrogram shows bright,
+ broadband harmonics and transient structure comparable to the reference; the
+350-character version is visibly thinner. This confirms the whole C pipeline
+— including `--backend metal`, the flow grid and the multi-window splice — is
+numerically faithful (§126) and that perceived quality is governed by the
+input caption, not synthesis.
+
+A concrete application-layer leak was found and fixed: the idea generator wrote
+the model-produced caption back into the prompt field via `slice(0, 1000)`,
+even though the field, the request payload and the server all allow 4000
+bytes. A 900–1800-character caption was therefore truncated mid-section,
+usually dropping the entire Arrangement block. It now slices to 4000.
+
+Consequence for the H5 flow: the text model must emit the full English
+three-section caption; a short English summary or any Chinese caption produces
+a quiet or instrumental result. This is a model input-domain limit, not a
+renderer defect, and is the remaining risk when the text model ignores the
+length/shape instruction.

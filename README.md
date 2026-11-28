@@ -19,10 +19,10 @@ The name is the picture: a wick is the narrow thread that lets a large body of
 wax burn. Here the wax is an 18–475 GiB weight bank on the SSD, and the wick is
 the few gigabytes per token that actually cross the bus.
 
-Eight checkpoints are supported end to end today — not by design a closed list,
+Ten checkpoints are supported end to end today — not by design a closed list,
 but each needs its own loader, quantizers, prompt renderer and kernels. Five are
-text models, one generates images, one generates video and one is a full-duplex
-speech model:
+text models, one generates images, one generates video, one generates music,
+one understands source audio and one is a full-duplex speech model:
 
 | model | on disk | shape | why it is here |
 |---|---|---|---|
@@ -33,9 +33,10 @@ speech model:
 | **Inkling-2-Mini** | ≈18.18 GiB, 1 shard | 24 stored layers, loop core run 3×, 128 experts top-8, NVFP4/MXFP8 + vision tower | complete text+image understanding with packed experts resident in 18.19 GiB |
 | **MiniMax-H3-Image** | ≈190 GiB, two trees | Qwen3-VL conditioner → 50-layer DiT → tiled ViT VAE | text-to-image and image editing behind the OpenAI image API |
 | **MiniMax-H3** | ≈72 GiB resident (Ref2VA subset) | 50-layer DiT (hidden 5376, 24 video latents) → tiled video VAE + audio VAE → mp4 | text- and reference-image-to-video behind the async `/v1/videos` job API |
+| **MiniMax-Music3** | ≈27.01 GiB wired | Qwen3 global LM → RVQ depth decoder → flow DiT → Flow-VAE → 32 kHz stereo | text-to-music and reference-latent cover behind async `/v1/generate` |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64-layer FP8 thinker → talker → flow + HiFT, 24 kHz | full-duplex speech over a WebSocket, hearing and speaking in the same turn |
 
-One model is resident at a time across **all eight**: the image, video and
+One model is resident at a time across **all nine**: the image, video, music and
 speech pipelines are hot-switched through the same `/v1/models/switch` as the
 text backends, and each release the previous pipeline before loading. The quality
 rule is not negotiable and is enforced at load time for the text models:
@@ -52,6 +53,7 @@ instead of quietly running a smaller model.
 - [Quick Start](#quick-start)
 - [Usage](#usage)
   - [Text + image with Inkling-2-Mini](#text--image-with-inkling-2-mini)
+  - [Music generation with MiniMax-Music3](#music-generation-with-minimax-music3)
 - [Configuration](#configuration)
 - [API](#api)
 - [Models, context and memory](#models-context-and-memory)
@@ -170,6 +172,7 @@ client (curl / coding agent / desktop chat app / web console / WebSocket)
         │              └── Inkling-2-Mini : ik.c  ik_engine.c  ik_prompt.c  ik_vision.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► text encode → DiT → tiled VAE
         ├── /v1/videos ──► h3v.c ──► text encode → Ref2VA DiT → tiled video VAE + audio VAE → mp4
+        ├── /v1/generate ──► music.c ──► global LM → RVQ depth → flow DiT → Flow-VAE → WAV
         ├── /v1/realtime (WebSocket) ──► ws.c + rt_realtime.c ──► VAD + session state
         │        └── rt_audio.c → rt_thinker.c → rt_talker.c → rt_flow.c → rt_hift.c
         ├── /v1/systemone ──► jev.c ──► one prefill, read the distribution
@@ -199,7 +202,7 @@ state on this machine
 - **The web console is compiled in** (`src/webui_embed.c`), so `--web` needs no
   assets on disk and no second process; the apps are files under `apps/`, served
   by the same server and stored in sqlite.
-- **One model resident at a time across all eight pipelines.** That is a bandwidth
+- **One model resident at a time across all ten pipelines.** That is a bandwidth
   decision, not a missing feature: two generations would halve each other's
   cache. Switching to the image, video or speech model releases the text engine
   first, and switching back releases it again.
@@ -393,6 +396,63 @@ buffers, and decode uses packed Metal. See
 [docs/PERF.md](docs/PERF.md) for full-chain measurements and
 [docs/DECISIONS.md](docs/DECISIONS.md) §118 for the numerical-policy rationale.
 
+### Music generation with MiniMax-Music3
+
+Register the converted Music3 checkpoint with `--music` (or
+`CWICK_MUSIC_MODEL`). It uses the same single resident slot as text, image,
+video and realtime: the first valid `/v1/generate` request releases the old
+pipeline, maps and wires the 27.01 GiB music model, then runs the job on a
+worker thread.
+
+```sh
+./cwick serve --root ./models/thinkingmachines/Inkling-2-Mini \
+  --backend metal --context 32768 --port 8001 --web \
+  --music ./models/MiniMaxAI/MiniMax-Music3
+```
+
+`POST /v1/generate` accepts the local Music3 fields `prompt` (music
+description), `lyrics`, `duration`/`seconds`, `steps`, `seed`, `cfg_scale`,
+`temperature` and `top_k`. It also accepts the useful Suno-style fields
+`style`, `title`, `customMode`, `instrumental` and `audioWeight`. In
+`customMode:true`, `style` becomes the music description and `lyrics` (or
+`prompt`) becomes the sung text; `instrumental:true` forces an instrumental
+directive. `style` is capped at 4000 bytes and should be an English Structured
+Caption with Global Metadata / Vocal Details / Arrangement sections: the Vocal
+Details section is what asks for a lead singer. A bare tag list such as
+`warm acoustic pop, 96 BPM` is accepted but gives the model no vocal contract
+and usually returns instrumental audio. The response is HTTP 200 with both a
+Suno-style envelope and the local job object:
+
+```sh
+curl http://127.0.0.1:8001/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MiniMax-Music3","customMode":true,"instrumental":false,
+       "style":"warm acoustic pop, 96 BPM","title":"Morning Light",
+       "lyrics":"[Verse]\nMorning light\n[Chorus]\nSoftly we breathe",
+       "duration":20,"steps":30,"seed":7}'
+```
+
+```json
+{"code":200,"msg":"success","data":{"taskId":"music_12_1","id":"music_12_1","status":"queued"}}
+```
+
+Poll `GET /v1/generate/{id}` (or the Suno-style alias
+`GET /v1/generate/record-generation?id=...`) and download the finished file from
+`GET /v1/generate/{id}/content`. The result is a 32 kHz, 16-bit stereo WAV.
+Details include `stage_history`, `timing`, output bytes/duration and
+`content_url`. stdout logs every phase: load, tokenize, reference encode,
+global LM, depth, condition, flow, vocoder and WAV.
+
+Cover mode uses `task:"cover"` with `audio`/`reference_audio` containing a
+base64 or data-URL WAV, or the `POST /v1/generate/upload-cover` alias. A
+completed local output can be reused with `taskId` + `audioId` (both are the
+local job id). Music3 is a generation model rather than a source-separation
+model, so cwick's cover path encodes the reference with the Flow-VAE encoder,
+generates a new latent, and blends the reference latent back with
+`audioWeight` (default `0.85`, `1.0` is closest to reconstruction). Remote HTTP
+`uploadUrl` values, callbacks and the other Suno-only controls are rejected
+rather than silently ignored.
+
 ### Logs and metrics
 
 The server prints every diagnostic to **stdout**, one line per event, each with a
@@ -431,6 +491,18 @@ text-only jobs. Completed jobs also return the same split in their `cwick`
 object under `GET /v1/videos/{id}`, with `encode_ms` for first-frame conditioning.
 The DiT and visual VAE also run on `--backend metal` (BF16 and F32 tensor-core
 GEMMs plus tiled attention); `CWICK_H3V_GPU=0` forces the CPU path for A/B.
+Music jobs add `cwick:music_jobs_accepted_total`, task/outcome counters,
+`cwick:music_stage_seconds_total{stage=...}` (load, tokenize, reference_encode,
+global_lm, depth, condition, flow, vocoder, wav, total), live phase/flow-step
+gauges and output seconds/sample/byte counters. `cwick:music_jobs_ended_early_total`, `cwick:music_ar_retries_total`,
+`cwick:music_jobs_short_total`, `cwick:music_last_duration_ratio`, the last/requested
+frame and attempt gauges, and `cwick:music_dense_lyrics_total` expose duration and
+vocal-density regressions. The global LM honors natural audio-end tokens, retries
+short attempts up to three times, and rejects output below 25% of the requested
+frames instead of forcing continuation. It projects only the contiguous 16,389-row
+audio-head slice; `CWICK_MUSIC_FULL_HEAD=1` restores the full 200,000-row projection
+for A/B checks. Each global-LM layer submits Q/K/V in one Metal command buffer;
+`CWICK_MUSIC_LM_QKV_LEGACY=1` restores separate submissions.
 
 ### Web console, model library and the app market
 
@@ -537,14 +609,15 @@ serve also have an environment twin:
 | `--models-dir DIR` | — | extra checkpoints to list (up to 8); switching loads one at a time |
 | `--img DIR` | `CWICK_IMAGE_MODEL` | image checkpoint directory; exposes `POST /v1/images/generations` and `/v1/images/edits` and allows an on-demand switch to `MiniMax-H3-Image` |
 | `--videos DIR` | `CWICK_VIDEO_MODEL` | video checkpoint directory; exposes `POST /v1/videos`, `GET /v1/videos/{id}` and `/content`, and allows an on-demand switch to `MiniMax-H3` |
+| `--music DIR` | `CWICK_MUSIC_MODEL` | MiniMax-Music3 checkpoint directory; exposes async `POST /v1/generate`, polling, WAV download and an on-demand music-model switch |
 | `--rt DIR` | `CWICK_REALTIME_MODEL` | speech checkpoint directory; exposes the `/v1/realtime` WebSocket and allows a switch to `Sophon-Realtime-32B-Tag` |
 | `--store DIR` | `~/.cwick/apps` | one sqlite file per app plus `auth.db` |
 
 Environment twins: `CWICK_MEM_PCT`, `CWICK_MEM_MAX_GIB`, `CWICK_STORE`,
 `CWICK_PASSWORD`, `CWICK_API_KEY`, `CWICK_WARMUP`, `CWICK_WEB`, `CWICK_METAL`,
-`CWICK_IMAGE_MODEL`, `CWICK_VIDEO_MODEL`, `CWICK_REALTIME_MODEL`, `CWICK_SEED`
+``CWICK_IMAGE_MODEL`, `CWICK_VIDEO_MODEL`, `CWICK_MUSIC_MODEL`, `CWICK_REALTIME_MODEL`, `CWICK_SEED`
 (sampling seed, so a run is repeatable), `CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`
-(model catalog host for the **模型** tab). `--img` / `--videos` / `--rt` win when
+(model catalog host for the **模型** tab). `--img` / `--videos` / `--music` / `--rt` win when
 they and the environment variable are both set. Video-specific overrides are
 `CWICK_H3V_GPU=0` (CPU fallback), `CWICK_H3V_WIRE=0/1` (wiring the DiT/VAE) and
 `CWICK_H3V_REF_EDGE=N` (encode the reference image at its own short edge);
@@ -555,11 +628,16 @@ to `./models`; it is in `.gitignore`.
 
 | method | path | notes |
 |---|---|---|
-| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` / `--img` / `--videos` / `--rt`; each entry carries `supported` / `unsupported_reason`, and the image/video pipelines are marked `cwick.kind:"image"` / `"video"` |
+| GET | `/v1/models` | the resident checkpoint plus anything found under `--models-dir` / `--img` / `--videos` / `--music` / `--rt`; each entry carries `supported` / `unsupported_reason`, and non-text pipelines carry `cwick.kind` |
 | GET | `/v1/realtime` | WebSocket full-duplex speech (`?model=…`); requires `--rt`, base64 PCM16 in and `response.audio.delta` out |
 | POST | `/v1/models/switch` | validate the target first, then unload one and map another; 400 for an architecture this build cannot load (resident model untouched), 409 while generating or queued. `MiniMax-H3-Image` and `MiniMax-H3` hot-load the image/video pipeline without touching the text model |
 | POST | `/v1/images/generations` | `b64_json` image from a JSON prompt; requires `--img` / `CWICK_IMAGE_MODEL` or an on-demand image switch |
 | POST | `/v1/images/edits` | `multipart/form-data` with repeatable `image` parts; same image response shape |
+| POST | `/v1/generate` | accept a MiniMax-Music3 text-to-music or `task:"cover"` job; Suno-style `code/msg/data.taskId` envelope plus local job fields |
+| GET | `/v1/generate/{id}` | job status, stage history, full-chain timing and output metadata |
+| GET | `/v1/generate/{id}/content` | complete 32 kHz, 16-bit stereo WAV |
+| POST | `/v1/generate/upload-cover` | cover alias accepting local base64/data-URL WAV in `uploadUrl`, or a completed local `taskId` + `audioId` |
+| GET | `/v1/generate/record-generation?id=…` | Suno-style polling alias for a local job |
 | POST | `/v1/videos` | async video job; JSON `prompt`, `size` (`WxH`, 256..2560, multiple of 32), `seconds`, optional `steps` (1–30, 0 = 30) and `image` (base64/data URL reference); only `variant:"Ref2VA"` exists; requires `--videos` / `CWICK_VIDEO_MODEL` |
 | GET | `/v1/videos/{id}` | poll a job: `status`, `progress`, `phase`, `steps_done`/`steps_total`; when done, a `cwick` object with per-phase timings, `spatial_corr`, `snr_db`, `suspect_noise` |
 | GET | `/v1/videos/{id}/content` | stream the finished mp4 |
@@ -875,7 +953,7 @@ decode is the default 21 GiB cache from the work in
 | Inkling-2-Mini | text decision, 3 questions / 550 tokens | 20.92 s | **26.3** | no decode |
 | Inkling-2-Mini | image decision, 1 question / 233 tokens | 32.81 s | **7.1** | `corn` p=0.999928, no decode |
 
-The three non-text pipelines have their own units — one rendered image, one
+The four non-text pipelines have their own units — one rendered image, one
 mp4 or one spoken reply, not a token rate. All measured on the same M3 Max:
 
 | pipeline | phase | wall | note |
@@ -886,11 +964,18 @@ mp4 or one spoken reply, not a token rate. All measured on the same M3 Max:
 | MiniMax-H3 | video, 256², 30 steps, metal | ≈2126 s | text 84 + DiT 60–67 s/step ×30 + VAE 64; 102 frames / 4.25 s |
 | MiniMax-H3 | video, 256², 4 steps, metal | 597 s | DiT 441 s; `steps:2..4` is the quick verification clip |
 | MiniMax-H3 | video, 544×960, 30 steps, metal | ≈11678 s | DiT 363–409 s/step — rows grow roughly with canvas² |
+| MiniMax-Music3 | generate, 1 s, 2 steps, metal | 28.60 s | load 4.45 + global LM 12.72 + depth 6.51 + flow 2.33 + vocoder 2.57 |
+| MiniMax-Music3 | generate, 1 s, 2 steps, compact head + grouped QKV | **25.63 s** | load 4.18 + global LM 9.90 + depth 6.62 + flow 2.39 + vocoder 2.50; same-seed WAV byte-identical to the full-head/legacy-QKV A/B |
+| MiniMax-Music3 | `POST /v1/generate`, cold after text→music switch | 54.60 s | same 1 s / 2-step smoke job over HTTP; global LM 30.71 + depth 16.81 |
+| MiniMax-Music3 | cover, 1 s, 2 steps, metal | 29.73 s | adds 1.91 s reference encode; source correlation 0.9858, no clipping |
+| MiniMax-Music3 | reference encoder, 6 s WAV | 11.74 s | 517 latent frames at 44.1 kHz |
 | Sophon-Realtime-32B-Tag | ear, 8.73 s audio | 0.17 s | ≈52× realtime, 55 audio embeddings |
 | Sophon-Realtime-32B-Tag | turn 1, cold | 18.54 s | prefill 8.16 + decode 9.40, first audio 12.96 s, 4.08 s speech |
 | Sophon-Realtime-32B-Tag | turn 2, warm | **13.22 s** | prefill 2.83 s (static prompt reused), first audio 7.67 s |
 
-The speech figures are wall time for one 8.73 s utterance; decode overlaps
+The Music3 figures are 1-second, 2-step smoke benchmarks for end-to-end
+accounting, not quality settings; production requests default to 20 seconds and
+30 flow steps. The speech figures are wall time for one 8.73 s utterance; decode overlaps
 talker synthesis, so subtracting `talker_s` leaves ~4 tok/s of pure decoding,
 and prefill runs at ~22 tok/s. Full per-phase tables are in
 [docs/REALTIME.md](docs/REALTIME.md), [docs/IMAGE.md](docs/IMAGE.md) and
@@ -949,6 +1034,7 @@ make bench       # kernel timings without loading a checkpoint
 make h3vgpuprobe # Metal GEMM/attention numerical probe, no checkpoint required
 make h3vprobe    # video pipeline prober (built separately, not part of make test)
 make h3vmuxprobe # mp4 container checks: avcC, ctts, stss
+make musicprobe  # Music3 checkpoint/open/generate/encoder/vocoder probe
 ```
 
 Correctness is anchored, not eyeballed: a fixed prompt must produce a fixed
@@ -959,6 +1045,12 @@ every resident byte plus a strided sample of the expert bank, so a corrupt shard
 is found before a request is, and `/v1/metrics` publishes the same state the logs
 print. Inkling's fixed arithmetic prompt returns `4`, all three image dialects
 return `Corn`, and image System One returns `corn` with probability 0.999928.
+Music3's condition encoder, DiT and vocoder are cross-checked against independent
+PyTorch/MPS references; the corrected Flow-VAE encoder matches to
+`5.51e-5` maximum absolute error and `0.9999999999945` correlation. Its
+encoder→decoder round trip reaches `0.9998` waveform correlation, and the
+reference-latent cover smoke test reaches `0.9858` correlation with the source
+while remaining unclipped.
 
 ## Detailed Guides
 
@@ -1017,6 +1109,7 @@ cwick/
 │   ├── ik_*.c         Inkling-2-Mini backend: loop MoE, packed experts, vision tower
 │   ├── h3*.c/.m       MiniMax-H3-Image: conditioner, DiT, tiled VAE
 │   ├── h3v*.c/.m      MiniMax-H3 video: Ref2VA DiT, temporal/tiled VAE, mp4
+│   ├── music.c        MiniMax-Music3: global/depth LM, flow DiT, Flow-VAE
 │   ├── rt_*.c         speech: .pt reader, audio tower, thinker, talker, flow, HiFT, VAD
 │   ├── ws.c           WebSocket transport for /v1/realtime
 │   ├── metal*.c/.m    Metal kernels and the zero-copy arena

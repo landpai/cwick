@@ -19,6 +19,7 @@
  * still emits B frames, so stts alone is not enough: ctts carries each sample's
  * composition offset and keeps display order correct in strict players. AAC-LC,
  * 128 kbit/s, stereo. The output is meant to be watched, not re-encoded.
+ * A fixed 5x5 unsharp mask restores detail softened by the Flow-VAE decoder.
  *
  * Comments describe mechanism and measured numbers only.
  */
@@ -291,6 +292,44 @@ static bool build_avcc(CMFormatDescriptionRef fd, unsigned char **out,
     return true;
 }
 
+static void sharpen_rgb24(const unsigned char *src, unsigned char *dst,
+                          unsigned char *horizontal, int width, int height) {
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            for (int c = 0; c < 3; c++) {
+                unsigned sum = 0;
+                for (int k = -2; k <= 2; k++) {
+                    int sx = x + k;
+                    if (sx < 0) sx = 0;
+                    if (sx >= width) sx = width - 1;
+                    static const int weights[5] = {1, 4, 6, 4, 1};
+                    sum += (unsigned)src[((size_t)y * width + sx) * 3 + c] * weights[k + 2];
+                }
+                horizontal[((size_t)y * width + x) * 3 + c] = (unsigned char)(sum >> 4);
+            }
+        }
+    }
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            for (int c = 0; c < 3; c++) {
+                unsigned sum = 0;
+                for (int k = -2; k <= 2; k++) {
+                    int sy = y + k;
+                    if (sy < 0) sy = 0;
+                    if (sy >= height) sy = height - 1;
+                    static const int weights[5] = {1, 4, 6, 4, 1};
+                    sum += (unsigned)horizontal[((size_t)sy * width + x) * 3 + c] * weights[k + 2];
+                }
+                size_t at = ((size_t)y * width + x) * 3 + c;
+                int blurred = (int)(sum >> 4);
+                int amount = c == 0 ? 256 : 128;
+                int value = (int)src[at] + (((int)src[at] - blurred) * amount) / 256;
+                dst[at] = (unsigned char)(value < 0 ? 0 : value > 255 ? 255 : value);
+            }
+        }
+    }
+}
+
 static bool encode_video(const unsigned char *rgb, int64_t frames, int width,
                          int height, mbtrack *t, unsigned char **avcc,
                          size_t *avcc_len, cwick_error *err) {
@@ -347,6 +386,17 @@ static bool encode_video(const unsigned char *rgb, int64_t frames, int width,
     CFRelease(n_fps);
     VTCompressionSessionPrepareToEncodeFrames(session);
 
+    size_t frame_bytes = (size_t)width * (size_t)height * 3;
+    unsigned char *horizontal = (unsigned char *)malloc(frame_bytes);
+    unsigned char *sharpened = (unsigned char *)malloc(frame_bytes);
+    if (!horizontal || !sharpened) {
+        free(horizontal); free(sharpened);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        cwick_error_set(err, CWICK_ERR_MEMORY, "cannot allocate video sharpening buffers");
+        return false;
+    }
+
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
@@ -368,7 +418,9 @@ static bool encode_video(const unsigned char *rgb, int64_t frames, int width,
         {
             unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(pb);
             const size_t stride = CVPixelBufferGetBytesPerRow(pb);
-            const unsigned char *src = rgb + (size_t)i * width * height * 3;
+            const unsigned char *frame_rgb = rgb + (size_t)i * width * height * 3;
+            sharpen_rgb24(frame_rgb, sharpened, horizontal, width, height);
+            const unsigned char *src = sharpened;
             for (int y = 0; y < height; y++) {
                 unsigned char *d = base + (size_t)y * stride;
                 const unsigned char *s = src + (size_t)y * width * 3;
@@ -391,6 +443,8 @@ static bool encode_video(const unsigned char *rgb, int64_t frames, int width,
             ok = false;
         }
     }
+    free(horizontal);
+    free(sharpened);
     if (ok && VTCompressionSessionCompleteFrames(session, kCMTimeInvalid) != noErr) {
         cwick_error_set(err, CWICK_ERR_STATE, "the H.264 encoder did not drain");
         ok = false;

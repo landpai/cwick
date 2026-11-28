@@ -109,6 +109,27 @@ static float *h3v_vec(const h3v_mat *m) {
     return v;
 }
 
+static void h3v_gemm_cpu(float *out, const float *x, int64_t xstride,
+                        const h3v_mat *w, int64_t n) {
+    const int64_t rows = w->rows, cols = w->cols;
+    if (w->f32) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)n, (int)rows,
+                    (int)cols, 1.0f, x, (int)xstride, (const float *)w->p,
+                    (int)cols, 0.0f, out, (int)rows);
+        return;
+    }
+    float *tile = h3v_f32(VD_DEQ_TILE * cols);
+    for (int64_t r0 = 0; r0 < rows; r0 += VD_DEQ_TILE) {
+        int64_t rn = rows - r0 < VD_DEQ_TILE ? rows - r0 : VD_DEQ_TILE;
+        const uint16_t *src = (const uint16_t *)w->p + r0 * cols;
+        for (int64_t i = 0; i < rn * cols; i++) tile[i] = cwick_bf16_fast(src[i]);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)n, (int)rn,
+                    (int)cols, 1.0f, x, (int)xstride, tile, (int)cols, 0.0f,
+                    out + r0, (int)rows);
+    }
+    free(tile);
+}
+
 /* out[n][rows] = x[n][cols] @ W^T. Weights are BF16 for the transformer, so
  * they are dequantised a tile at a time: the full 21504x5376 qkv block would
  * be 231 MiB of float32 for a GEMM that reads each row once.
@@ -130,22 +151,7 @@ static void h3v_gemm_s(float *out, const float *x, int64_t xstride,
                                 (int)xstride, (int)rows);
         if (ok) return;
     }
-    if (w->f32) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)n, (int)rows,
-                    (int)cols, 1.0f, x, (int)xstride, (const float *)w->p,
-                    (int)cols, 0.0f, out, (int)rows);
-        return;
-    }
-    float *tile = h3v_f32(VD_DEQ_TILE * cols);
-    for (int64_t r0 = 0; r0 < rows; r0 += VD_DEQ_TILE) {
-        int64_t rn = rows - r0 < VD_DEQ_TILE ? rows - r0 : VD_DEQ_TILE;
-        const uint16_t *src = (const uint16_t *)w->p + r0 * cols;
-        for (int64_t i = 0; i < rn * cols; i++) tile[i] = cwick_bf16_fast(src[i]);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)n, (int)rn,
-                    (int)cols, 1.0f, x, (int)xstride, tile, (int)cols, 0.0f,
-                    out + r0, (int)rows);
-    }
-    free(tile);
+    h3v_gemm_cpu(out, x, xstride, w, n);
 }
 
 static void h3v_gemm(float *out, const float *x, const h3v_mat *w, int64_t n) {
@@ -184,6 +190,21 @@ static int h3v_legacy_layout(void) {
     return v;
 }
 
+static int h3v_gpu_scalar(void) {
+    const char *e = getenv("CWICK_H3V_GPU_SCALAR");
+    return !(e && *e && strcmp(e, "0") == 0);
+}
+
+static int h3v_gpu_qk(void) {
+    const char *e = getenv("CWICK_H3V_GPU_QK");
+    return h3v_gpu_scalar() && !(e && *e && strcmp(e, "0") == 0);
+}
+
+static int h3v_gpu_swiglu_on(void) {
+    const char *e = getenv("CWICK_H3V_GPU_SWIGLU");
+    return h3v_gpu_scalar() && e && *e && strcmp(e, "1") == 0;
+}
+
 /* The fused projection stores each head as [q | k | v] back to back, while
  * attention needs q, k and v in three contiguous planes. Scatter once per
  * projection instead of rewriting the 231 MiB weight tile per layer. */
@@ -208,9 +229,16 @@ static void h3v_split_qkv(float *q, float *k, float *v, const float *src,
 static void h3v_gemm_qkv(float *q, float *k, float *v, const float *x,
                          const h3v_mat *w, int64_t n, int64_t heads, int64_t hd) {
     const int64_t cols = heads * hd;
-    if (!w->f32 && n >= 32 &&
+    const int use_qkv3 = !(getenv("CWICK_H3V_QKV3") &&
+                           strcmp(getenv("CWICK_H3V_QKV3"), "0") == 0);
+    if (!w->f32 && n >= 32 && use_qkv3 &&
         (int64_t)n * (int64_t)w->cols * w->rows >= (int64_t)8 * 1024 * 1024 &&
         h3v_gpu_on()) {
+        if (h3v_gpu_gemm_qkv3(x, w->p, q, k, v, (int)n, (int)w->cols,
+                              (int)cols, (int)w->rows, (int)w->cols,
+                              (int)cols, (int)hd)) return;
+    }
+    if (!w->f32 && n >= 32 && h3v_gpu_on()) {
         int ok = 1;
         float *planes[3] = {q, k, v};
         for (int p = 0; p < 3; p++) {
@@ -952,14 +980,77 @@ static void h3v_temb(h3v_model *m, float t, float *out, cwick_error *err) {
     free(hid);
 }
 
+static bool h3v_adaln_precompute(h3v_model *m, const float *ts, const float *ats,
+                                int steps, bool has_audio, bool has_condition,
+                                float **out_mod, float **out_final,
+                                cwick_error *err) {
+    const int nts = 1 + (has_audio ? 1 : 0) + (has_condition ? 1 : 0);
+    const int64_t rows = (int64_t)steps * nts;
+    float *tin = h3v_f32(rows * VD_TIME_DIM);
+    float *mod = h3v_f32((int64_t)VD_LAYERS * rows * VD_ADALN_ROWS);
+    float *fmod = h3v_f32(rows * VD_FINAL_ADALN);
+    if (!tin || !mod || !fmod) goto fail;
+    for (int s = 0; s < steps; s++) {
+        float tv[3] = {ts[s], has_audio ? ats[s] : 0.0f,
+                       has_condition ? 0.999f : 0.0f};
+        for (int ti = 0; ti < nts; ti++) {
+            float *temb = h3v_f32(VD_TIME_DIM);
+            float *dst = tin + ((int64_t)s * nts + ti) * VD_TIME_DIM;
+            if (!temb) goto fail;
+            h3v_temb(m, tv[ti], temb, err);
+            if (err->message[0]) { free(temb); goto fail; }
+            memcpy(dst, temb, (size_t)VD_TIME_DIM * sizeof(float));
+            h3v_silu_inplace(dst, VD_TIME_DIM);
+            free(temb);
+        }
+    }
+    for (int64_t L = 0; L < VD_LAYERS; L++) {
+        char name[192];
+        h3v_mat adw, adb;
+        snprintf(name, sizeof(name), "blocks.%lld.adaln_proj.linear.weight",
+                 (long long)L);
+        if (!h3v_mat_get(&m->dit, name, &adw, err)) goto fail;
+        snprintf(name, sizeof(name), "blocks.%lld.adaln_proj.linear.bias",
+                 (long long)L);
+        if (!h3v_mat_get(&m->dit, name, &adb, err)) goto fail;
+        float *am = h3v_f32(rows * VD_ADALN_ROWS);
+        float *bias = h3v_vec(&adb);
+        if (!am || !bias) { free(am); free(bias); goto fail; }
+        h3v_gemm_cpu(am, tin, VD_TIME_DIM, &adw, rows);
+        h3v_add_bias(am, bias, VD_ADALN_ROWS, rows);
+        memcpy(mod + L * rows * VD_ADALN_ROWS, am,
+               (size_t)rows * VD_ADALN_ROWS * sizeof(float));
+        free(am); free(bias);
+    }
+    {
+        h3v_mat adw, adb;
+        if (!h3v_mat_get(&m->dit, "final_layer.adaln_proj.linear.weight",
+                         &adw, err) ||
+            !h3v_mat_get(&m->dit, "final_layer.adaln_proj.linear.bias",
+                         &adb, err)) goto fail;
+        float *bias = h3v_vec(&adb);
+        if (!bias) goto fail;
+        h3v_gemm_cpu(fmod, tin, VD_TIME_DIM, &adw, rows);
+        h3v_add_bias(fmod, bias, VD_FINAL_ADALN, rows);
+        free(bias);
+    }
+    free(tin);
+    *out_mod = mod;
+    *out_final = fmod;
+    return true;
+fail:
+    free(tin); free(mod); free(fmod);
+    return false;
+}
+
 static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
                          const float *ttags,
                          const float *vrows, int64_t nvideo,
                          const float *crows, int64_t nref,
                          const float *arows, int64_t naudio,
-                         int64_t lt, int64_t lh, int64_t lw,
-                         int64_t rlh, int64_t rlw,
-                         float timestep, int64_t step, int steps,
+                         const float *mod_all, const float *final_mod_all,
+                         const float *cos, const float *sin,
+                         int64_t step, int steps,
                          h3v_progress_fn cb, void *cbctx,
                          float *vout, float *aout, cwick_error *err) {
     const int64_t D = VD_HIDDEN, H = VD_HEADS, HD = VD_HEAD_DIM;
@@ -979,15 +1070,16 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
         }
     }
     const int64_t QKV = VD_QKV, F = VD_FFN;
-    const int nts = (crows && nref > 0) ? 2 : 1;   /* distinct noise levels */
-    const int64_t nref_use = nts > 1 ? nref : 0;
+    const bool has_condition = crows && nref > 0;
+    const int nts = 1 + (naudio > 0) + (has_condition ? 1 : 0);
+    const int condition_ti = naudio > 0 ? 2 : 1;
+    const int64_t nref_use = has_condition ? nref : 0;
     const int64_t seq = ntext + nref_use + naudio + nvideo;
     const int64_t t_video0 = ntext + nref_use + naudio;
-    /* Row -> (timestep slot, modality). Only the conditioning keyframe rows
-     * sit at the near-clean anchor level; every generated row uses ts[s].
-     * Both the condition rows and the target rows are video (tag 0); audio
-     * occupies [ntext+nref, t_video0). */
-#define H3V_TI(r) ((nts > 1 && (r) >= ntext && (r) < ntext + nref_use) ? 1 : 0)
+    /* Text and generated video use the video schedule, generated audio uses
+     * the audio schedule, and conditioning rows stay at their anchor. */
+#define H3V_TI(r) ((has_condition && (r) >= ntext && (r) < ntext + nref_use) ? condition_ti : \
+                  ((r) >= ntext + nref_use && (r) < t_video0 ? 1 : 0))
 /* Vision rows inside the text stream are tagged video by the presentation,
  * so they take the video AdaLN slot even though they sit before the generated
  * rows. A text-only presentation has every tag at 1 and keeps the old map. */
@@ -1004,11 +1096,6 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
     float *prod = h3v_f32(seq * QKV);
     /* fc1 is 2x wide: [gate | value] per row. */
     float *gate = h3v_f32(seq * 2 * F);
-    float *cos = h3v_f32(seq * VD_ROPE_DIM), *sin = h3v_f32(seq * VD_ROPE_DIM);
-    float *temb = h3v_f32(VD_TIME_DIM);
-    float *tact = NULL;
-    float *temb2 = NULL, *tact2 = NULL;
-    float *mod = NULL;
     bool ok = false;
 
     h3v_mat cp, cp_b, vp, vp_b, ap, ap_b;
@@ -1030,8 +1117,6 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
                        (long long)ntext, VD_TEXT_DIM, dc);
         }
     }
-    h3v_rope_tables(ntext, nvideo, naudio, nref_use, lt, lh, lw,
-                    rlh > 0 ? rlh : lh, rlw > 0 ? rlw : lw, cos, sin);
     h3v_gemm(x, cond, &cp, ntext);
     if (cp_b.p) {
         float *b = h3v_vec(&cp_b);
@@ -1086,33 +1171,13 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
                    (long long)ntext, (long long)naudio, (long long)nvideo);
     }
 
-    /* Timestep embedding: 256-wide sinusoid -> linear_1 -> silu -> linear_2.
-     * The sinusoid consumes the sampler's sigma directly, unscaled, with cos
-     * in the first half and sin in the second (flip_sin_to_cos). */
-    h3v_temb(m, timestep, temb, err);
-    /* Every adaLN projection consumes `silu(temb)`, not `temb`: each of the
-     * 51 modulation heads applies its own silu before its linear. */
-    tact = h3v_f32(VD_TIME_DIM);
-    memcpy(tact, temb, (size_t)VD_TIME_DIM * sizeof(float));
-    h3v_silu_inplace(tact, VD_TIME_DIM);
-    if (nts > 1) {
-        temb2 = h3v_f32(VD_TIME_DIM);
-        tact2 = h3v_f32(VD_TIME_DIM);
-        h3v_temb(m, 0.999f, temb2, err);
-        memcpy(tact2, temb2, (size_t)VD_TIME_DIM * sizeof(float));
-        h3v_silu_inplace(tact2, VD_TIME_DIM);
-    }
-
-    mod = h3v_f32((size_t)nts * 3 * 6 * D);
     const int block_stats = getenv("CWICK_H3V_BLOCKSTATS") != NULL;
 
     char name[192];
     for (int64_t L = 0; L < VD_LAYERS; L++) {
-        h3v_mat adw, adb, n1, n2, qw, ow, qn, kn, f1, f2;
-        snprintf(name, sizeof(name), "blocks.%lld.adaln_proj.linear.weight", (long long)L);
-        if (!h3v_mat_get(&m->dit, name, &adw, err)) goto done;
-        snprintf(name, sizeof(name), "blocks.%lld.adaln_proj.linear.bias", (long long)L);
-        if (!h3v_mat_get(&m->dit, name, &adb, err)) goto done;
+        const float *mod = mod_all +
+            ((L * steps + step) * nts) * VD_ADALN_ROWS;
+        h3v_mat n1, n2, qw, ow, qn, kn, f1, f2;
         snprintf(name, sizeof(name), "blocks.%lld.norm1.weight", (long long)L);
         if (!h3v_mat_get(&m->dit, name, &n1, err)) goto done;
         snprintf(name, sizeof(name), "blocks.%lld.norm2.weight", (long long)L);
@@ -1130,20 +1195,6 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
         snprintf(name, sizeof(name), "blocks.%lld.mlp.fc2.weight", (long long)L);
         if (!h3v_mat_get(&m->dit, name, &f2, err)) goto done;
 
-        /* The checkpoint stores rows grouped by vector, then modality, for
-         * each distinct timestep. Compute one 18-row block per noise level. */
-        {
-            float *adb_v = h3v_vec(&adb);
-            for (int ti = 0; ti < nts; ti++) {
-                float *am = h3v_f32(VD_ADALN_ROWS);
-                h3v_gemm(am, ti ? tact2 : tact, &adw, 1);
-                for (int64_t i = 0; i < VD_ADALN_ROWS; i++) am[i] += adb_v[i];
-                memcpy(mod + (size_t)ti * VD_ADALN_ROWS, am,
-                       (size_t)VD_ADALN_ROWS * sizeof(float));
-                free(am);
-            }
-            free(adb_v);
-        }
         float *w1 = h3v_vec(&n1), *w2 = h3v_vec(&n2);
         float *wq = h3v_vec(&qn), *wk = h3v_vec(&kn);
 
@@ -1166,8 +1217,12 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
         } else {
             h3v_gemm_qkv(attn, kbuf, vbuf, tmp, &qw, seq, H, HD);
         }
-        h3v_qk_prep(attn, seq, wq, cos, sin, 1);
-        h3v_qk_prep(kbuf, seq, wk, cos, sin, 1);
+        if (!h3v_gpu_on() || !h3v_gpu_qk() ||
+            !h3v_gpu_qk_prep(attn, kbuf, wq, wk, cos, sin, (int)seq,
+                             (int)QKV, (int)H, (int)HD, 1, h3v_rope_mode())) {
+            h3v_qk_prep(attn, seq, wq, cos, sin, 1);
+            h3v_qk_prep(kbuf, seq, wk, cos, sin, 1);
+        }
         h3v_attention(prod, attn, kbuf, vbuf, seq, H, HD, QKV);
         {
             /* out_proj and the attention gate */
@@ -1241,8 +1296,11 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
          * result in the first half of each row, so fc2 reads with stride 2*F. */
         h3v_gemm(gate, tmp, &f1, seq);
         {
-            for (int64_t r = 0; r < seq; r++)
-                h3v_swiglu(gate + r * 2 * F, F, F);
+            if (!h3v_gpu_on() || !h3v_gpu_swiglu_on() ||
+                !h3v_gpu_swiglu(gate, seq * F, F, h3v_legacy_layout())) {
+                for (int64_t r = 0; r < seq; r++)
+                    h3v_swiglu(gate + r * 2 * F, F, F);
+            }
             float *mo = h3v_f32(seq * D);
             h3v_gemm_s(mo, gate, 2 * F, &f2, seq);
             {
@@ -1284,27 +1342,15 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
 
     /* final_layer: norm -> modulate -> split into video and audio velocity. */
     {
-        h3v_mat fn, fadw, fadb, vw, vwb, aw, awb;
+        h3v_mat fn, vw, vwb, aw, awb;
         if (!h3v_mat_get(&m->dit, "final_layer.norm.weight", &fn, err)) goto done;
-        if (!h3v_mat_get(&m->dit, "final_layer.adaln_proj.linear.weight", &fadw, err)) goto done;
-        if (!h3v_mat_get(&m->dit, "final_layer.adaln_proj.linear.bias", &fadb, err)) goto done;
         if (!h3v_mat_get(&m->dit, "final_layer.video_out.weight", &vw, err)) goto done;
         if (!h3v_mat_get(&m->dit, "final_layer.video_out.bias", &vwb, err)) goto done;
         if (!h3v_mat_get(&m->dit, "final_layer.audio_out.weight", &aw, err)) goto done;
         if (!h3v_mat_get(&m->dit, "final_layer.audio_out.bias", &awb, err)) goto done;
 
         float *fw = h3v_vec(&fn);
-        float *fmod = h3v_f32((size_t)nts * VD_FINAL_ADALN);
-        {
-            float *b = h3v_vec(&fadb);
-            for (int ti = 0; ti < nts; ti++) {
-                h3v_gemm(fmod + (size_t)ti * VD_FINAL_ADALN,
-                         ti ? tact2 : tact, &fadw, 1);
-                for (int64_t i = 0; i < VD_FINAL_ADALN; i++)
-                    fmod[(size_t)ti * VD_FINAL_ADALN + i] += b[i];
-            }
-            free(b);
-        }
+        const float *fmod = final_mod_all + (size_t)step * nts * VD_FINAL_ADALN;
         float *fv = h3v_f32(seq * D);
         /* Final norm_out has one shift/scale pair per timestep, indexed per
          * row (not per modality). */
@@ -1366,14 +1412,13 @@ static bool h3v_dit_step(h3v_model *m, const float *cond, int64_t ntext,
                (size_t)nvideo * VD_PATCH_DIM * sizeof(float));
         memcpy(aout, ao + (ntext + nref_use) * VD_AUDIO,
                (size_t)naudio * VD_AUDIO * sizeof(float));
-        free(fw); free(fmod); free(fv); free(vo); free(ao);
+        free(fw); free(fv); free(vo); free(ao);
     }
     ok = true;
 
 done:
     free(x); free(tmp); free(qkv); free(attn); free(kbuf); free(vbuf);
     free(prod); free(gate);
-    free(cos); free(sin); free(temb); free(temb2); free(tact); free(tact2); free(mod);
     return ok;
 }
 
@@ -1707,6 +1752,8 @@ static bool h3v_gen_impl(h3v_model *m, const char *prompt, const char *variant,
     pthread_mutex_lock(&m->lock);
     float *cond = NULL, *vlat = NULL, *vrows = NULL, *arows = NULL;
     float *vvel = NULL, *avel = NULL;
+    float *mod_all = NULL, *final_mod_all = NULL;
+    float *rope_cos = NULL, *rope_sin = NULL;
     float *crows = NULL;
     /* The reference frame belongs in its own conditioning rows, noise-augmented
      * to t=0.999 and held there for every step, while the generated frames
@@ -1900,7 +1947,7 @@ static bool h3v_gen_impl(h3v_model *m, const char *prompt, const char *variant,
     h3v_apply_residency(&m->dit, "DiT transformer");
     {
         float sg[H3V_SAMPLE_STEPS + 1], asg[H3V_SAMPLE_STEPS + 1];
-        float ts[H3V_SAMPLE_STEPS];
+        float ts[H3V_SAMPLE_STEPS], ats[H3V_SAMPLE_STEPS];
         h3v_sigmas(steps, m->video_shift, sg);
         h3v_sigmas(steps, m->audio_shift, asg);
         /* Timestep convention. The working image line uses t = 1 - sigma, and
@@ -1923,8 +1970,10 @@ static bool h3v_gen_impl(h3v_model *m, const char *prompt, const char *variant,
                     ts_is_sigma = 1;
             }
         }
-        for (int s = 0; s < steps; s++)
+        for (int s = 0; s < steps; s++) {
             ts[s] = ts_is_sigma ? sg[s] : 1.0f - sg[s];
+            ats[s] = ts_is_sigma ? asg[s] : 1.0f - asg[s];
+        }
         /* Decisive one-step velocity test (pure C, probe-only). A 2-step run
          * from pure noise is too coarse to say whether the DiT convention is
          * right — both shifts end at noise. So CWICK_H3V_DIAG_MIX=<m> in (0,1)
@@ -1995,6 +2044,20 @@ static bool h3v_gen_impl(h3v_model *m, const char *prompt, const char *variant,
          * cases, which is the difference between "flip the sign" and "the
          * output head is not producing a usable field". Off by default. */
         int step_stats = getenv("CWICK_H3V_STEPSTATS") != NULL;
+        const int64_t seq = ntext + (condrows ? ref_rows : 0) + naudio + nvideo;
+        rope_cos = h3v_f32(seq * VD_ROPE_DIM);
+        rope_sin = h3v_f32(seq * VD_ROPE_DIM);
+        if (!rope_cos || !rope_sin) goto done;
+        h3v_rope_tables(ntext, nvideo, naudio, condrows ? ref_rows : 0,
+                        lt, lh, lw, rlh > 0 ? rlh : lh,
+                        rlw > 0 ? rlw : lw, rope_cos, rope_sin);
+        double adaln_ms = h3v_ms();
+        if (!h3v_adaln_precompute(m, ts, ats, steps, naudio > 0,
+                                  condrows && ref_rows > 0,
+                                  &mod_all, &final_mod_all, err))
+            goto done;
+        CWICK_INFO("video", "AdaLN precomputed for %d steps in %.1f ms",
+                   steps, h3v_ms() - adaln_ms);
         vvel = h3v_f32(nvideo * VD_PATCH_DIM);
         avel = h3v_f32(naudio * VD_AUDIO);
         CWICK_INFO("video", "phase 3/6 dit: %d steps, seq %lld "
@@ -2008,8 +2071,9 @@ static bool h3v_gen_impl(h3v_model *m, const char *prompt, const char *variant,
                        (double)s / (double)steps);
             if (!h3v_dit_step(m, cond, ntext, text_tags, vrows, nvideo,
                               condrows ? crows : NULL, condrows ? ref_rows : 0,
-                              arows, naudio,
-                              lt, lh, lw, rlh, rlw, ts[s], s, steps, cb, cbctx,
+                              arows, naudio, mod_all, final_mod_all,
+                              rope_cos, rope_sin,
+                              s, steps, cb, cbctx,
                               vvel, avel, err))
                 goto done;
             /* Network-probe: with a known mix `x = m*noise + (1-m)*x0` the
@@ -2206,6 +2270,8 @@ done:
     free(cond);
     free(vlat); free(vrows); free(arows);
     free(vvel); free(avel);
+    free(mod_all); free(final_mod_all);
+    free(rope_cos); free(rope_sin);
     free(ref_rgb_scaled); free(ref_lat); free(ref_packed); free(crows);
     free(ref_rgb_vision);
     if (text_tags) h3_text_cond_free(text_tags);

@@ -95,6 +95,7 @@ typedef struct {
     double stamp_ms;
 } h3_progress;
 void h3_progress_get(h3_progress *out);
+double h3_progress_age_ms(const h3_progress *out);
 
 /* PNG encoding for the API response. `rgb` is interleaved float [0,1]. */
 unsigned char *h3_png_encode(const float *rgb, int w, int h,

@@ -42,6 +42,7 @@
 #include "../src/h3v.h"
 #include "../src/h3v_gpu.h"
 #include "../src/h3v_internal.h"
+#include "../src/music.h"
 #include "../src/metrics.h"
 #include "../src/rt_realtime.h"
 #include "../src/rt_vad.h"
@@ -5152,6 +5153,10 @@ static void test_webui(void) {
           "webui: the manifest lists the kart app");
     CHECK(manifest && strstr((const char *)manifest->data, "\"imagegen\"") != NULL,
           "webui: the manifest lists the H5 image-generation app");
+    CHECK(manifest && strstr((const char *)manifest->data, "\"music\"") != NULL &&
+          strstr((const char *)manifest->data, "纯音乐") != NULL &&
+          strstr((const char *)manifest->data, "风格标签和歌词") == NULL,
+          "webui: the manifest lists the instrumental H5 music app");
     const cwick_webui_blob *apps_alias = cwick_webui_lookup("/apps");
     const cwick_webui_blob *apps_alias2 = cwick_webui_lookup("/apps/");
     CHECK(apps_alias && apps_alias2 && manifest &&
@@ -5201,6 +5206,8 @@ static void test_webui(void) {
           strstr((const char *)igenhtml->data, "data-input=\"outfit\"") != NULL &&
           strstr((const char *)igenhtml->data, "data-input=\"pose\"") != NULL &&
           strstr((const char *)igenhtml->data, "id=\"download\"") != NULL &&
+          strstr((const char *)igenhtml->data, "overall_soundscape") != NULL &&
+          strstr((const char *)igenhtml->data, "non_diegetic_music") != NULL &&
           igendir && igendir->len == igenhtml->len &&
           memcmp(igendir->data, igenhtml->data, igenhtml->len) == 0,
           "webui: the image app has prompt, three uploads, download and a dir alias");
@@ -5214,6 +5221,63 @@ static void test_webui(void) {
           strstr((const char *)igenhtml->data, "optgroup") != NULL &&
           strstr((const char *)igenhtml->data, "2560x1440") != NULL,
           "webui: the video size list separates paired and extended canvases");
+
+    const cwick_webui_blob *musicjs = cwick_webui_lookup("/apps/music/app.js");
+    const cwick_webui_blob *musichtml = cwick_webui_lookup("/apps/music/index.html");
+    const cwick_webui_blob *musicdir = cwick_webui_lookup("/apps/music/");
+    CHECK(musicjs && strstr(musicjs->content_type, "javascript") != NULL &&
+          strstr((const char *)musicjs->data, "postJson('/v1/generate',") != NULL &&
+          strstr((const char *)musicjs->data, "postJson('/v1/chat/completions',") != NULL &&
+          strstr((const char *)musicjs->data, "postJson('/v1/models/switch',") != NULL &&
+          strstr((const char *)musicjs->data, "generateIdea") != NULL &&
+          strstr((const char *)musicjs->data, "function validateCaption") != NULL &&
+          strstr((const char *)musicjs->data, "Vocals: None") != NULL &&
+          strstr((const char *)musicjs->data, "Instrumental Focus:") != NULL &&
+          strstr((const char *)musicjs->data, "The complete instrumental track must fit") != NULL &&
+          strstr((const char *)musicjs->data, "instrumental: true") != NULL &&
+          strstr((const char *)musicjs->data, "lyrics: seconds <= 15") != NULL &&
+          strstr((const char *)musicjs->data, "[Intro]") != NULL &&
+          strstr((const char *)musicjs->data, "[Outro]") != NULL &&
+          strstr((const char *)musicjs->data, "纯音乐描述必须明确 Vocals: None") != NULL &&
+          strstr((const char *)musicjs->data, "编排时间线超过") != NULL &&
+          strstr((const char *)musicjs->data, "S.ideaSeconds") != NULL &&
+          strstr((const char *)musicjs->data, "$('seed').value.trim()") != NULL &&
+          strstr((const char *)musicjs->data, "function buildLyricsRequest") == NULL &&
+          strstr((const char *)musicjs->data, "function lyricBudget") == NULL &&
+          strstr((const char *)musicjs->data, "function lyricUnits") == NULL &&
+          strstr((const char *)musicjs->data, "function validateLyrics") == NULL &&
+          strstr((const char *)musicjs->data, "languageButtons") == NULL &&
+          strstr((const char *)musicjs->data, "reasoning_effort") != NULL &&
+          strstr((const char *)musicjs->data, "/v1/generate/upload-cover") == NULL &&
+          strstr((const char *)musicjs->data, "/v1/generate/format") == NULL &&
+          strstr((const char *)musicjs->data, "Ace-Step1.5") == NULL &&
+          strstr((const char *)musicjs->data, "decodeAudioData") == NULL &&
+          strstr((const char *)musicjs->data, "aria-valuenow") != NULL &&
+          strstr((const char *)musicjs->data, "job.status === 'completed' ? 100") != NULL &&
+          strstr((const char *)musicjs->data, "已结束") != NULL &&
+          strstr((const char *)musicjs->data, "提前 EOS") != NULL &&
+          strstr((const char *)musicjs->data, "setTimeout") != NULL,
+          "webui: the music app generates instrumental captions and polls /v1/generate");
+    CHECK(musichtml && strstr((const char *)musichtml->data, "id=\"player\"") != NULL &&
+          strstr((const char *)musichtml->data, "一键生成纯音乐") != NULL &&
+          strstr((const char *)musichtml->data, "换一首灵感") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"analyzeBtn\"") == NULL &&
+          strstr((const char *)musichtml->data, "id=\"audioFile\"") == NULL &&
+          strstr((const char *)musichtml->data, "id=\"formatLyrics\"") == NULL &&
+          strstr((const char *)musichtml->data, "id=\"lyrics\"") == NULL &&
+          strstr((const char *)musichtml->data, "languageButtons") == NULL &&
+          strstr((const char *)musichtml->data, "data-language=\"auto\"") == NULL &&
+          strstr((const char *)musichtml->data, "data-language=\"en\"") == NULL &&
+          strstr((const char *)musichtml->data, "id=\"title\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"duration\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"duration\" type=\"number\" min=\"10\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"steps\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"seed\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"download\"") != NULL &&
+          strstr((const char *)musichtml->data, "id=\"progressBar\"") != NULL &&
+          musicdir && musicdir->len == musichtml->len &&
+          memcmp(musicdir->data, musichtml->data, musichtml->len) == 0,
+          "webui: the music app has progress, playback, download and a dir alias");
 
     const cwick_webui_blob *login = cwick_webui_lookup("/login");
     const cwick_webui_blob *login2 = cwick_webui_lookup("/login.html");
@@ -6371,6 +6435,82 @@ static void test_h3v_video(void) {
           "h3v: 4K-wide canvas (3840) is still refused");
 }
 
+static void test_music_contract(void) {
+    CHECK(music_conv_selftest(), "music: strided convolution places every kernel tap correctly");
+    CHECK(music_latent_frames_selftest(), "music: zero AR offset maps to zero latent offset");
+    CHECK(music_audio_valid_selftest(), "music: non-finite and digital-silence output are rejected");
+    CHECK(music_flow_layout_selftest(), "music: conditional batch copy stays inside the two-row latent buffer");
+    CHECK(music_flow_scheduler_selftest(), "music: Flow scheduler runs from 0 to (steps-1)/steps with a positive Euler step");
+    CHECK(music_ar_stop_selftest(), "music: fixed-duration AR keeps the minimum-frame guard");
+    CHECK(music_short_window_selftest(), "music: short tracks select a stable window from a longer render");
+    CHECK(music_audio_head_selftest(), "music: compact audio head preserves end and semantic token row order");
+    CHECK(music_qkv_group_selftest(), "music: grouped QKV projection matches separate BF16 GEMMs");
+    CHECK(music_lyric_stats_selftest(), "music: lyric density counts Chinese characters and English words");
+    CHECK(music_lyrics_selftest(),
+          "music: lyric tags collapse to the documented section set and annotations are dropped");
+    char tmpl[] = "/tmp/cwick-test-music-XXXXXX";
+    char *root = mkdtemp(tmpl);
+    CHECK(root != NULL, "music: temporary checkpoint directory can be created");
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/modular_model_index.json", root);
+    CHECK(cwick_write_file(path, "{}", 2) == 0, "music: modular manifest written");
+    CHECK(cwick_model_music_manifest(root), "music: modular manifest is recognized");
+    CHECK(!cwick_model_music_complete(root), "music: manifest alone is not a complete model");
+    static const char *const dirs[] = {
+        "language_model", "rvq_depth_decoder", "condition_encoder", "transformer", "vocoder", "tokenizer"
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", root, dirs[i]);
+        CHECK(cwick_mkdir_p(path) == 0, "music: component directory exists");
+    }
+    static const char *const files[] = {
+        "language_model/model.safetensors.index.json",
+        "rvq_depth_decoder/diffusion_pytorch_model.safetensors",
+        "condition_encoder/diffusion_pytorch_model.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "vocoder/diffusion_pytorch_model.safetensors",
+        "tokenizer/tokenizer.json",
+        "dav.pth",
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", root, files[i]);
+        CHECK(cwick_write_file(path, "w", 1) == 0, "music: required component file exists");
+    }
+    CHECK(cwick_model_music_complete(root), "music: all required components form a complete model");
+    char id[128];
+    CHECK(!cwick_model_dir_probe(root, id, sizeof(id)), "music: pipeline is not misclassified as text");
+
+    music_timing tim;
+    memset(&tim, 0, sizeof(tim));
+    tim.total_ms = 1234.0;
+    tim.flow_ms = 100.0;
+    tim.audio_samples = MUSIC_SAMPLE_RATE;
+    tim.frames = 25;
+    tim.requested_frames = 100;
+    tim.ended_early = 1;
+    tim.ar_attempts = 3;
+    cwick_metrics_music_accept(false, false);
+    cwick_metrics_music_dense_lyrics();
+    cwick_metrics_music_progress(MUSIC_PHASE_FLOW, 1, 2, 0.5);
+    cwick_metrics_music_observe(&tim, CWICK_MUSIC_SUCCEEDED);
+    size_t metrics_len = 0;
+    char *metrics = cwick_metrics_render(&metrics_len);
+    CHECK(metrics && strstr(metrics, "cwick:music_jobs_completed_total") &&
+          strstr(metrics, "cwick:music_stage_seconds_total{stage=\"flow\"}") &&
+          strstr(metrics, "cwick:music_audio_seconds_total") &&
+          strstr(metrics, "cwick:music_generation_modes_total{mode=\"vocal\"}") &&
+          strstr(metrics, "cwick:music_jobs_ended_early_total 1") &&
+          strstr(metrics, "cwick:music_ar_retries_total 2") &&
+          strstr(metrics, "cwick:music_last_ar_attempts 3") &&
+          strstr(metrics, "cwick:music_jobs_short_total 1") &&
+          strstr(metrics, "cwick:music_dense_lyrics_total 1") &&
+          strstr(metrics, "cwick:music_last_duration_ratio 0.25") &&
+          strstr(metrics, "cwick:music_last_frames 25") &&
+          strstr(metrics, "cwick:music_last_requested_frames 100"),
+          "music: full-chain stage, output, early-stop and vocal-mode metrics are exported");
+    free(metrics);
+}
+
 static void test_video_metrics(void) {
     CHECK(h3v_layout_selftest(),
           "h3v layout: [C][T][H][W] stats and pack/unpack round-trip");
@@ -6378,6 +6518,12 @@ static void test_video_metrics(void) {
           "h3v variant: case-insensitive Ref2VA name resolution");
     CHECK(h3v_latnorm_selftest(),
           "h3v vae: 24-channel latent normalise/denormalise round-trip");
+    CHECK(h3v_vae_plan_selftest(),
+          "h3v vae: tile plan keeps full intermediate tiles and official overlaps");
+    CHECK(h3v_audio_latnorm_selftest(),
+          "h3v audio: latent denormalisation uses the released channel statistics");
+    CHECK(h3v_audio_amp_selftest(),
+          "h3v audio: AMP residual adds the block input, not the inner convolution");
     cwick_metrics_init(NULL);
     cwick_metrics_video_start(0, 30);
     cwick_metrics_video_step(15, 30);
@@ -6545,6 +6691,11 @@ static void test_h3_progress(void) {
     CHECK(pr.phase >= 0 && pr.phase <= 7,
           "h3 progress: getter returns a valid phase code");
     CHECK(pr.stamp_ms >= 0.0, "h3 progress: getter returns a monotonic stamp");
+    CHECK(pr.stamp_ms <= (double)cwick_prof_ns() / 1e6 + 1.0,
+          "h3 progress: stamp stays on the monotonic clock domain");
+    pr.stamp_ms = (double)cwick_prof_ns() / 1e6;
+    CHECK(h3_progress_age_ms(&pr) >= 0.0 && h3_progress_age_ms(&pr) < 1000.0,
+          "h3 progress: age uses the same monotonic clock as the publisher");
     /* The step counter is only meaningful inside the DiT phase. Outside it
      * the publisher writes 0/0, and a fresh snapshot must never report a step
      * larger than its total. */
@@ -6629,6 +6780,7 @@ int main(void) {
     test_h3v_video();
     test_h3v_mp4();
     test_video_metrics();
+    test_music_contract();
     if (g_fail) {
         printf("\nRESULT: FAIL\n");
         return 1;

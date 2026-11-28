@@ -193,6 +193,28 @@ static _Atomic uint64_t m_video_frames, m_video_bytes;
 static _Atomic uint64_t m_video_video_tokens, m_video_audio_tokens;
 static _Atomic uint64_t g_video_dit_done, g_video_dit_total, g_video_last_total_bits;
 
+/* Music jobs: accepted at validation time, balanced by one terminal observer
+ * from the worker. Stage counters are populated directly from music_timing. */
+static _Atomic uint64_t m_music_accepted, m_music_completed;
+static _Atomic uint64_t m_music_succeeded, m_music_failed, m_music_cancelled;
+static _Atomic uint64_t m_music_ended_early, m_music_short;
+static _Atomic uint64_t m_music_ar_retries;
+static _Atomic uint64_t m_music_dense_lyrics;
+static _Atomic uint64_t m_music_generate, m_music_cover;
+static _Atomic uint64_t m_music_vocal, m_music_instrumental;
+static _Atomic uint64_t m_music_load_bits, m_music_tokenize_bits;
+static _Atomic uint64_t m_music_reference_bits, m_music_global_bits;
+static _Atomic uint64_t m_music_depth_bits, m_music_condition_bits;
+static _Atomic uint64_t m_music_flow_bits, m_music_vocoder_bits, m_music_wav_bits;
+static _Atomic uint64_t m_music_total_bits;
+static _Atomic uint64_t g_music_last_total_bits, g_music_last_seconds_bits, g_music_last_ratio_bits;
+static _Atomic uint64_t g_music_last_frames, g_music_last_requested_frames;
+static _Atomic uint64_t g_music_last_ar_attempts;
+static _Atomic uint64_t m_music_audio_seconds_bits, m_music_samples, m_music_bytes;
+static _Atomic uint64_t m_music_prompt_tokens, m_music_frames, m_music_steps;
+static _Atomic uint64_t g_music_phase, g_music_done, g_music_total;
+static _Atomic uint64_t g_music_frac_bits;
+
 static _Atomic uint64_t m_expert_reads;
 static _Atomic uint64_t m_expert_bytes;
 
@@ -382,6 +404,102 @@ void cwick_metrics_video_observe(const cwick_video_job_metrics *m) {
     counter_add(&m_video_bytes, m->bytes);
     counter_add(&m_video_video_tokens, m->video_tokens);
     counter_add(&m_video_audio_tokens, m->audio_tokens);
+}
+
+static int music_phase_id(const char *phase) {
+    static const char *const names[] = {
+        "idle", MUSIC_PHASE_LOAD, MUSIC_PHASE_TOKENIZE, MUSIC_PHASE_REFERENCE,
+        MUSIC_PHASE_GLOBAL, MUSIC_PHASE_DEPTH, MUSIC_PHASE_CONDITION,
+        MUSIC_PHASE_FLOW, MUSIC_PHASE_VOCODER, MUSIC_PHASE_WAV, "done", "error"
+    };
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
+        if (strcmp(phase ? phase : "", names[i]) == 0) return i;
+    return -1;
+}
+
+void cwick_metrics_music_accept(bool cover, bool instrumental) {
+    counter_add(&m_music_accepted, 1);
+    counter_add(cover ? &m_music_cover : &m_music_generate, 1);
+    counter_add(instrumental ? &m_music_instrumental : &m_music_vocal, 1);
+}
+
+void cwick_metrics_music_dense_lyrics(void) {
+    counter_add(&m_music_dense_lyrics, 1);
+}
+
+void cwick_metrics_music_progress(const char *phase, int64_t done, int64_t total,
+                                  double frac) {
+    int id = music_phase_id(phase);
+    if (id >= 0) atomic_store_explicit(&g_music_phase, (uint64_t)id,
+                                      memory_order_relaxed);
+    if (phase && strcmp(phase, MUSIC_PHASE_FLOW) == 0) {
+        if (done >= 0) atomic_store_explicit(&g_music_done, (uint64_t)done,
+                                            memory_order_relaxed);
+        if (total >= 0) atomic_store_explicit(&g_music_total, (uint64_t)total,
+                                              memory_order_relaxed);
+    }
+    if (isfinite(frac)) {
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        atomic_store_explicit(&g_music_frac_bits, d2u(frac),
+                              memory_order_relaxed);
+    }
+}
+
+void cwick_metrics_music_observe(const music_timing *tim,
+                                 cwick_music_outcome outcome) {
+    if (!tim) return;
+    counter_add(&m_music_completed, 1);
+    if (outcome == CWICK_MUSIC_SUCCEEDED) counter_add(&m_music_succeeded, 1);
+    else if (outcome == CWICK_MUSIC_CANCELLED) counter_add(&m_music_cancelled, 1);
+    else counter_add(&m_music_failed, 1);
+    if (tim->ended_early) counter_add(&m_music_ended_early, 1);
+    if (tim->ar_attempts > 1)
+        counter_add(&m_music_ar_retries, (uint64_t)(tim->ar_attempts - 1));
+    atomic_store_explicit(&g_music_last_ar_attempts, tim->ar_attempts, memory_order_relaxed);
+
+    gauge_add(&m_music_load_bits, tim->load_ms / 1000.0);
+    gauge_add(&m_music_tokenize_bits, tim->tokenize_ms / 1000.0);
+    gauge_add(&m_music_reference_bits, tim->reference_encode_ms / 1000.0);
+    gauge_add(&m_music_global_bits, tim->global_lm_ms / 1000.0);
+    gauge_add(&m_music_depth_bits, tim->depth_ms / 1000.0);
+    gauge_add(&m_music_condition_bits, tim->condition_ms / 1000.0);
+    gauge_add(&m_music_flow_bits, tim->flow_ms / 1000.0);
+    gauge_add(&m_music_vocoder_bits, tim->vocoder_ms / 1000.0);
+    gauge_add(&m_music_wav_bits, tim->wav_ms / 1000.0);
+    gauge_add(&m_music_total_bits, tim->total_ms / 1000.0);
+    atomic_store_explicit(&g_music_last_total_bits, d2u(tim->total_ms / 1000.0),
+                          memory_order_relaxed);
+
+    double seconds = MUSIC_SAMPLE_RATE > 0
+                   ? (double)tim->audio_samples / (double)MUSIC_SAMPLE_RATE : 0.0;
+    atomic_store_explicit(&g_music_last_seconds_bits, d2u(seconds),
+                          memory_order_relaxed);
+    double requested_seconds = (double)tim->requested_frames / 25.0;
+    double duration_ratio = requested_seconds > 0.0 ? seconds / requested_seconds : 0.0;
+    atomic_store_explicit(&g_music_last_ratio_bits, d2u(duration_ratio),
+                          memory_order_relaxed);
+    if (outcome == CWICK_MUSIC_SUCCEEDED && duration_ratio < 0.99)
+        counter_add(&m_music_short, 1);
+    gauge_add(&m_music_audio_seconds_bits, seconds);
+    counter_add(&m_music_samples, tim->audio_samples);
+    counter_add(&m_music_bytes, tim->output_bytes);
+    counter_add(&m_music_prompt_tokens, tim->prompt_tokens);
+    counter_add(&m_music_frames, tim->frames);
+    counter_add(&m_music_steps, tim->flow_steps);
+    atomic_store_explicit(&g_music_last_frames, tim->frames, memory_order_relaxed);
+    atomic_store_explicit(&g_music_last_requested_frames, tim->requested_frames,
+                          memory_order_relaxed);
+
+    atomic_store_explicit(&g_music_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_music_total, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_music_phase,
+                          (uint64_t)(outcome == CWICK_MUSIC_SUCCEEDED ? 10 :
+                                     outcome == CWICK_MUSIC_CANCELLED ? 0 : 11),
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_music_frac_bits, d2u(outcome == CWICK_MUSIC_SUCCEEDED
+                                                  ? 1.0 : 0.0),
+                          memory_order_relaxed);
 }
 
 void cwick_metrics_request_finish(int64_t prompt_tokens, int64_t gen_tokens,
@@ -864,6 +982,129 @@ char *cwick_metrics_render(size_t *out_len) {
     buf_addf(&b, "cwick:video_tokens_total{kind=\"audio\"} %llu\n",
              (unsigned long long)atomic_load_explicit(&m_video_audio_tokens,
                                                       memory_order_relaxed));
+
+    /* ---- music generation jobs ---- */
+    emit_counter(&b, "cwick:music_jobs_accepted_total",
+                 "Fully validated music jobs accepted by /v1/generate.",
+                 atomic_load_explicit(&m_music_accepted, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_completed_total",
+                 "Accepted music jobs that reached a terminal state.",
+                 atomic_load_explicit(&m_music_completed, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_succeeded_total",
+                 "Music jobs that produced a WAV.",
+                 atomic_load_explicit(&m_music_succeeded, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_failed_total",
+                 "Music jobs that failed.",
+                 atomic_load_explicit(&m_music_failed, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_cancelled_total",
+                 "Music jobs cancelled before completion.",
+                 atomic_load_explicit(&m_music_cancelled, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_ended_early_total",
+                 "Finished music jobs whose global LM stopped before the frame limit.",
+                 atomic_load_explicit(&m_music_ended_early, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_ar_retries_total",
+                 "Additional autoregressive attempts after an early audio-end token.",
+                 atomic_load_explicit(&m_music_ar_retries, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_jobs_short_total",
+                 "Successful music jobs that produced less than 75 percent of the requested duration.",
+                 atomic_load_explicit(&m_music_short, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_dense_lyrics_total",
+                 "Accepted vocal jobs exceeding six sung characters or words per second.",
+                 atomic_load_explicit(&m_music_dense_lyrics, memory_order_relaxed));
+    emit_help_type(&b, "cwick:music_tasks_total",
+                   "Accepted music jobs by task.", "counter");
+    buf_addf(&b, "cwick:music_tasks_total{task=\"generate\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_music_generate,
+                                                      memory_order_relaxed));
+    buf_addf(&b, "cwick:music_tasks_total{task=\"cover\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_music_cover,
+                                                      memory_order_relaxed));
+    emit_help_type(&b, "cwick:music_generation_modes_total",
+                   "Accepted music jobs by requested vocal mode.", "counter");
+    buf_addf(&b, "cwick:music_generation_modes_total{mode=\"vocal\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_music_vocal,
+                                                      memory_order_relaxed));
+    buf_addf(&b, "cwick:music_generation_modes_total{mode=\"instrumental\"} %llu\n",
+             (unsigned long long)atomic_load_explicit(&m_music_instrumental,
+                                                      memory_order_relaxed));
+    emit_help_type(&b, "cwick:music_stage_seconds_total",
+                   "Wall seconds accumulated per music pipeline stage across "
+                   "finished jobs.", "counter");
+    {
+        static const struct { const char *name; _Atomic uint64_t *p; } stage[] = {
+            { "load", &m_music_load_bits }, { "tokenize", &m_music_tokenize_bits },
+            { "reference_encode", &m_music_reference_bits },
+            { "global_lm", &m_music_global_bits }, { "depth", &m_music_depth_bits },
+            { "condition", &m_music_condition_bits }, { "flow", &m_music_flow_bits },
+            { "vocoder", &m_music_vocoder_bits }, { "wav", &m_music_wav_bits },
+            { "total", &m_music_total_bits },
+        };
+        for (size_t i = 0; i < sizeof(stage) / sizeof(stage[0]); i++)
+            buf_addf(&b, "cwick:music_stage_seconds_total{stage=\"%s\"} %.6g\n",
+                     stage[i].name, gauge_get(stage[i].p));
+    }
+    emit_gauge(&b, "cwick:music_last_total_seconds",
+               "Wall seconds of the most recent finished music job.",
+               u2d(atomic_load_explicit(&g_music_last_total_bits,
+                                        memory_order_relaxed)));
+    emit_gauge(&b, "cwick:music_last_output_seconds",
+               "Audio duration of the most recent finished music job.",
+               u2d(atomic_load_explicit(&g_music_last_seconds_bits,
+                                        memory_order_relaxed)));
+    emit_gauge(&b, "cwick:music_last_duration_ratio",
+               "Produced audio duration divided by the requested duration.",
+               u2d(atomic_load_explicit(&g_music_last_ratio_bits,
+                                        memory_order_relaxed)));
+    emit_gauge_i(&b, "cwick:music_last_frames",
+                 "Global LM frames produced by the most recent finished music job.",
+                 atomic_load_explicit(&g_music_last_frames, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:music_last_requested_frames",
+                 "Global LM frames requested by the most recent finished music job.",
+                 atomic_load_explicit(&g_music_last_requested_frames, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:music_last_ar_attempts",
+                 "Autoregressive attempts used by the most recent finished music job.",
+                 atomic_load_explicit(&g_music_last_ar_attempts, memory_order_relaxed));
+    emit_gauge(&b, "cwick:music_progress",
+               "Overall progress of the current music job, from 0 to 1.",
+               u2d(atomic_load_explicit(&g_music_frac_bits,
+                                        memory_order_relaxed)));
+    emit_gauge_i(&b, "cwick:music_steps_done",
+                 "Steps completed in the current music job; 0 when idle.",
+                 atomic_load_explicit(&g_music_done, memory_order_relaxed));
+    emit_gauge_i(&b, "cwick:music_steps_total",
+                 "Steps planned in the current music job; 0 when idle.",
+                 atomic_load_explicit(&g_music_total, memory_order_relaxed));
+    {
+        static const char *const phases[] = {
+            "idle", MUSIC_PHASE_LOAD, MUSIC_PHASE_TOKENIZE, MUSIC_PHASE_REFERENCE,
+            MUSIC_PHASE_GLOBAL, MUSIC_PHASE_DEPTH, MUSIC_PHASE_CONDITION,
+            MUSIC_PHASE_FLOW, MUSIC_PHASE_VOCODER, MUSIC_PHASE_WAV, "done", "error"
+        };
+        uint64_t id = atomic_load_explicit(&g_music_phase, memory_order_relaxed);
+        emit_help_type(&b, "cwick:music_phase_info",
+                       "Current music pipeline phase.", "gauge");
+        buf_addf(&b, "cwick:music_phase_info{phase=\"%s\"} 1\n",
+                 phases[id < sizeof(phases) / sizeof(phases[0]) ? id : 0]);
+    }
+    emit_help_type(&b, "cwick:music_audio_seconds_total",
+                   "Audio seconds produced by finished music jobs.", "counter");
+    buf_addf(&b, "cwick:music_audio_seconds_total %.6g\n",
+             gauge_get(&m_music_audio_seconds_bits));
+    emit_counter(&b, "cwick:music_samples_total",
+                 "Per-channel PCM samples produced by finished music jobs.",
+                 atomic_load_explicit(&m_music_samples, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_bytes_total",
+                 "WAV bytes produced by finished music jobs.",
+                 atomic_load_explicit(&m_music_bytes, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_prompt_tokens_total",
+                 "Text prompt tokens processed by finished music jobs.",
+                 atomic_load_explicit(&m_music_prompt_tokens, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_frames_total",
+                 "Audio frames processed by finished music jobs.",
+                 atomic_load_explicit(&m_music_frames, memory_order_relaxed));
+    emit_counter(&b, "cwick:music_steps_total",
+                 "Flow steps performed by finished music jobs.",
+                 atomic_load_explicit(&m_music_steps, memory_order_relaxed));
 
     /* ---- gauges ---- */
     uint64_t used = atomic_load_explicit(&g_expert_used, memory_order_relaxed);

@@ -23,8 +23,17 @@ int h3vm_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n);
 int h3vm_gemm_bf16_qkv(const float *a, const void *w, float *c,
                        int rows, int k, int cols, int wrows, int lda, int ldc,
                        int part, int hd);
+int h3vm_gemm_bf16_qkv3(const float *a, const void *w, float *q, float *k,
+                        float *v, int rows, int inner, int cols, int wrows,
+                        int lda, int ldc, int hd);
+int h3vm_swiglu(float *x, int64_t n, int64_t half, int legacy);
+int h3vm_qk_prep(float *q, float *k, const float *wq, const float *wk,
+                 const float *cos, const float *sin, int seq, int ld,
+                 int heads, int hd, int rope_on, int rope_mode);
 int h3vm_gemm_f32(const float *a, const float *w, float *c,
                   int rows, int k, int cols, int lda, int ldc);
+int h3vm_gemm_f32_accum(const float *a, const float *w, float *c,
+                        int rows, int k, int cols, int lda, int ldc);
 int h3vm_attention(const float *q, const float *k, const float *v, float *o,
                    int seq, int ld, int heads, int hd);
 int h3vm_inkling_decode_attn(const float *q, const float *k, const float *v,
@@ -39,6 +48,7 @@ int h3vm_inkling_prefill_attn(const float *q, const float *k, const float *v,
                               int extent, int window);
 
 static int g_state = -1;   /* -1 untried, 0 unavailable, 1 ready */
+static int g_policy = -1;  /* cached h3v_gpu_on() result */
 
 int h3v_gpu_ready(void) {
     if (g_state < 0) g_state = h3vm_init() ? 1 : 0;
@@ -48,20 +58,23 @@ int h3v_gpu_ready(void) {
 void h3v_gpu_shutdown(void) {
     if (g_state == 1) h3vm_shutdown();
     g_state = -1;
+    g_policy = -1;
 }
 
 int h3v_gpu_on(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
+    if (g_policy >= 0) return g_policy;
     if (!cwick_metal_backend_active()) {
-        cached = 0;
+        g_policy = 0;
     } else if (getenv("CWICK_H3V_GPU") && !cwick_env_true("CWICK_H3V_GPU")) {
-        cached = 0;
+        g_policy = 0;
     } else {
-        cached = h3v_gpu_ready() ? 1 : 0;
+        g_policy = h3v_gpu_ready() ? 1 : 0;
     }
-    if (cached) CWICK_INFO("init", "video Metal backend up (DiT + VAE)");
-    return cached;
+    /* One shared library serves every GPU caller (text GEMM, Inkling attention,
+     * image and video). Naming just the video pipeline here made a first text
+     * request look like it was loading a model it never touches. */
+    if (g_policy) CWICK_INFO("init", "Metal kernel library ready (GEMM + attention + diffusion pipelines)");
+    return g_policy;
 }
 
 void h3v_gpu_adopt(const void *base, size_t len) {
@@ -103,6 +116,15 @@ int h3v_gpu_gemm_f32(const float *a, const float *w, float *c,
     return h3vm_gemm_f32(a, w, c, rows, k, cols, lda, ldc);
 }
 
+/* Same shape policy, but adds the product to the existing output. Convolution
+ * taps share one output tile, so this must match the CPU path's beta=1.0. */
+int h3v_gpu_gemm_f32_accum(const float *a, const float *w, float *c,
+                           int rows, int k, int cols, int lda, int ldc) {
+    if (g_state != 1 || !a || !w || !c) return 0;
+    if (!gemm_shape_ok(rows, k, cols, lda, ldc)) return 0;
+    return h3vm_gemm_f32_accum(a, w, c, rows, k, cols, lda, ldc);
+}
+
 int h3v_gpu_gemm_qkv(const float *a, const void *w, float *c,
                      int rows, int k, int cols, int wrows, int lda, int ldc,
                      int part, int hd) {
@@ -111,6 +133,33 @@ int h3v_gpu_gemm_qkv(const float *a, const void *w, float *c,
     if (part < 0 || part > 2 || hd <= 0 || hd % 16 || cols % hd ||
         wrows < (cols / hd) * 3 * hd) return 0;
     return h3vm_gemm_bf16_qkv(a, w, c, rows, k, cols, wrows, lda, ldc, part, hd);
+}
+
+int h3v_gpu_gemm_qkv3(const float *a, const void *w, float *q, float *k,
+                      float *v, int rows, int inner, int cols, int wrows,
+                      int lda, int ldc, int hd) {
+    if (g_state != 1 || !a || !w || !q || !k || !v) return 0;
+    if (!gemm_shape_ok(rows, inner, cols, lda, ldc)) return 0;
+    if (hd <= 0 || hd % 16 || cols % hd ||
+        wrows < (cols / hd) * 3 * hd) return 0;
+    return h3vm_gemm_bf16_qkv3(a, w, q, k, v, rows, inner, cols, wrows,
+                               lda, ldc, hd);
+}
+
+int h3v_gpu_swiglu(float *x, int64_t n, int64_t half, int legacy) {
+    if (g_state != 1 || !x || n <= 0 || half <= 0 || n > 0x7FFFFFFFl) return 0;
+    return h3vm_swiglu(x, n, half, legacy != 0);
+}
+
+int h3v_gpu_qk_prep(float *q, float *k, const float *wq, const float *wk,
+                    const float *cos, const float *sin, int seq, int ld,
+                    int heads, int hd, int rope_on, int rope_mode) {
+    if (g_state != 1 || !q || !k || !wq || !wk || !cos || !sin) return 0;
+    if (seq <= 0 || heads <= 0 || heads % 8 || (hd != 64 && hd != 128) ||
+        ld < heads * hd || rope_mode < 0 || rope_mode > 1 ||
+        (rope_on && (rope_mode != 0 || hd != 128))) return 0;
+    return h3vm_qk_prep(q, k, wq, wk, cos, sin, seq, ld, heads, hd,
+                        rope_on != 0, rope_mode);
 }
 
 int h3v_gpu_attention(const float *q, const float *k, const float *v, float *o,

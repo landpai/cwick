@@ -446,6 +446,32 @@
         <div id="imageNote" class="note" hidden></div>
       </div>
 
+      <div class="panel" id="musicModelPanel">
+        <div class="panel-head">
+          <div>
+            <h3 data-i18n="set.music">音乐模型</h3>
+            <p data-i18n="set.musicTip">MiniMax-Music3 使用独立常驻槽位；生成或切换前会释放文本、语音、图像和视频权重</p>
+          </div>
+          <span id="musicStatePill" class="pill mono" data-i18n="set.musicIdle">未加载</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span data-i18n="set.musicDir">模型目录</span><b id="musicDir" class="mono">—</b></div>
+          <div class="kv"><span data-i18n="set.musicEndpoints">接口</span><b class="mono">POST/GET /v1/generate</b></div>
+          <div class="kv"><span data-i18n="set.musicJob">当前 / 最近任务</span><b id="musicJobId" class="mono">—</b></div>
+          <div class="kv"><span data-i18n="set.musicPhase">阶段</span><b id="musicJobPhase" class="mono">—</b></div>
+        </div>
+        <div class="music-progress">
+          <div class="bar tall"><i id="musicJobBar"></i></div>
+          <span id="musicJobProgress" class="mono muted">0%</span>
+        </div>
+        <div class="set-grid img-actions">
+          <button id="musicSwitchBtn" class="min-btn accent" type="button" data-i18n="set.musicLoad">加载 / 切换到音乐模型</button>
+          <button id="musicRefreshBtn" class="min-btn" type="button" data-i18n="common.refresh">刷新</button>
+          <a id="musicWavLink" class="min-btn" href="#" target="_blank" rel="noreferrer" download hidden data-i18n="set.musicWav">打开 / 下载 WAV</a>
+        </div>
+        <div id="musicNote" class="note" hidden></div>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
           <div>

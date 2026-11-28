@@ -254,7 +254,7 @@ static void gemm_bf16_range(void *argp, int64_t t0, int64_t t1) {
     int64_t c0 = t0 * tile, c1 = t1 * tile;
     if (c1 > a->cols) c1 = a->cols;
     if (c0 >= c1) return;
-    float *arena = cwick_xmalloc((size_t)tile * (size_t)a->k * sizeof(float));
+    float *arena = cwick_xmalloc(((size_t)tile * (size_t)a->k + 262144u) * sizeof(float));
     if (!arena) return;
     for (int64_t base = c0; base < c1; base += tile) {
         int64_t n = c1 - base < tile ? c1 - base : tile;
@@ -282,6 +282,10 @@ void cwick_gemm_bf16_tile(float *out, int64_t rows, int64_t k, int64_t cols,
     gemm_bf16_arg a;
     a.w = (const uint16_t *)w_bf16; a.in = in; a.out = out;
     a.rows = rows; a.k = k; a.cols = cols; a.tile = tile;
+    if (rows <= 16) {
+        gemm_bf16_range(&a, 0, ntiles);
+        return;
+    }
     cwick_pool_init();
     cwick_pool_for(ntiles, &a, gemm_bf16_range);
 }
@@ -309,7 +313,7 @@ static void gemm_i8_range(void *argp, int64_t t0, int64_t t1) {
     int64_t c0 = t0 * tile, c1 = t1 * tile;
     if (c1 > a->cols) c1 = a->cols;
     if (c0 >= c1) return;
-    float *arena = cwick_xmalloc((size_t)tile * (size_t)a->k * sizeof(float));
+    float *arena = cwick_xmalloc(((size_t)tile * (size_t)a->k + 262144u) * sizeof(float));
     if (!arena) return;
     for (int64_t base = c0; base < c1; base += tile) {
         int64_t n = c1 - base < tile ? c1 - base : tile;

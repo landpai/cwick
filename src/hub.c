@@ -21,6 +21,7 @@
 #include "json.h"
 #include "log.h"
 #include "models.h"
+#include "music.h"
 #include "util.h"
 
 #include <curl/curl.h>
@@ -508,6 +509,7 @@ static bool dir_has_model_weights(const char *dir, int depth) {
 static bool checkpoint_ready(const char *dir, int files, int partials) {
     if (partials > 0 || files == 0) return false;
     char cfg[HUB_PATH_MAX];
+    if (cwick_model_music_complete(dir)) return true;
     if (snprintf(cfg, sizeof(cfg), "%s/config.json", dir) < (int)sizeof(cfg) &&
         cwick_file_exists(cfg)) return true;
     if (h3_pipeline_complete(dir)) return true;
@@ -559,6 +561,7 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     bool has_config = cwick_file_exists(cfg);
     bool image = !has_config && h3_pipeline_manifest(dir);
     bool video = !has_config && !image && h3v_pipeline_manifest(dir);
+    bool music = !image && !video && cwick_model_music_manifest(dir);
     bool complete = checkpoint_ready(dir, files, partials);
     /* "Downloaded" and "loadable" are different facts: the library happily
      * fetches any repository, but only architectures with kernels can become
@@ -567,7 +570,7 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
     char why[192] = "";
     bool supported = false;
     if (has_config) supported = cwick_model_root_supported(dir, why, sizeof(why));
-    else if (image || video) supported = true;
+    else if (image || video || music) supported = true;
     else snprintf(why, sizeof(why),
                   "weights-only checkpoint (no config.json); "
                   "not a cwick-loadable architecture");
@@ -583,13 +586,16 @@ static void append_local_one(hbuf *out, const char *dir, const char *name,
             (long long)bytes, files, (long long)partial_bytes, partials,
             complete ? "true" : "false", partials > 0 ? "true" : "false",
             supported ? "true" : "false");
-    hb_json_str(out, image ? "image" : video ? "video" : "text");
+    hb_json_str(out, image ? "image" : video ? "video" : music ? "music" : "text");
     if (image) {
         hb_puts(out, ",\"served_id\":");
         hb_json_str(out, H3_SERVED_ID);
     } else if (video) {
         hb_puts(out, ",\"served_id\":");
         hb_json_str(out, H3V_SERVED_ID);
+    } else if (music) {
+        hb_puts(out, ",\"served_id\":");
+        hb_json_str(out, MUSIC_SERVED_ID);
     }
     if (!supported) {
         hb_puts(out, ",\"unsupported_reason\":");
@@ -620,6 +626,7 @@ static bool looks_like_checkpoint(const char *dir) {
     snprintf(p, sizeof(p), "%s/config.json", dir);
     if (cwick_file_exists(p)) return true;
     if (h3_pipeline_manifest(dir)) return true;
+    if (cwick_model_music_manifest(dir)) return true;
     if (pipeline_manifest(dir)) return true;
     snprintf(p, sizeof(p), "%s/.cwick-repo", dir);
     return cwick_file_exists(p) ? true : false;
@@ -689,7 +696,8 @@ static char *checked_path(const char *dir) {
     char cfg[HUB_PATH_MAX];
     snprintf(cfg, sizeof(cfg), "%s/config.json", dir);
     bool config = cwick_file_exists(cfg);
-    if (!config && !h3_pipeline_complete(dir)) return NULL;
+    if (!config && !h3_pipeline_complete(dir) && !h3v_pipeline_complete(dir) &&
+        !cwick_model_music_complete(dir)) return NULL;
     int64_t bytes = 0, partial = 0;
     int files = 0, partials = 0;
     dir_stats(dir, &bytes, &files, &partial, &partials, 0);

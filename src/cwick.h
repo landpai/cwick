@@ -1600,6 +1600,10 @@ typedef struct cwick_server_options {
      * /v1/realtime serves it; the text endpoints answer 503 until a switch
      * back to a text checkpoint. */
     const char *realtime_dir;
+    /* Directory holding the MiniMax-Music3 modular checkpoint (--music /
+     * CWICK_MUSIC_MODEL). It is opened lazily for the first generate request or
+     * a hot switch and owns the same single resident slot as every other model. */
+    const char *music_dir;
     /* The --root the operator launched with, kept so the catalog can still
      * offer it as a switch-back target when no text engine was built (a
      * realtime/image pipeline is resident from startup and the machine holds

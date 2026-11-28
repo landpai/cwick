@@ -41,6 +41,16 @@
       "entry": "/apps/teachme/index.html",
       "description": "全双工语音对话：麦克风采集 PCM 经 WebSocket 送入 /v1/realtime（Sophon-Realtime-32B-Tag），模型直接听声音并把回答说出来；服务端 VAD 免提轮转、可随时插话打断，右侧实时展示耳/预填充/解码/合成全链路耗时与聚合统计。",
       "meta": "实时语音 · 全双工 · 插话打断 · 全链路性能 · sqlite"
+    },
+    {
+      "id": "music",
+      "name": "音乐台",
+      "tag": "H5",
+      "icon": "音",
+      "version": "2.1.0",
+      "entry": "/apps/music/index.html",
+      "description": "先让当前常驻的文本模型随机生成纯音乐的英文结构化描述，明确无主唱、无歌词、无人声采样；再一键交给 MiniMax-Music3 生成整曲。实时轮询加载、全局语言模型、深度解码、Flow、声码器等阶段进度，完成后在线播放并下载 32 kHz 立体声 WAV。",
+      "meta": "文本模型写纯音乐描述 · 一键作曲 · 实时进度 · 在线播放 · WAV 下载"
     }
   ]
 }

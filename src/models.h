@@ -80,6 +80,14 @@ bool cwick_model_type_supported(const char *model_type);
  * `why` gets a short client-facing reason. No weights are opened. */
 bool cwick_model_root_supported(const char *root, char *why, size_t whycap);
 
+/* MiniMax-Music3 uses a modular pipeline layout rather than a text config.
+ * Manifest presence is enough to identify and inventory a (possibly partial)
+ * checkpoint; completeness additionally requires every component directory.
+ * The ordinary text probe deliberately skips these roots, preventing a
+ * duplicate unsupported text entry when --music also scans --models-dir. */
+bool cwick_model_music_manifest(const char *dir);
+bool cwick_model_music_complete(const char *dir);
+
 /* Does `dir` look like a cwick checkpoint root? True when `config.json` sits
  * next to a converted `resident/tensors` tree or the released HF shards
  * (`model.safetensors.index.json` / `model.safetensors`). On success writes

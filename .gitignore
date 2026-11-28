@@ -138,6 +138,7 @@ Thumbs.db
 *.swp
 *~
 .workbuddy/
+.qoder/
 
 # --- local secrets ---------------------------------------------------------
 .env

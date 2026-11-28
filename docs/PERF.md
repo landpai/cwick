@@ -1373,3 +1373,81 @@ measured text path is about 24–26 / 8.5–9.4 tok/s; the image path is about
 7–9 / 8–9 tok/s. The remaining image cost is active-expert BF16 dequantization
 plus GEMM, and the remaining decode cost is packed expert bandwidth and host
 synchronization. These are full-chain numbers, not kernel-only estimates.
+
+## Music pipelines: Music3 generation (2026-11-25)
+
+Measured on the M3 Max with `--backend metal`, one resident pipeline, seed 42
+unless noted, over HTTP on `127.0.0.1:8002`. Wall time is the complete client
+request, including JSON parsing and the response.
+
+| step | input | HTTP wall | engine stages | result |
+|---|---|---:|---|---|
+| switch to Music3 via `/v1/models/switch` | — | 4.7 s | 27.01 GiB mapped and wired | one pipeline resident |
+| `/v1/generate/upload-cover`, English caption | 10 s excerpt, 8 steps | **94.8 s** | reference 21.5, global LM 28.6, depth 14.9, flow 19.5, vocoder 6.0 | 2.47 s / 316,576-byte 32 kHz stereo WAV, −36.6 dBFS |
+| `/v1/generate`, 1 s / 2-step smoke | English prompt | 27.5 s | global + depth dominate | −43.4 dBFS, audible |
+
+A real quality regression is recorded here rather than hidden: submitting a
+Chinese style description to Music3 returned a structurally valid WAV at
+−91 dBFS. The same 10 s / 8-step job with English style tags produced audible
+audio. A 10 s Chinese text-to-music job took 314.7 s and a Chinese cover 332.9 s,
+both silent; the English cover above took 94.8 s. §125 shows the later, larger
+regression had two input-side causes, not the style language alone.
+
+On 2026-11-26 the built-in studio's 60 s / 30-step request (prompt 151 tokens,
+short style tags) completed in **4566.3 s** with the pre-fix build: load 4.8,
+global LM 760.3, depth 392.0, flow 3131.5, vocoder 277.2 s. During that window
+`/metrics` stayed responsive and `GET /v1/generate/{id}` kept returning
+progress; the job ended `succeeded` with 60.07 s of output. Those stage numbers
+are the cost of the 1500-frame autoregressive path, not the newer fix.
+
+After aligning the flow grid and the caption contract, an offline 6 s / 12-step
+run with the checkpoint's three-section English Structured Caption took
+**221.7 s**: load 4.8, global LM 76.7, depth 36.4, condition 0.01, flow 88.7,
+vocoder 15.0, WAV 0.01 s. The 5.991 s / 766,856-byte WAV measured −27.5 dBFS RMS,
+mean autocorrelation peak 0.478, 15/119 weak-periodicity frames and a
+diff-energy ratio of 0.028; the same-seed 2 s / 8-step A/B is in §125.
+
+A follow-up HTTP smoke on the rebuilt server accepted an 1804-byte Structured
+Caption (above the old 1000-byte cap) and completed a 15 s / 2-step job in
+**377.7 s**: load 4.3, global LM 186.4, depth 93.7, condition 0.04, flow 37.6
+(three windows), vocoder 55.5, WAV 0.02 s. The 15.000 s / 1,920,052-byte WAV
+was downloadable through `GET /v1/generate/{id}/content`; polling and metrics
+stayed responsive throughout. A 50 ms RMS scan found the largest adjacent jump
+at 0.10 s (0.069), larger than any jump around the three window boundaries
+(≤0.033), so the window carry produced no dominant seam transient.
+
+Stage progress is written to stdout with wall-clock time and request id, and
+exported as `cwick:music_stage_seconds_total`, `cwick:music_progress` and the
+matching job/task/output counters. Polling and `/metrics` stayed responsive
+while generation occupied the single render slot.
+
+The published `minimax_ttm.wav` was used as a ground-truth probe (§126). A 6 s
+middle section (20–26 s) measures −20.5 dBFS, mean autocorrelation peak 0.731
+and 4/119 weak-periodicity frames; a matched 6 s / 30-step generation measures
+−18.3 dBFS, 0.481 and 15/119. Encoding that reference section to latents and
+decoding it back through the C Flow-VAE preserved the periodicity at 0.761,
+which isolates the vocoder as correct and places the gap in the sampled
+conditioning, not in synthesis. Loading the released transformer weights in
+PyTorch and replaying the same dumped inputs reproduced the C DiT output at
+cosine 1.0000 at every one of the 36 blocks (max abs diff 0.011), and the first
+global-LM logits matched at cosine 0.977/0.981 with identical top-1 tokens.
+These are equivalence checks, not a claim of parity with a curated 285 s track;
+they establish that no weight-layout or operator defect remains in the chain.
+
+### Input-caption A/B at fixed seed (2026-11-26)
+
+Single-window 6 s / seed 7 / CFG 1.7 jobs, measured on the written WAV:
+
+| caption | steps | frames | RMS | dBFS | autocorr peak |
+|---------|------:|-------:|----:|-----:|--------------:|
+| hand-written 350-char summary | 8 | 150 | 0.01096 | −39.2 | — |
+| same 350-char summary | 30 | 150 | 0.03609 | −28.9 | 0.619 |
+| checkpoint 3492-char three-section caption | 30 | 76 | 0.13082 | −17.7 | 0.493 |
+
+A 10 s / 8-step two-window job with the 350-char caption measured 0.01282 and
+0.01205 RMS per chunk — statistically identical to the 6 s / 8-step single
+window (0.01489). The first window has no overlap in either case, so the earlier
+"more windows are quieter" reading was a confound. Wall time for the 6 s /
+30-step job was 328 s (global 71.8, depth 37.9, flow 199.3, vocoder 14.4);
+the 6 s / 8-step job took 185 s (flow 57.1). Step count is the controllable
+cost/quality knob; caption detail is the dominant quality knob. See §128.

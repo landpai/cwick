@@ -377,6 +377,7 @@ static int run_serve(const char *root, const char *host, int port,
                      const char *image_dir,
                      const char *video_dir,
                      const char *rt_dir,
+                     const char *music_dir,
                      const char *spine, int verbose, int trace, int web,
                      int jev, const char *password,
                      const char *const *models_dirs, int models_dirs_n,
@@ -422,19 +423,20 @@ static int run_serve(const char *root, const char *host, int port,
     /* --root decides which model is resident at startup (goal #10: exactly one
      * model, the one root names). A speech root has no text decoder, so the
      * realtime pipeline is resident; any other root builds the text engine.
-     * --rt / --img only register the other pipelines as hot-switch targets —
-     * they never displace root, and the server opens a pipeline at startup only
-     * when no text engine is resident. */
+     * --rt / --img / --videos / --music only register the other pipelines as
+     * hot-switch targets — they never displace root, and the server opens a
+     * pipeline at startup only when no text engine is resident. */
     const char *realtime_dir = (rt_dir && *rt_dir) ? rt_dir
                                : (speech ? root : NULL);
     if (speech) {
         CWICK_INFO("init", "speech checkpoint %s: the realtime pipeline is the "
                           "resident model (ws /v1/realtime); text endpoints "
                           "answer 503 until a switch to a text id", realtime_dir);
-    } else if (realtime_dir || (image_dir && *image_dir)) {
-        CWICK_INFO("init", "root %s is the resident text model; --rt/--img "
-                          "register the realtime/image pipelines for hot-switch "
-                          "(POST /v1/models/switch), not loaded at startup", root);
+    } else if (realtime_dir || (image_dir && *image_dir) ||
+               (video_dir && *video_dir) || (music_dir && *music_dir)) {
+        CWICK_INFO("init", "root %s is the resident text model; --rt/--img/--videos/--music "
+                          "register realtime, image, video and music pipelines for "
+                          "hot-switch (POST /v1/models/switch), not loaded at startup", root);
     }
     /* One model at a time: build the text engine whenever root is not a speech
      * checkpoint. A speech root leaves eng NULL and the server opens the
@@ -465,6 +467,7 @@ static int run_serve(const char *root, const char *host, int port,
     sopts.image_dir = image_dir;
     sopts.video_dir = video_dir;
     sopts.realtime_dir = realtime_dir;
+    sopts.music_dir = music_dir;
     sopts.startup_root = speech ? NULL : root;
     sopts.verbose = verbose;
     sopts.trace = trace;
@@ -1161,7 +1164,8 @@ static void usage(void) {
            "                                  [--context N] [--backend metal|cpu]\n"
            "                                  [--verbose] [--trace]\n"
            "  cwick serve --root DIR [--host H] [--port P] [--max-tokens N]\n"
-           "                        [--videos DIR] [--context N] [--spine bf16|int8]\n"
+           "                        [--img DIR] [--videos DIR] [--rt DIR]\n"
+           "                        [--music DIR] [--context N] [--spine bf16|int8]\n"
            "                        [--warmup N]\n"
            "                        [--backend metal|cpu] [--verbose] [--trace]\n"
            "                        [--mem-fraction PCT] [--max-memory GiB]\n"
@@ -1269,8 +1273,13 @@ static void usage(void) {
            "                 first/last-frame partition is not probed or loaded.\n"
            "                 The video model is switched to at runtime from\n"
            "                 POST /v1/models/switch (id MiniMax-H3); switching\n"
-           "                 loads both VAE shards and leaves the resident text\n"
-           "                 model untouched.\n"
+           "                 releases the previous resident pipeline first.\n"
+           "  --music DIR    register the MiniMax-Music3 modular checkpoint and\n"
+           "                 expose async POST/GET /v1/generate plus\n"
+           "                 GET /v1/generate/{id}/content (32 kHz stereo WAV).\n"
+           "                 CWICK_MUSIC_MODEL sets the same value for launchers.\n"
+           "                 It is opened lazily and hot switching releases the\n"
+           "                 previous text/image/video/realtime/music model.\n"
            "\n"
            "other local models:\n"
            "  --models-dir DIR   also scan DIR (and its immediate children) for\n"
@@ -1544,6 +1553,8 @@ int main(int argc, char **argv) {
         const char *video_dir = getenv("CWICK_VIDEO_MODEL");
         /* --rt wins over the environment variable, same rationale as --img. */
         const char *rt_dir = getenv("CWICK_REALTIME_MODEL");
+        /* --music registers the lazy MiniMax-Music3 pipeline. */
+        const char *music_dir = getenv("CWICK_MUSIC_MODEL");
         bool verbose = false, trace = false;
         bool allow_swap = false;
         /* CWICK_WEB=1 turns the UI on for everyone who starts the same
@@ -1613,6 +1624,8 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "--rt") == 0 ||
                      strcmp(argv[i], "--realtime") == 0)
                 rt_dir = need_arg(&i, argc, argv, "--rt");
+            else if (strcmp(argv[i], "--music") == 0)
+                music_dir = need_arg(&i, argc, argv, "--music");
             else if (strcmp(argv[i], "--prefix-cache-gib") == 0) {
                 if (!parse_i64(need_arg(&i, argc, argv, "--prefix-cache-gib"),
                                1, 4096, &prefix_cache_gib)) {
@@ -1729,7 +1742,7 @@ int main(int argc, char **argv) {
         int rc;
         rc = run_serve(root, host, port, max_tokens, max_context,
                        prefix_cache_dir, prefix_cache_gib, image_dir, video_dir,
-                       rt_dir,
+                       rt_dir, music_dir,
                        spine, verbose, trace, web, jev, password,
                        models_dirs, models_dirs_n, store_path,
                        api_key, api_key_secret, warmup, &ran);

@@ -10,14 +10,101 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
 #include "h3v.h"
+#include "h3v_internal.h"
 #include "cwick.h"
 
 int main(int argc, char **argv) {
     /* Match the server's `--backend metal` when asked; the probe otherwise
      * inherits the CPU/autotune default because no CLI flag is parsed here. */
     if (getenv("H3VPROBE_METAL")) cwick_metal_force(1);
+    if (argc == 7 && strcmp(argv[1], "--vae-roundtrip") == 0) {
+        int w = atoi(argv[4]), h = atoi(argv[5]);
+        if (w <= 0 || h <= 0 || w % 16 || h % 16) {
+            fprintf(stderr, "RGB dimensions must be positive multiples of 16\n");
+            return 2;
+        }
+        FILE *rf = fopen(argv[3], "rb");
+        unsigned char *rgb = (unsigned char *)malloc((size_t)w * h * 3);
+        if (!rf || !rgb || fread(rgb, 1, (size_t)w * h * 3, rf) != (size_t)w * h * 3) {
+            fprintf(stderr, "cannot read RGB24 %s\n", argv[3]);
+            if (rf) fclose(rf);
+            free(rgb);
+            return 4;
+        }
+        fclose(rf);
+        cwick_error e;
+        cwick_error_clear(&e);
+        h3v_model *m = h3v_model_open(argv[2], &e);
+        if (!m) {
+            fprintf(stderr, "open failed: %s\n", cwick_error_message(&e));
+            free(rgb);
+            return 1;
+        }
+        double t0 = (double)cwick_prof_ns() / 1e6;
+        float *lat = h3v_vae_encode(m, rgb, w, h, &e);
+        double t1 = (double)cwick_prof_ns() / 1e6;
+        unsigned char *out = lat ? h3v_vae_decode(m, lat, 1, h / 16, w / 16,
+                                                   NULL, NULL, &e) : NULL;
+        double t2 = (double)cwick_prof_ns() / 1e6;
+        FILE *pf = out ? fopen(argv[6], "wb") : NULL;
+        if (pf) {
+            fwrite(out, 1, (size_t)w * h * 3, pf);
+            fclose(pf);
+        }
+        printf("vae-roundtrip %dx%d encode=%.1f ms decode=%.1f ms rgb=%zu bytes\n",
+               w, h, t1 - t0, t2 - t1, (size_t)w * h * 3);
+        free(out); free(lat); free(rgb);
+        h3v_model_close(m);
+        return pf ? 0 : 3;
+    }
+    if (argc == 6 && strcmp(argv[1], "--audio-decode") == 0) {
+        int64_t t = atoll(argv[4]);
+        if (t < 2 || (t & 1)) {
+            fprintf(stderr, "audio latent length must be a positive even number\n");
+            return 2;
+        }
+        FILE *lf = fopen(argv[3], "rb");
+        float *z = (float *)malloc((size_t)32 * t * sizeof(float));
+        if (!lf || !z || fread(z, sizeof(float), (size_t)32 * t, lf) != (size_t)32 * t) {
+            fprintf(stderr, "cannot read audio latent %s\n", argv[3]);
+            if (lf) fclose(lf);
+            free(z);
+            return 4;
+        }
+        fclose(lf);
+        cwick_error e;
+        cwick_error_clear(&e);
+        h3v_model *m = h3v_model_open(argv[2], &e);
+        if (!m) {
+            fprintf(stderr, "open failed: %s\n", cwick_error_message(&e));
+            free(z);
+            return 1;
+        }
+        int64_t samples = 0;
+        double t0 = (double)cwick_prof_ns() / 1e6;
+        float *pcm = h3v_audio_decode(m, z, t, &samples, NULL, NULL, &e);
+        double t1 = (double)cwick_prof_ns() / 1e6;
+        FILE *pf = pcm ? fopen(argv[5], "wb") : NULL;
+        if (pf) {
+            fwrite(pcm, sizeof(float), (size_t)samples * 2, pf);
+            fclose(pf);
+        }
+        double ss = 0.0, peak = 0.0;
+        for (int64_t i = 0; pcm && i < samples * 2; i++) {
+            ss += (double)pcm[i] * pcm[i];
+            if (fabs(pcm[i]) > peak) peak = fabs(pcm[i]);
+        }
+        printf("audio-decode tokens=%lld samples=%lld rms=%.6f peak=%.6f decode=%.1f ms\n",
+               (long long)t, (long long)samples,
+               samples ? sqrt(ss / (double)(samples * 2)) : 0.0, peak, t1 - t0);
+        free(pcm); free(z);
+        h3v_model_close(m);
+        return pf ? 0 : 3;
+    }
     if (argc < 6) {
         fprintf(stderr, "usage: %s ROOT PROMPT W H SECONDS\n", argv[0]);
         return 2;

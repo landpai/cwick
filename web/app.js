@@ -524,7 +524,19 @@
       'hub.switchResident': '设为常驻', 'hub.switchImage': '切换到图像模型',
       'hub.kindImage': '图像模型', 'hub.huge': '超大权重',
       'hub.switchVideo': '切换到视频模型', 'hub.kindVideo': '视频模型',
-      'set.videoTip': '视频管线独占常驻槽位：热切换会先释放文本/语音/图像权重，因为采样阶段要映射 62 GiB  transformer'
+      'hub.switchMusic': '切换到音乐模型', 'hub.kindMusic': '音乐模型',
+      'set.videoTip': '视频管线独占常驻槽位：热切换会先释放文本/语音/图像权重，因为采样阶段要映射 62 GiB  transformer',
+      'set.music': '音乐模型', 'set.musicIdle': '未加载', 'set.musicReady': '已加载',
+      'set.musicDir': '模型目录', 'set.musicEndpoints': '接口',
+      'set.musicTip': 'MiniMax-Music3 使用独立常驻槽位；生成或切换前会释放文本、语音、图像和视频权重',
+      'set.musicLoad': '加载 / 切换到音乐模型',
+      'set.noMusic': '未配置音乐目录：启动时加 --music DIR，或设置 CWICK_MUSIC_MODEL',
+      'set.musicSwitching': '正在热加载音乐模型…',
+      'set.musicOk': '✓ 音乐模型已就绪，可调用 POST /v1/generate',
+      'set.musicFail': '✗ 音乐模型加载失败：',
+      'set.musicJob': '当前 / 最近任务', 'set.musicPhase': '阶段',
+      'set.musicNoJobs': '尚无音乐生成任务',
+      'set.musicWav': '打开 / 下载 WAV'
     },
     en: {
       'doc.title': 'cwick · Local Chat',
@@ -581,7 +593,19 @@
       'hub.switchResident': 'Make resident', 'hub.switchImage': 'Switch to image model',
       'hub.kindImage': 'Image model', 'hub.huge': 'Huge weights',
       'hub.switchVideo': 'Switch to video model', 'hub.kindVideo': 'Video model',
-      'set.videoTip': 'The video pipeline owns the resident slot: a hot switch releases the text/voice/image weights first, because sampling maps the 62 GiB transformer'
+      'hub.switchMusic': 'Switch to music model', 'hub.kindMusic': 'Music model',
+      'set.videoTip': 'The video pipeline owns the resident slot: a hot switch releases the text/voice/image weights first, because sampling maps the 62 GiB transformer',
+      'set.music': 'Music model', 'set.musicIdle': 'Not loaded', 'set.musicReady': 'Loaded',
+      'set.musicDir': 'Model directory', 'set.musicEndpoints': 'Endpoints',
+      'set.musicTip': 'MiniMax-Music3 owns a resident slot; generation or switching releases text, voice, image, and video weights first',
+      'set.musicLoad': 'Load / switch to music model',
+      'set.noMusic': 'No music directory configured: pass --music DIR at startup, or set CWICK_MUSIC_MODEL',
+      'set.musicSwitching': 'Hot-loading the music model…',
+      'set.musicOk': '✓ Music model ready; call POST /v1/generate',
+      'set.musicFail': 'Failed to load the music model: ',
+      'set.musicJob': 'Current / latest job', 'set.musicPhase': 'Phase',
+      'set.musicNoJobs': 'No music generation jobs yet',
+      'set.musicWav': 'Open / download WAV'
     }
   };
   function t(key) {
@@ -3250,6 +3274,7 @@
        * stays usable against a binary that has not been rebuilt yet. */
       var supported = cw.supported !== false;
       var why = cw.unsupported_reason || '该模型架构没有对应的推理内核';
+      var kind = cw.kind || '';
       var row = document.createElement('div');
       row.className = 'model-row' + (loaded ? ' is-loaded' : '');
       row.dataset.id = m.id;
@@ -3260,6 +3285,8 @@
             esc(cw.root || '') + '</div>' +
         '</div><div class="mr-side">' +
           (loaded ? '<span class="tag-loaded">常驻</span>' : '') +
+          (kind === 'music' ? '<span class="hub-badge info">' +
+            t('hub.kindMusic') + '</span>' : '') +
           (supported ? '' : '<span class="hub-badge warn" title="' +
             esc(why) + '">不支持</span>') +
           '<button class="btn-switch" type="button"' +
@@ -3341,6 +3368,123 @@
     await loadImageModelStatus();
   }
 
+  var musicPoll = 0, musicPollBusy = false;
+
+  function musicNote(text, cls) {
+    var n = $('musicNote');
+    if (!n) return;
+    n.hidden = !text;
+    n.className = 'note' + (cls ? ' ' + cls : '');
+    n.textContent = text || '';
+  }
+
+  function renderMusicJob(jobs) {
+    var list = (jobs || []).slice();
+    var active = list.filter(function (j) {
+      return j.status === 'queued' || j.status === 'in_progress';
+    })[0];
+    list.sort(function (a, b) {
+      var d = (Number(b.created_at) || 0) - (Number(a.created_at) || 0);
+      if (d) return d;
+      var as = String(a.id || '').split('_').pop();
+      var bs = String(b.id || '').split('_').pop();
+      return (Number(bs) || 0) - (Number(as) || 0);
+    });
+    var j = active || list[0];
+    if (!j) {
+      $('musicJobId').textContent = '—';
+      $('musicJobPhase').textContent = '—';
+      $('musicJobProgress').textContent = '0%';
+      $('musicJobBar').style.width = '0%';
+      $('musicWavLink').hidden = true;
+      $('musicWavLink').removeAttribute('href');
+      return;
+    }
+    var pct = Math.max(0, Math.min(100, Math.round((Number(j.progress) || 0) * 100)));
+    $('musicJobId').textContent = j.id || '—';
+    $('musicJobPhase').textContent = (j.status || '') + (j.phase ? ' · ' + j.phase : '');
+    $('musicJobProgress').textContent = pct + '%';
+    $('musicJobBar').style.width = pct + '%';
+    $('musicJobBar').classList.toggle('green', j.status === 'completed');
+    $('musicJobBar').classList.toggle('warn', j.status === 'failed' || j.status === 'cancelled');
+    var wav = $('musicWavLink');
+    if (j.content_url) {
+      wav.href = j.content_url;
+      wav.hidden = false;
+    } else {
+      wav.hidden = true;
+      wav.removeAttribute('href');
+    }
+    if (j.error && j.error.message) musicNote(j.error.message, 'bad');
+  }
+
+  async function loadMusicStatus() {
+    if (!$('musicStatePill') || musicPollBusy) return;
+    musicPollBusy = true;
+    try {
+      var results = await Promise.all([
+        fetch('/v1/config', { cache: 'no-store' }),
+        fetch('/v1/generate', { cache: 'no-store' })
+      ]);
+      if (authRedirect(results[0]) || authRedirect(results[1])) return;
+      var config = results[0].ok ? await results[0].json() : {};
+      var music = config.music_model || {};
+      var dir = music.dir || '';
+      var loaded = !!music.loaded;
+      $('musicDir').textContent = dir || '—';
+      $('musicStatePill').textContent = t(loaded ? 'set.musicReady' : 'set.musicIdle');
+      $('musicStatePill').classList.toggle('is-ready', loaded);
+      var btn = $('musicSwitchBtn');
+      if (btn) {
+        btn.disabled = !dir;
+        btn.textContent = t(loaded ? 'set.musicReady' : 'set.musicLoad');
+      }
+      if (!dir) musicNote(t('set.noMusic'), '');
+      if (results[1].ok) {
+        var jobs = await results[1].json();
+        renderMusicJob(jobs.data || []);
+      }
+    } catch (e) {
+      /* The rest of settings remains useful if music is unavailable. */
+    } finally {
+      musicPollBusy = false;
+    }
+  }
+
+  function musicStartPolling() {
+    musicStopPolling();
+    loadMusicStatus();
+    musicPoll = window.setInterval(loadMusicStatus, 2000);
+  }
+  function musicStopPolling() {
+    if (musicPoll) window.clearInterval(musicPoll);
+    musicPoll = 0;
+  }
+
+  async function switchMusicModel() {
+    var btn = $('musicSwitchBtn');
+    musicNote(t('set.musicSwitching'), '');
+    if (btn) btn.disabled = true;
+    try {
+      var res = await fetch('/v1/models/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'MiniMax-Music3' })
+      });
+      if (authRedirect(res)) return;
+      var j = {};
+      try { j = await res.json(); } catch (e) {}
+      var detail = (j.error && j.error.message) || j.detail || ('HTTP ' + res.status);
+      if (res.ok) musicNote(t('set.musicOk') + ' (' + detail + ')', 'ok');
+      else musicNote(t('set.musicFail') + detail, 'bad');
+      setStatus(res.ok ? 'MiniMax-Music3' : 'HTTP ' + res.status);
+    } catch (e) {
+      musicNote(t('set.musicFail') + (e && e.message ? e.message : e), 'bad');
+    }
+    await loadMusicStatus();
+    await loadModelList();
+  }
+
   async function loadSettings() {
     try {
       var rc = await fetch('/v1/config', { cache: 'no-store' });
@@ -3351,6 +3495,7 @@
     }
     await loadModelList();
     await loadImageModelStatus();
+    await loadMusicStatus();
     await loadAuthState();
     await loadKeys();
   }
@@ -3442,6 +3587,7 @@
       var supported = m.supported !== false;
       var image = m.kind === 'image';
       var video = m.kind === 'video';
+      var music = m.kind === 'music';
       var served = m.served_id || m.id;
       var why = m.unsupported_reason || t('hub.archMismatch');
       return '<div class="hub-card ' + (ready ? 'is-ready' : 'is-partial') + '">' +
@@ -3452,6 +3598,8 @@
             '">' + t('hub.kindImage') + '</span>' : '') +
           (video ? '<span class="hub-badge info" title="' + esc(t('set.videoTip')) +
             '">' + t('hub.kindVideo') + '</span>' : '') +
+          (music ? '<span class="hub-badge info" title="' + esc(t('set.musicTip')) +
+            '">' + t('hub.kindMusic') + '</span>' : '') +
           (ready && !supported
             ? '<span class="hub-badge warn" title="' + esc(why) + '">' +
               t('hub.unsupported') + '</span>' : '') +
@@ -3469,9 +3617,10 @@
           (ready && supported
             ? '<button class="min-btn accent" type="button" data-hub-switch="' +
               esc(served) + '"' + (image ? ' title="' + esc(t('set.imageTip')) + '"' :
-                video ? ' title="' + esc(t('set.videoTip')) + '"' : '') +
+                video ? ' title="' + esc(t('set.videoTip')) + '"' :
+                music ? ' title="' + esc(t('set.musicTip')) + '"' : '') +
               '>' + t(image ? 'hub.switchImage' : video ? 'hub.switchVideo' :
-                'hub.switchResident') + '</button>'
+                music ? 'hub.switchMusic' : 'hub.switchResident') + '</button>'
             : (ready ? '<span class="hub-badge info" title="' + esc(why) +
                 '">' + t('hub.archMismatch') + '</span>' : '')) +
           '<button class="min-btn danger" type="button" data-hub-delete="' +
@@ -3714,6 +3863,8 @@
       await loadModel();
       await hubLoadLocal();
       if (local && local.kind === 'image') await loadImageModelStatus();
+      if (local && local.kind === 'music') await loadMusicStatus();
+      await loadModelList();
     } catch (e) {
       hubLocalNote('✗ 切换失败：' + (e && e.message ? e.message : e), true);
     }
@@ -3752,6 +3903,9 @@
     if (v === 'logs') startLogs(); else stopLogs();
     if (v === 'settings') {
       loadSettings(); loadMetrics(true); trendDrawAll(); pmDrawAll();
+      musicStartPolling();
+    } else {
+      musicStopPolling();
     }
 
     /* Deep-linkable: #logs / #settings open straight onto that tab. */
@@ -3884,6 +4038,10 @@
     }
     var imgBtn = $('imageSwitchBtn');
     if (imgBtn) imgBtn.addEventListener('click', switchImageModel);
+    var musicBtn = $('musicSwitchBtn');
+    if (musicBtn) musicBtn.addEventListener('click', switchMusicModel);
+    var musicRefreshBtn = $('musicRefreshBtn');
+    if (musicRefreshBtn) musicRefreshBtn.addEventListener('click', loadMusicStatus);
 
     $('apiSel').addEventListener('change', function () {
       state.prefs.api = normalizeApi(this.value);

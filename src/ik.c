@@ -1456,6 +1456,22 @@ int ik_model_open(ik_model *m, const char *root, int64_t cap, cwick_error *err) 
     }
     CWICK_INFO("ik", "wired %.2f GiB weights + %.2f GiB inference state",
                cwick_gib(total), cwick_gib((double)cache_bytes));
+    /* The shared Metal device builds its pipelines on first use: ~20 ms with a
+     * warm driver shader cache, the full MSL compile on a cold one. Doing it
+     * here keeps that off the first request's time-to-first-token. It is not a
+     * large win and it is not the ~1 s a short first request shows -- measured
+     * 14- and 18-token prefills cost 0.83-0.96 s whether this call sits inside
+     * the request or ahead of it, so that second is prefill, not pipeline
+     * setup. */
+    if (ik_gpu_enabled()) (void)h3v_gpu_on();
+    /* This backend has no streaming plan, so nothing else publishes these
+     * gauges: without them /v1/metrics reports a resident 18 GiB model as 0. */
+    uint64_t host = cwick_host_memory_bytes();
+    if (host)
+        cwick_metrics_set_memory_ceiling(
+            (uint64_t)((double)host * CWICK_MEM_DEFAULT_FRACTION));
+    cwick_metrics_set_model_residency((uint64_t)total, (uint64_t)total,
+                                      (uint64_t)(total + cache_bytes), 1);
     m->pos = 0;
 
     int64_t nswa = 0, nnv = 0, nmx = 0;

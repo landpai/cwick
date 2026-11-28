@@ -10,7 +10,7 @@
 
 名字就是画面：灯芯是让一大块蜡持续燃烧的那根细线。这里的"蜡"是 SSD 上 18–475 GiB 的权重库，"灯芯"是每个 token 真正过总线的那几 GB。
 
-目前端到端支持八个 checkpoint——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。五个是文本模型，一个生成图像，一个生成视频，一个是全双工语音模型：
+目前端到端支持十个 checkpoint——不是一份设计上封闭的清单，但每一个都需要自己的加载器、反量化、模板渲染与内核。五个是文本模型，一个生成图像，一个生成视频，一个生成音乐，一个理解源音频，一个是全双工语音模型：
 
 | 模型 | 磁盘占用 | 结构 | 为什么收它 |
 | --- | --- | --- | --- |
@@ -21,9 +21,10 @@
 | **Inkling-2-Mini** | ≈18.18 GiB，1 分片 | 24 个存储层，循环核心执行 3 轮，128 专家 top-8，NVFP4/MXFP8 + 视觉塔 | 完整文本+图像理解，打包专家以 18.19 GiB 常驻 |
 | **MiniMax-H3-Image** | ≈190 GiB，两棵树 | Qwen3-VL 条件器 → 50 层 DiT → 分块 ViT VAE | 文生图与图像编辑，走 OpenAI 图像接口 |
 | **MiniMax-H3** | ≈72 GiB 常驻（Ref2VA 子集） | 50 层 DiT（hidden 5376，24 个视频 latent）→ 分块视频 VAE + 音频 VAE → mp4 | 文生视频与参考图生视频，走异步 `/v1/videos` 任务接口 |
+| **MiniMax-Music3** | ≈27.01 GiB wired | Qwen3 global LM → RVQ depth decoder → flow DiT → Flow-VAE → 32 kHz stereo | 文生音乐与参考 latent 翻唱，走异步 `/v1/generate` 任务接口 |
 | **Sophon-Realtime-32B-Tag** | ≈42 GiB | 64 层 FP8 thinker → talker → flow + HiFT，24 kHz | 全双工语音走 WebSocket，同一轮里边听边说 |
 
-八个管线共用一条铁律：**任何时刻只常驻一个模型**。图像、视频与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
+九个管线共用一条铁律：**任何时刻只常驻一个模型**。图像、视频、音乐与语音管线和文本后端走同一个 `/v1/models/switch` 热切换，切换前先释放上一个管线。文本模型的质量铁律不可协商，且在加载期强制：**top-k 就是模型自己的 `num_experts_per_token`**（从不降低），专家从不剪枝，embedding 从不共享，分片缺失时直接失败，而不是悄悄跑一个小一点的模型。
 
 # 目录
 
@@ -34,12 +35,13 @@
 - [快速开始](#快速开始)
 - [用法](#用法)
   - [用 Inkling-2-Mini 理解文本与图像](#用-inkling-2-mini-理解文本与图像)
+  - [音乐生成 MiniMax-Music3](#音乐生成-minimax-music3)
 - [配置](#配置)
 - [API](#api)
 - [模型、上下文与内存](#模型上下文与内存)
 - [长 prompt 与前缀缓存](#长-prompt-与前缀缓存)
 - [思考、流式与工具](#思考流式与工具)
-- [图像、视频与语音管线](#图像视频与语音管线)
+- [图像、视频、音乐与语音管线](#图像视频音乐与语音管线)
 - [速度](#速度)
 - [验证](#验证)
 - [详细文档](#详细文档)
@@ -99,6 +101,7 @@
         │              └── Inkling-2-Mini : ik.c  ik_engine.c  ik_prompt.c  ik_vision.c
         ├── /v1/images/{generations,edits} ──► h3.c ──► 文本编码 → DiT → 分块 VAE
         ├── /v1/videos ──► h3v.c ──► 文本编码 → Ref2VA DiT → 分块视频 VAE + 音频 VAE → mp4
+        ├── /v1/generate ──► music.c ──► global LM → RVQ depth → flow DiT → Flow-VAE → WAV
         ├── /v1/realtime（WebSocket）──► ws.c + rt_realtime.c ──► VAD + 会话状态
         │        └── rt_audio.c → rt_thinker.c → rt_talker.c → rt_flow.c → rt_hift.c
         ├── /v1/systemone ──► jev.c ──► 一次 prefill，读答案位置的分布
@@ -119,14 +122,14 @@
 - **语言与依赖**：C11，外加几个 Objective-C 文件做 Metal 桥。链接的只有 macOS 系统框架——Accelerate、Metal、CoreImage、ImageIO、CoreGraphics——以及系统自带的 `sqlite3`。没有 Python，没有 BLAS，没有运行期转换步骤。语音的 `.pt` 张量由一个纯 C 的 zip/pickle 读取器（`rt_torch.c`）就地读取，任何 checkpoint 都不做格式转换。
 - **一个二进制，四个子命令**：`setup`（生成合成验证模型）、`run`（单条 prompt，或多条一起批解码）、`serve`（API 服务）、`doctor`（读一遍常驻字节并打印内存计划）。
 - **web 控制台是编译进去的**（`src/webui_embed.c`），所以 `--web` 不需要磁盘上的静态资源，也没有第二个进程；应用是 `apps/` 下的文件，由同一个服务端托管，状态进 sqlite。
-- **八个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像、视频或语音模型会先释放文本引擎，切回来再释放它。
+- **十个管线共用一条铁律：同一时刻只常驻一个模型。** 这是带宽决定，不是缺功能：两次生成会互相腰斩缓存。切到图像、视频、音乐或语音模型会先释放文本引擎，切回来再释放它。
 
 ## 快速开始
 
 ### 0. 前置条件
 
 - Apple Silicon 上的 macOS，以及 `clang`。别的都不要——内存设计点见[支持的硬件](#支持的硬件)。
-- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5 或 Inkling-2-Mini）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，视频模型常驻 ≈72 GiB（Ref2VA 子集，完整目录含两个分区），语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
+- 一个 checkpoint：文本模型要 ≈18 GiB（Qwen3.5 或 Inkling-2-Mini）、≈233 GiB（MiniMax）、≈306 GiB（GLM）或 ≈475 GiB（DeepSeek）的空闲 SSD；图像模型 ≈190 GiB，视频模型常驻 ≈72 GiB（Ref2VA 子集，完整目录含两个分区），音乐模型 ≈27.01 GiB wired，语音模型 ≈42 GiB。全部按发布原样下载，没有转换步骤。
 
 ### 1. 构建与测试
 
@@ -177,7 +180,7 @@ sh ./start.sh qwen3.5-9b       # Qwen3.5-9B，128K 上下文（稠密 BF16，18 
 Qwen3.5 这个 checkpoint 对客户端暴露的名字是
 `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic`——请求 `model` 字段填它，`GET /v1/models` 也报它。它内部的 `model_type` 标签（`qwen3_5` / `qwen3_5_text`）只用于选择内核，为兼容起见仍被接受，但不再是展示名。
 
-`start.sh` 同时传了 `--rt`、`--img` 和 `--videos`，注册语音、图像与视频管线。`POST /v1/images/...` 与 `POST /v1/videos` 首次调用时会通过同一个单模型切换闸门加载自己的管线；也可以从设置面板（或 `POST /v1/models/switch`）显式切换。`/v1/realtime` 仍需先切到 `Sophon-Realtime-32B-Tag`。另一种管线常驻或忙时这些接口返回 503——详见[图像、视频与语音管线](#图像视频与语音管线)。
+`start.sh` 同时传了 `--rt`、`--img`、`--videos` 和 `--music`，注册语音、图像、视频与音乐管线。`POST /v1/images/...`、`POST /v1/videos` 与 `POST /v1/generate` 首次调用时会通过同一个单模型切换闸门加载自己的管线；也可以从设置面板（或 `POST /v1/models/switch`）显式切换。`/v1/realtime` 仍需先切到 `Sophon-Realtime-32B-Tag`。另一种管线常驻或忙时这些接口返回 503——详见[图像、视频、音乐与语音管线](#图像视频音乐与语音管线)。
 
 `start.sh` 是推荐的入口：它打开了前缀缓存、web 控制台、局域网共享、模型目录和密码——这些一项一项都容易忘。不用脚本时，同一个服务是：
 
@@ -269,6 +272,35 @@ NVFP4/MXFP8 打包专家保持常驻（18.19 GiB wired）；图像 prefill 只�
 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)，数值策略理由见
 [docs/DECISIONS.zh-CN.md](docs/DECISIONS.zh-CN.md) §118。
 
+### 音乐生成 MiniMax-Music3
+
+用 `--music DIR`（或 `CWICK_MUSIC_MODEL`）注册 Music3 checkpoint。它与文本、图像、视频和语音共用同一个单模型槽位：首个有效的 `/v1/generate` 请求会先释放旧管线，再映射并 wire ≈27.01 GiB 的音乐模型，随后在工作线程上运行任务。
+
+```sh
+./cwick serve --root ./models/thinkingmachines/Inkling-2-Mini \
+  --backend metal --context 32768 --port 8001 --web \
+  --music ./models/MiniMaxAI/MiniMax-Music3
+```
+
+`POST /v1/generate` 接受 `prompt`、`lyrics`、`duration`/`seconds`、`steps`、`seed`、`cfg_scale`、`temperature`、`top_k`，也接受 Suno 风格的 `style`、`title`、`customMode`、`instrumental` 与 `audioWeight`。`customMode:true` 时 `style` 作为音乐描述，`lyrics`（或 `prompt`）作为演唱文本；`instrumental:true` 强制走纯音乐指令。`style` 上限 4000 字节，应当写成含 Global Metadata / Vocal Details / Arrangement 三段的英文 Structured Caption：主唱要求写在 Vocal Details 里。只给 `warm acoustic pop, 96 BPM` 这样的标签列表接口也会接受，但模型没有拿到人声契约，通常返回纯音乐。响应为 HTTP 200，外层是 `{code,msg,data:{taskId}}`，`data` 同时带本地任务字段：
+
+```sh
+curl -s http://127.0.0.1:8001/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MiniMax-Music3","customMode":true,"instrumental":false,
+       "style":"warm acoustic pop, 96 BPM","title":"Morning Light",
+       "lyrics":"[Verse]\nMorning light\n[Chorus]\nSoftly we breathe",
+       "duration":20,"steps":30,"seed":7,"audioWeight":0.85}'
+```
+
+```json
+{"code":200,"msg":"success","data":{"taskId":"music_12_1"}}
+```
+
+把 `data.taskId` 记为 `TASK_ID`，轮询 `GET http://127.0.0.1:8001/v1/generate/$TASK_ID`（Suno 风格别名是 `GET /v1/generate/record-generation?id=$TASK_ID`）；`status` 变为 `completed` 后，从 `GET http://127.0.0.1:8001/v1/generate/$TASK_ID/content` 下载 **32 kHz、16-bit、立体声 WAV**。任务详情含 `stage_history`、`timing`、输出字节数/时长与 `content_url`；stdout 会逐阶段记录 load、tokenize、reference encode、global LM、depth、condition、flow、vocoder 与 WAV。
+
+翻唱模式使用 `task:"cover"`，参考音频可放在 `audio`、`reference_audio` 或 `uploadUrl`，值必须是 WAV 的 base64 或 data URL；也可用 `POST /v1/generate/upload-cover` 别名。已完成的本地任务可用 `taskId` + `audioId` 复用（两者都是本地任务 id）。Music3 是生成模型而非音轨分离模型：cover 路径先用 Flow-VAE encoder 编码参考音频，生成新 latent，再按 `audioWeight` 混回参考 latent（默认 `0.85`，`1.0` 最接近重建）。**不支持远程 HTTP `uploadUrl` 与 callbacks**，也不静默忽略这些 Suno 专属控件。
+
 ### 日志与指标
 
 服务端把每条诊断打到 **stdout**，一事件一行，带墙上时间，请求在飞时还带请求号，所以并发日志照样能 grep：
@@ -284,7 +316,7 @@ decode 行会说明自己在数哪一段：`decode(thinking)`、`decode(content)
 
 `--verbose` 增加每步细节和内存预算；`--trace` 还会打印渲染后的 prompt、输出和每次工具调用（默认关闭：它会把用户内容打到 stdout）。`Ctrl+C` 任何时候都能干净停下——生成中则在下一个 token 处中断，在飞请求得到 503，快照落盘，最后一行会说明。
 
-`/v1/metrics` 用 vLLM 兼容的命名发布同一份状态，可以被抓取，也可以直接在**设置**标签页里看。视频任务额外发布 `cwick:video_stage_seconds_total{stage=...}`（text、pack、encode、dit、vae、audio_vae、mux、load、total）、用于实时采样进度条的 `cwick:video_dit_steps_done` / `_total`、任务/帧/字节计数器以及 `cwick:video_last_total_seconds`。`encode` 阶段是参考图的视觉 VAE 编码，纯文本任务保持为零。完成的任务在 `GET /v1/videos/{id}` 的 `cwick` 对象里返回同样的分阶段数据，其中 `encode_ms` 对应首帧条件注入。DiT 与视觉 VAE 也支持 `--backend metal`（BF16 / F32 张量核 GEMM 加分块注意力）；`CWICK_H3V_GPU=0` 可强制 CPU 路径做 A/B 对比。
+`/v1/metrics` 用 vLLM 兼容的命名发布同一份状态，可以被抓取，也可以直接在**设置**标签页里看。视频任务额外发布 `cwick:video_stage_seconds_total{stage=...}`（text、pack、encode、dit、vae、audio_vae、mux、load、total）、用于实时采样进度条的 `cwick:video_dit_steps_done` / `_total`、任务/帧/字节计数器以及 `cwick:video_last_total_seconds`。`encode` 阶段是参考图的视觉 VAE 编码，纯文本任务保持为零。完成的任务在 `GET /v1/videos/{id}` 的 `cwick` 对象里返回同样的分阶段数据，其中 `encode_ms` 对应首帧条件注入。DiT 与视觉 VAE 也支持 `--backend metal`（BF16 / F32 张量核 GEMM 加分块注意力）；`CWICK_H3V_GPU=0` 可强制 CPU 路径做 A/B 对比。音乐任务发布 `cwick:music_*` 阶段与输出指标，并用 `cwick:music_jobs_ended_early_total`、`cwick:music_ar_retries_total`、`cwick:music_jobs_short_total`、`cwick:music_last_duration_ratio`、最近/请求帧数与尝试次数指标和 `cwick:music_dense_lyrics_total` 暴露时长与人声密度回退。global LM 尊重自然音频结束 token，对过早结束最多重试三次，若仍不足请求帧数的 25% 则明确失败，不再强行续唱；它只投影连续的 16,389 行音频词表头，`CWICK_MUSIC_FULL_HEAD=1` 可恢复完整 200,000 行投影做 A/B 对比。global LM 每层 Q/K/V 合并为一个 Metal command buffer；`CWICK_MUSIC_LM_QKV_LEGACY=1` 可恢复分开提交。
 
 ### Web 控制台、模型库与应用市场
 
@@ -330,20 +362,26 @@ HELP/TYPE 与当前值，可按名筛选、点选任意指标（最多 4 个）�
 | `--models-dir DIR` | — | 额外列出（最多 8 个）可切换的 checkpoint，一次只加载一个 |
 | `--img DIR` | `CWICK_IMAGE_MODEL` | 图像 checkpoint 目录；提供 `POST /v1/images/generations` 与 `/v1/images/edits`，并允许按需切换到 `MiniMax-H3-Image` |
 | `--videos DIR` | `CWICK_VIDEO_MODEL` | 视频 checkpoint 目录；提供 `POST /v1/videos`、`GET /v1/videos/{id}` 与 `/content`，并允许按需切换到 `MiniMax-H3` |
+| `--music DIR` | `CWICK_MUSIC_MODEL` | MiniMax-Music3 checkpoint 目录；提供异步 `POST /v1/generate`、轮询、WAV 下载，并允许按需切换到音乐模型 |
 | `--rt DIR` | `CWICK_REALTIME_MODEL` | 语音 checkpoint 目录；提供 `/v1/realtime` WebSocket，并允许切换到 `Sophon-Realtime-32B-Tag` |
 | `--store DIR` | `~/.cwick/apps` | 每个应用一个 sqlite，外加 `auth.db` |
 
-环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_IMAGE_MODEL`、`CWICK_VIDEO_MODEL`、`CWICK_REALTIME_MODEL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。两者都设置时 `--img` / `--videos` / `--rt` 优先。视频专用开关有 `CWICK_H3V_GPU=0`（CPU 回退）、`CWICK_H3V_WIRE=0/1`（是否 wire DiT/VAE）与 `CWICK_H3V_REF_EDGE=N`（按参考图自身短边编码），完整清单见 [docs/SERVER.zh-CN.md](docs/SERVER.zh-CN.md)。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
+环境变量孪生：`CWICK_MEM_PCT`、`CWICK_MEM_MAX_GIB`、`CWICK_STORE`、`CWICK_PASSWORD`、`CWICK_API_KEY`、`CWICK_WARMUP`、`CWICK_WEB`、`CWICK_METAL`、`CWICK_IMAGE_MODEL`、`CWICK_VIDEO_MODEL`、`CWICK_MUSIC_MODEL`、`CWICK_REALTIME_MODEL`、`CWICK_SEED`（采样种子，让一次运行可复现）、`CWICK_HUB_ENDPOINT` / `HF_ENDPOINT`（**模型**标签页的目录服务地址）。两者都设置时 `--img` / `--videos` / `--music` / `--rt` 优先。视频专用开关有 `CWICK_H3V_GPU=0`（CPU 回退）、`CWICK_H3V_WIRE=0/1`（是否 wire DiT/VAE）与 `CWICK_H3V_REF_EDGE=N`（按参考图自身短边编码），完整清单见 [docs/SERVER.zh-CN.md](docs/SERVER.zh-CN.md)。在线下载一律写入 `./models`，该目录已在 `.gitignore` 中。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/models` | 常驻模型，加上 `--models-dir` / `--img` / `--videos` / `--rt` 下找到的模型；每条带 `supported` / `unsupported_reason`，图像与视频管线分别标为 `cwick.kind:"image"` / `"video"` |
+| GET | `/v1/models` | 常驻模型，加上 `--models-dir` / `--img` / `--videos` / `--music` / `--rt` 下找到的模型；每条带 `supported` / `unsupported_reason`，非文本管线带 `cwick.kind` |
 | GET | `/v1/realtime` | WebSocket 全双工语音（`?model=…`）；需要 `--rt`，base64 PCM16 入、`response.audio.delta` 出 |
-| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。`MiniMax-H3-Image` 与 `MiniMax-H3` 改为热装载图像/视频管线，不触碰文本模型 |
+| POST | `/v1/models/switch` | 先校验目标，再卸一个、映射另一个；本构建无法装载的架构返回 400（常驻模型不动），生成或排队中返回 409。图像、视频、音乐与语音管线改为热装载，不触碰文本模型 |
 | POST | `/v1/images/generations` | 由 JSON prompt 返回 `b64_json` 图像；需要 `--img` / `CWICK_IMAGE_MODEL` 或按需切换图像模型 |
 | POST | `/v1/images/edits` | `multipart/form-data`，`image` 字段可重复；返回同样的图像响应 |
+| POST | `/v1/generate` | 接收 MiniMax-Music3 文生音乐或 `task:"cover"` 任务；返回 Suno 风格 `code/msg/data.taskId` 外层与本地任务字段 |
+| GET | `/v1/generate/{id}` | 任务状态、阶段历史、全链路计时与输出元数据 |
+| GET | `/v1/generate/{id}/content` | 下载完成的 32 kHz、16-bit、立体声 WAV |
+| POST | `/v1/generate/upload-cover` | 翻唱别名；`uploadUrl` 接受本地 WAV 的 base64/data URL，或已完成的本地 `taskId` + `audioId` |
+| GET | `/v1/generate/record-generation?id=…` | Suno 风格的本地任务轮询别名 |
 | POST | `/v1/videos` | 异步视频任务；JSON 传 `prompt`、`size`（`WxH`，每轴 256–2560、32 的倍数）、`seconds`、可选 `steps`（1–30，0 = 30 步）与 `image`（base64/data URL 参考图）；只有 `variant:"Ref2VA"`；需要 `--videos` / `CWICK_VIDEO_MODEL` |
 | GET | `/v1/videos/{id}` | 轮询任务：`status`、`progress`、`phase`、`steps_done` / `steps_total`；完成后带 `cwick` 对象，含逐阶段计时、`spatial_corr`、`snr_db`、`suspect_noise` |
 | GET | `/v1/videos/{id}/content` | 流式返回完成的 mp4 |
@@ -475,9 +513,9 @@ Agent 会话每轮都重发同一段几千 token 的系统提示。重新 prefil
 
 **流式工具调用在生成过程中就可见**：模型一写出函数名，三个方言就各自用空的 `arguments` 开启调用，随后追加参数增量（chat 是 `delta.tool_calls[].function.arguments`、Responses 是 `response.function_call_arguments.delta`、Messages 是 `input_json_delta`）。增量会继续落在**参数值内部**，因此「一个很长参数」的工具调用（一段 shell 脚本、一个文件正文）是逐段填充的，而不是最后整体出现。增量拼接结果与最终 payload 逐字节一致；私有进度字段 `delta.cwick_tool` 仍发给内置控制台。实测与结算规则见 DECISIONS §58、§59。
 
-## 图像、视频与语音管线
+## 图像、视频、音乐与语音管线
 
-另外两个 checkpoint 走各自的接口。它们和文本模型一样是**单模型常驻**：切过去会先释放文本引擎，切回来再释放它。`--img DIR` / `--rt DIR`（或 `CWICK_IMAGE_MODEL` / `CWICK_REALTIME_MODEL`）把它们注册成切换目标，`start.sh` 两个都传了。另一种管线常驻时访问这个接口会返回 503。
+另外四个 checkpoint 走各自的接口。它们和文本模型一样是**单模型常驻**：切过去会先释放文本引擎，切回来再释放它。`--img DIR` / `--videos DIR` / `--music DIR` / `--rt DIR`（或 `CWICK_IMAGE_MODEL` / `CWICK_VIDEO_MODEL` / `CWICK_MUSIC_MODEL` / `CWICK_REALTIME_MODEL`）把它们注册成切换目标，`start.sh` 都传了。另一种管线常驻时访问这些接口会返回 503。
 
 **图像**——`POST /v1/images/generations` 收 JSON prompt，返回 `{"created":…,"data":[{"b64_json":"…"}]}`；`POST /v1/images/edits` 是 `multipart/form-data`，`image` 字段可重复，响应形状相同。`MiniMax-H3-Image` 跑一个 Qwen3-VL 条件器、一个 50 层 DiT 和一个分块 ViT VAE 解码器。两条权重规则要紧：这个 checkpoint 只在约 4 MP 以上才出干净图，所以任何请求都渲染在 2048² 画布上再 Lanczos 缩回请求尺寸（512² 的开销和 2048² 相同）；VAE 必须按 256 px 分块、带重叠与交叉淡入解码，整张一次解会出可见网格。两个响应都带逐阶段的 `cwick` 计时对象，每个阶段发生时都打一行带时间戳的 `[image]` stdout 日志。参数限制（6 步、`guidance_scale: 1`、只支持 `b64_json`）与完整数值对齐在 [docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md)。
 
@@ -524,7 +562,7 @@ curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
 | Inkling-2-Mini | 文本决策，3 题 / 550 token | 20.92 s | **26.3** | 无 decode |
 | Inkling-2-Mini | 图像决策，1 题 / 233 token | 32.81 s | **7.1** | `corn` p=0.999928，无 decode |
 
-三个非文本管线有自己的单位——一张图、一段 mp4 或一句话，不是 token 速率。都在同一台 M3 Max 上测得：
+四个非文本管线有自己的单位——一张图、一段 mp4、一首音乐或一句话，不是 token 速率。都在同一台 M3 Max 上测得：
 
 | 管线 | 阶段 | 耗时 | 备注 |
 | --- | --- | --- | --- |
@@ -534,11 +572,16 @@ curl -s --noproxy '*' localhost:8001/v1/videos/$JOB/content -o clip.mp4
 | MiniMax-H3 | 视频，256²，30 步，metal | ≈2126 s | 文本 84 + DiT 60–67 s/步 ×30 + VAE 64；102 帧 / 4.25 s |
 | MiniMax-H3 | 视频，256²，4 步，metal | 597 s | DiT 441 s；`steps:2..4` 用于快速验证 |
 | MiniMax-H3 | 视频，544×960，30 步，metal | ≈11678 s | DiT 363–409 s/步——行数随画布² 增长 |
+| MiniMax-Music3 | 生成，1 s，2 步，metal | 28.60 s | load 4.45 + global LM 12.72 + depth 6.51 + flow 2.33 + vocoder 2.57 |
+| MiniMax-Music3 | 生成，1 s，2 步，紧凑词表头 + QKV 合并 | **25.63 s** | load 4.18 + global LM 9.90 + depth 6.62 + flow 2.39 + vocoder 2.50；同 seed 的 WAV 与全词表头/独立 QKV 的 A/B 逐字节一致 |
+| MiniMax-Music3 | `POST /v1/generate`，文本→音乐冷切换 | 54.60 s | 同一 1 s / 2 步冒烟任务走 HTTP；global LM 30.71 + depth 16.81 |
+| MiniMax-Music3 | 翻唱，1 s，2 步，metal | 29.73 s | 增加 1.91 s 参考编码；源音频相关度 0.9858，无削波 |
+| MiniMax-Music3 | 参考编码，6 s WAV | 11.74 s | 44.1 kHz 下 517 个 latent 帧 |
 | Sophon-Realtime-32B-Tag | 耳，8.73 s 音频 | 0.17 s | ≈52× 实时，55 个音频 embedding |
 | Sophon-Realtime-32B-Tag | 第 1 轮，冷 | 18.54 s | prefill 8.16 + decode 9.40，首音频 12.96 s，语音 4.08 s |
 | Sophon-Realtime-32B-Tag | 第 2 轮，热 | **13.22 s** | prefill 2.83 s（复用静态提示），首音频 7.67 s |
 
-语音数字是一句 8.73 s 音频的墙钟时间；decode 与 talker 合成重叠，扣掉 `talker_s` 后纯解码约 4 tok/s，prefill 约 22 tok/s。完整逐阶段表在 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md)、[docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md) 和 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)（视频 Metal A/B）。
+Music3 的数字是 1 秒、2 步的全链路冒烟基准，用于阶段记账，不是质量设置；正式请求默认 20 秒、30 步。语音数字是一句 8.73 s 音频的墙钟时间；decode 与 talker 合成重叠，扣掉 `talker_s` 后纯解码约 4 tok/s，prefill 约 22 tok/s。完整逐阶段表在 [docs/REALTIME.zh-CN.md](docs/REALTIME.zh-CN.md)、[docs/IMAGE.zh-CN.md](docs/IMAGE.zh-CN.md) 和 [docs/PERF.zh-CN.md](docs/PERF.zh-CN.md)（视频 Metal A/B）。
 
 ### 什么决定了 token 速率
 
@@ -577,9 +620,10 @@ make test        # 869 项断言：引擎、采样、前缀缓存、服务端、
 make bench       # 不加载 checkpoint 也能测内核
 make h3vgpuprobe # Metal GEMM/attention 数值探针，无需 checkpoint
 make h3vmuxprobe # mp4 容器检查：avcC、ctts、stss
+make musicprobe  # Music3 checkpoint/open/generate/encoder/vocoder 探针
 ```
 
-正确性是锚定的，不靠肉眼：固定 prompt 必须产出固定的 top-1 token id 与 logit；每个内核改动都与参考实现互检到 1e-5（fp8 分块 GEMM 实测 8.3e-6，FP4 分组核与单行核逐位相同）。Inkling 的固定算术请求返回 `4`，三种图像接口均返回 `Corn`，图像 System One 以 0.999928 返回 `corn`。`cwick doctor` 会读一遍每个常驻字节加一段专家库抽样，所以坏分片在请求之前就被发现；`/v1/metrics` 发布的就是日志里打的同一份状态。
+正确性是锚定的，不靠肉眼：固定 prompt 必须产出固定的 top-1 token id 与 logit；每个内核改动都与参考实现互检到 1e-5（fp8 分块 GEMM 实测 8.3e-6，FP4 分组核与单行核逐位相同）。Inkling 的固定算术请求返回 `4`，三种图像接口均返回 `Corn`，图像 System One 以 0.999928 返回 `corn`。Music3 的 condition encoder、DiT 与 vocoder 均和独立 PyTorch/MPS 参考互检；修复后的 Flow-VAE encoder 最大绝对误差 `5.51e-5`、相关度 `0.9999999999945`，encoder→decoder 直连重建波形相关度 `0.9998`，参考 latent 翻唱冒烟测试与源音频相关度 `0.9858` 且无削波。`cwick doctor` 会读一遍每个常驻字节加一段专家库抽样，所以坏分片在请求之前就被发现；`/v1/metrics` 发布的就是日志里打的同一份状态。
 
 ## 详细文档
 
@@ -625,6 +669,7 @@ cwick/
 │   ├── ik_*.c         Inkling-2-Mini 后端：循环 MoE、打包专家、视觉塔
 │   ├── h3*.c/.m       MiniMax-H3-Image：条件器、DiT、分块 VAE
 │   ├── h3v*.c/.m      MiniMax-H3 视频：Ref2VA DiT、时间/空间分块 VAE、mp4
+│   ├── music.c        MiniMax-Music3：global/depth LM、flow DiT、Flow-VAE
 │   ├── rt_*.c         语音：.pt 读取、音频塔、thinker、talker、flow、HiFT、VAD
 │   ├── ws.c           /v1/realtime 的 WebSocket 传输
 │   ├── metal*.c/.m    Metal 内核与零拷贝 arena

@@ -26,16 +26,12 @@ const cwick_safetensors *h3v_shards_vae(const h3v_model *m);
 const cwick_safetensors *h3v_shards_avae(const h3v_model *m);
 
 /* Reported through h3v_timing from the pipeline. */
-/* A 12-cell tile put a seam every 160 px on a multi-tile canvas; the tile's
- * local [-1,1] rope makes adjacent tiles predict the same row differently,
- * and a 2-cell cross-fade cannot hide it. Measured on a smooth-ramp round
- * trip at 736x1280: mean boundary/non-boundary gradient ratio was 4.5x (x)
- * and 5.3x (y) at 12 cells, 1.9x/6.5x at 24, and 0.0x/1.6x at 48 — with a
- * higher correlation (0.9937 vs 0.9913) and 1.75x less decode time. 48 cells
- * keeps the attention sequence small enough for an 80x46 latent while
- * leaving at most two tiles per axis on this machine's 736x1280 canvas. */
-#define H3V_VAE_TILE_CELLS   48   /* latent cells per tile edge            */
-#define H3V_VAE_TILE_OVERLAP 8    /* latent cells shared between neighbours */
+/* The released decoder config uses 256 px tiles with 64 px minimum overlap.
+ * In latent cells that is 16/4. Keeping every intermediate tile at the full
+ * size matters: a short tail tile changes the length-normalised RoPE grid and
+ * leaves a visible phase seam even when the latent itself is smooth. */
+#define H3V_VAE_TILE_CELLS   16   /* latent cells per tile edge            */
+#define H3V_VAE_TILE_OVERLAP 4    /* latent cells shared between neighbours */
 #define H3V_VAE_LATENT_CH    24
 #define H3V_VAE_PIXEL        16   /* pixels per latent cell                */
 #define H3V_VAE_FRAMES       4    /* frames per latent step                */
@@ -78,6 +74,9 @@ float *h3v_audio_decode(const h3v_model *m, const float *z, int64_t t,
  * verifies the denoise signal reads that plane, not a neighbouring channel or
  * time step. Also checks 3D pack/unpack round-trips. Returns true on success. */
 bool h3v_layout_selftest(void);
+bool h3v_vae_plan_selftest(void);
+bool h3v_audio_latnorm_selftest(void);
+bool h3v_audio_amp_selftest(void);
 
 /* Resolve the reference image's VAE-encode raster from its natural size and
  * the requested short edge. `edge` is CWICK_H3V_REF_EDGE; 0 (or a value out of

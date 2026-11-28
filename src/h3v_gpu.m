@@ -48,7 +48,7 @@ static float bf16_rn(float x) {
 }
 
 /* ---- projection kernels ------------------------------------------- */
-struct gargs { int rows, k, cols, lda, ldc; long woff; int qpart, qhd; };
+struct gargs { int rows, k, cols, lda, ldc; long woff; int qpart, qhd, accum; };
 
 /* The release shards store a fused QKV projection one head at a time as
  * [q | k | v]. Select one plane at GEMM time so no separate copy of the
@@ -82,7 +82,7 @@ static void gemm_core(device const float *A,
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (int k0 = 0; k0 < a.k; k0 += TG_K) {
-        for (int pass = 0; pass < 8; pass++) {
+        for (int pass = 0; pass < TG_M * TG_K / 128; pass++) {
             int idx = pass * 128 + lin;
             int r = idx / TG_K, c = idx % TG_K;
             int gm = m0 + r, gn = n0 + r, gk = k0 + c;
@@ -116,7 +116,10 @@ static void gemm_core(device const float *A,
         int idx = pass * 128 + lin;
         int r = idx / TG_N, c = idx % TG_N;
         int gm = m0 + r, gn = n0 + c;
-        if (gm < a.rows && gn < a.cols) C[(long)gm * a.ldc + gn] = tC[r][c];
+        if (gm < a.rows && gn < a.cols) {
+            long ci = (long)gm * a.ldc + gn;
+            C[ci] = a.accum ? C[ci] + tC[r][c] : tC[r][c];
+        }
     }
 }
 
@@ -154,13 +157,13 @@ static void gemm_core_small(device const float *A,
         for (int j = 0; j < 4; j++)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     for (int k0 = 0; k0 < a.k; k0 += TG_K) {
-        for (int pass = 0; pass < 2; pass++) {
+        for (int pass = 0; pass < TM * TG_K / 128; pass++) {
             int idx = pass * 128 + lin;
             int r = idx / TG_K, c = idx % TG_K;
             int gm = m0 + r, gk = k0 + c;
             tA[r][c] = (gm < a.rows) ? T(A[(long)gm * a.lda + gk]) : T(0.0f);
         }
-        for (int pass = 0; pass < 8; pass++) {
+        for (int pass = 0; pass < TG_M * TG_K / 128; pass++) {
             int idx = pass * 128 + lin;
             int r = idx / TG_K, c = idx % TG_K;
             int gn = n0 + r, gk = k0 + c;
@@ -189,7 +192,10 @@ static void gemm_core_small(device const float *A,
         int idx = pass * 128 + lin;
         int r = idx / TG_N, c = idx % TG_N;
         int gm = m0 + r, gn = n0 + c;
-        if (gm < a.rows && gn < a.cols) C[(long)gm * a.ldc + gn] = tC[r][c];
+        if (gm < a.rows && gn < a.cols) {
+            long ci = (long)gm * a.ldc + gn;
+            C[ci] = a.accum ? C[ci] + tC[r][c] : tC[r][c];
+        }
     }
 }
 
@@ -233,6 +239,60 @@ kernel void gemm_f32(device const float *A [[buffer(0)]],
     gemm_core<float, simdgroup_float8x8>(A, Wr, C, a, tg, lid, sgi, tC, tA, tB);
 }
 
+struct sargs { uint n, nhalf, legacy; };
+
+kernel void swiglu(device float *X [[buffer(0)]], constant sargs &a [[buffer(1)]],
+                   uint3 gp [[threadgroup_position_in_grid]],
+                   uint3 lt [[thread_position_in_threadgroup]]) {
+    uint i = gp.x * 256u + lt.x;
+    if (i >= a.n) return;
+    float g = a.legacy ? X[i + a.nhalf] : X[i];
+    float v = a.legacy ? X[i] : X[i + a.nhalf];
+    X[i] = v * (g / (1.0f + exp(-g)));
+}
+
+struct qkargs { uint seq, ld, heads, hd, rope_on, rope_mode; float eps; };
+
+kernel void qk_prep(device float *Q [[buffer(0)]],
+                    device float *K [[buffer(1)]],
+                    device const float *Wq [[buffer(2)]],
+                    device const float *Wk [[buffer(3)]],
+                    device const float *Cos [[buffer(4)]],
+                    device const float *Sin [[buffer(5)]],
+                    constant qkargs &a [[buffer(6)]],
+                    uint2 tg [[threadgroup_position_in_grid]],
+                    uint sgi [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x, h = tg.y * 8u + sgi;
+    if (row >= a.seq || h >= a.heads) return;
+    uint off = row * a.ld + h * a.hd;
+    float sq = 0.0f, sk = 0.0f;
+    for (uint d = lane; d < a.hd; d += 32u) {
+        float q = Q[off + d], k = K[off + d];
+        sq += q * q; sk += k * k;
+    }
+    sq = simd_sum(sq); sk = simd_sum(sk);
+    float iq = rsqrt(sq / (float)a.hd + a.eps);
+    float ik = rsqrt(sk / (float)a.hd + a.eps);
+    for (uint d = lane; d < a.hd; d += 32u) {
+        Q[off + d] *= iq * Wq[d];
+        K[off + d] *= ik * Wk[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.rope_on) {
+        uint roff = row * 96u;
+        for (uint p = lane; p < 48u; p += 32u) {
+            float c = Cos[roff + p], s = Sin[roff + p];
+            float qa = Q[off + p], qb = Q[off + p + 48u];
+            float ka = K[off + p], kb = K[off + p + 48u];
+            Q[off + p] = qa * c - qb * s;
+            Q[off + p + 48u] = qa * s + qb * c;
+            K[off + p] = ka * c - kb * s;
+            K[off + p + 48u] = ka * s + kb * c;
+        }
+    }
+}
+
 /* ---- attention ---------------------------------------------------- *
  * One threadgroup owns a 64-query-row block of one head. The key range is
  * walked twice: once for the row maximum, once for the exponent and the
@@ -243,7 +303,7 @@ kernel void gemm_f32(device const float *A [[buffer(0)]],
 struct aargs { int seq, ld, hoff; float scale; };
 
 template<int HD, int NF>
-static void attn_core(device const float *Q,
+static void attn_core_twopass(device const float *Q,
                       device const float *Kb,
                       device const float *Vb,
                       device float *Ob,
@@ -418,6 +478,162 @@ static void attn_core(device const float *Q,
     }
 }
 
+template<int HD, int NF>
+static void attn_core_online(device const float *Q,
+                            device const float *Kb,
+                            device const float *Vb,
+                            device float *Ob,
+                            constant aargs &a,
+                            uint2 tg,
+                            uint2 lid,
+                            uint sgi,
+                            uint slane,
+                            threadgroup bfloat (*tQ)[HD],
+                            threadgroup bfloat (*tK)[HD],
+                            threadgroup bfloat (*tV)[HD],
+                            threadgroup float (*sc)[AK],
+                            threadgroup float (*oc)[HD],
+                            threadgroup bfloat (*tP)[AK],
+                            threadgroup float *tSum,
+                            threadgroup float *tMax,
+                            threadgroup float *tAlpha,
+                            threadgroup float (*tDiag)[8][8]) {
+    const int QSPAN = HD / 32;
+    const int KSPAN = HD / 8;
+    const int lin = (int)lid.x;
+    const int m0 = (int)tg.x * AM;
+    const int hoff = (int)tg.y * a.hoff;
+
+    if (lin < AM) { tSum[lin] = 0.0f; tMax[lin] = -INFINITY; }
+    {
+        int r = lin / QSPAN, seg = (lin % QSPAN) * 32;
+        int gm = m0 + r;
+        if (r < AM)
+            for (int i = 0; i < 32; i += 4) {
+                float4 f = float4(0.0f);
+                if (gm < a.seq)
+                    f = *(const device float4 *)(Q + (long)gm * a.ld + hoff + seg + i);
+                tQ[r][seg + i + 0] = bfloat(f.x);
+                tQ[r][seg + i + 1] = bfloat(f.y);
+                tQ[r][seg + i + 2] = bfloat(f.z);
+                tQ[r][seg + i + 3] = bfloat(f.w);
+            }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 O[NF];
+    for (int i = 0; i < NF; i++)
+        O[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int j0 = 0; j0 < a.seq; j0 += AK) {
+        int r = lin / KSPAN, seg = (lin % KSPAN) * 8;
+        int gn = j0 + r;
+        if (r < AK)
+            for (int i = 0; i < 8; i += 4) {
+                float4 f = float4(0.0f), g = float4(0.0f);
+                if (gn < a.seq) {
+                    f = *(const device float4 *)(Kb + (long)gn * a.ld + hoff + seg + i);
+                    g = *(const device float4 *)(Vb + (long)gn * a.ld + hoff + seg + i);
+                }
+                tK[r][seg + i + 0] = bfloat(f.x);
+                tK[r][seg + i + 1] = bfloat(f.y);
+                tK[r][seg + i + 2] = bfloat(f.z);
+                tK[r][seg + i + 3] = bfloat(f.w);
+                tV[r][seg + i + 0] = bfloat(g.x);
+                tV[r][seg + i + 1] = bfloat(g.y);
+                tV[r][seg + i + 2] = bfloat(g.z);
+                tV[r][seg + i + 3] = bfloat(g.w);
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 S[AK / 8];
+        for (int i = 0; i < AK / 8; i++)
+            S[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (int kf = 0; kf < NF; kf++) {
+            simdgroup_bfloat8x8 qf;
+            simdgroup_load(qf, &tQ[sgi * 8][kf * 8], HD);
+            for (int ni = 0; ni < AK / 8; ni++) {
+                simdgroup_bfloat8x8 kf8;
+                simdgroup_load(kf8, &tK[ni * 8][kf * 8], HD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(S[ni], qf, kf8, S[ni]);
+            }
+        }
+        for (int ni = 0; ni < AK / 8; ni++)
+            simdgroup_store(S[ni], &sc[sgi * 8][ni * 8], AK);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lin < AM) {
+            float bm = -INFINITY;
+            for (int c = 0; c < AK; c++)
+                if (j0 + c < a.seq) {
+                    float v = sc[lin][c] * a.scale;
+                    if (v > bm) bm = v;
+                }
+            float old = tMax[lin];
+            float nm = bm > old ? bm : old;
+            tAlpha[lin] = m0 + lin < a.seq ? exp(old - nm) : 0.0f;
+            tMax[lin] = nm;
+            tSum[lin] *= tAlpha[lin];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (slane < 8) {
+            int rr = (int)slane;
+            for (int c = 0; c < 8; c++) tDiag[sgi][rr][c] = 0.0f;
+            tDiag[sgi][rr][rr] = tAlpha[(int)sgi * 8 + rr];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dmat;
+        simdgroup_load(dmat, &tDiag[sgi][0][0], 8);
+        for (int nf = 0; nf < NF; nf++)
+            simdgroup_multiply(dmat, O[nf], O[nf]);
+
+        if (lin < AM) {
+            float sum = 0.0f;
+            for (int c = 0; c < AK; c++) {
+                float p = (j0 + c < a.seq) ? exp(sc[lin][c] * a.scale - tMax[lin]) : 0.0f;
+                sum += p;
+                tP[lin][c] = bfloat(p);
+            }
+            tSum[lin] += sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ni = 0; ni < AK / 8; ni++) {
+            simdgroup_bfloat8x8 pf;
+            simdgroup_load(pf, &tP[sgi * 8][ni * 8], AK);
+            for (int nf = 0; nf < NF; nf++) {
+                simdgroup_bfloat8x8 vf;
+                simdgroup_load(vf, &tV[ni * 8][nf * 8], HD);
+                simdgroup_multiply_accumulate(O[nf], pf, vf, O[nf]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int base = m0 + (int)sgi * 8;
+    const int ECOL = HD / 4;
+    const int er = (int)slane / 4, ec = ((int)slane % 4) * ECOL;
+    const int eg = base + er;
+    const float den = tSum[er + (int)sgi * 8] > 0.0f
+                        ? 1.0f / tSum[er + (int)sgi * 8] : 0.0f;
+    if (base + 8 <= a.seq) {
+        for (int nf = 0; nf < NF; nf++)
+            simdgroup_store(O[nf], Ob + (long)base * a.ld + hoff + nf * 8, a.ld);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (eg < a.seq)
+            for (int i = 0; i < ECOL; i++)
+                Ob[(long)eg * a.ld + hoff + ec + i] *= den;
+    } else if (base < a.seq) {
+        for (int nf = 0; nf < NF; nf++)
+            simdgroup_store(O[nf], &oc[0][nf * 8], HD);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (eg < a.seq)
+            for (int i = 0; i < ECOL; i++)
+                Ob[(long)eg * a.ld + hoff + ec + i] = oc[er][ec + i] * den;
+    }
+}
+
 kernel void attn128(device const float *Q [[buffer(0)]],
                     device const float *Kb [[buffer(1)]],
                     device const float *Vb [[buffer(2)]],
@@ -434,8 +650,10 @@ kernel void attn128(device const float *Q [[buffer(0)]],
     threadgroup bfloat tP[AM][AK];
     threadgroup float tSum[AM];
     threadgroup float tMax[AM];
-    attn_core<128, 16>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
-                       tQ, tK, tV, u.s, u.o, tP, tSum, tMax);
+    threadgroup float tAlpha[AM];
+    threadgroup float tDiag[8][8][8];
+    attn_core_online<128, 16>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
+                             tQ, tK, tV, u.s, u.o, tP, tSum, tMax, tAlpha, tDiag);
 }
 
 kernel void attn64(device const float *Q [[buffer(0)]],
@@ -454,8 +672,50 @@ kernel void attn64(device const float *Q [[buffer(0)]],
     threadgroup bfloat tP[AM][AK];
     threadgroup float tSum[AM];
     threadgroup float tMax[AM];
-    attn_core<64, 8>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
-                     tQ, tK, tV, u.s, u.o, tP, tSum, tMax);
+    threadgroup float tAlpha[AM];
+    threadgroup float tDiag[8][8][8];
+    attn_core_online<64, 8>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
+                            tQ, tK, tV, u.s, u.o, tP, tSum, tMax, tAlpha, tDiag);
+}
+
+kernel void attn128_twopass(device const float *Q [[buffer(0)]],
+                            device const float *Kb [[buffer(1)]],
+                            device const float *Vb [[buffer(2)]],
+                            device float *Ob [[buffer(3)]],
+                            constant aargs &a [[buffer(4)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint2 lid [[thread_position_in_threadgroup]],
+                            uint sgi [[simdgroup_index_in_threadgroup]],
+                            uint slane [[thread_index_in_simdgroup]]) {
+    threadgroup bfloat tQ[AM][128];
+    threadgroup bfloat tK[AK][128];
+    threadgroup bfloat tV[AK][128];
+    threadgroup union { float s[AM][AK]; float o[8][128]; } u;
+    threadgroup bfloat tP[AM][AK];
+    threadgroup float tSum[AM];
+    threadgroup float tMax[AM];
+    attn_core_twopass<128, 16>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
+                              tQ, tK, tV, u.s, u.o, tP, tSum, tMax);
+}
+
+kernel void attn64_twopass(device const float *Q [[buffer(0)]],
+                           device const float *Kb [[buffer(1)]],
+                           device const float *Vb [[buffer(2)]],
+                           device float *Ob [[buffer(3)]],
+                           constant aargs &a [[buffer(4)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint2 lid [[thread_position_in_threadgroup]],
+                           uint sgi [[simdgroup_index_in_threadgroup]],
+                           uint slane [[thread_index_in_simdgroup]]) {
+    threadgroup bfloat tQ[AM][64];
+    threadgroup bfloat tK[AK][64];
+    threadgroup bfloat tV[AK][64];
+    threadgroup union { float s[AM][AK]; float o[8][64]; } u;
+    threadgroup bfloat tP[AM][AK];
+    threadgroup float tSum[AM];
+    threadgroup float tMax[AM];
+    attn_core_twopass<64, 8>(Q, Kb, Vb, Ob, a, tg, lid, sgi, slane,
+                            tQ, tK, tV, u.s, u.o, tP, tSum, tMax);
 }
 
 struct dargs {
@@ -646,7 +906,10 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_q;
 static id<MTLComputePipelineState> p_gemm_bf16, p_gemm_f32, p_gemm_qkv;
 static id<MTLComputePipelineState> p_gemm_bf16_small;
+static id<MTLComputePipelineState> p_swiglu;
+static id<MTLComputePipelineState> p_qk_prep;
 static id<MTLComputePipelineState> p_attn128, p_attn64;
+static id<MTLComputePipelineState> p_attn128_twopass, p_attn64_twopass;
 static id<MTLComputePipelineState> p_inkling_decode_attn;
 static id<MTLComputePipelineState> p_inkling_prefill_attn;
 static id<MTLBuffer> p_dec_scores;
@@ -674,8 +937,18 @@ static id<MTLBuffer> h3vm_wrap(const void *p, size_t len, NSUInteger *off, int k
     size_t need = ((len + lead + page - 1u) / page) * page;
     volatile const unsigned char *vp = (volatile const unsigned char *)base;
     unsigned char sink = 0;
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    (void)vp;
+    (void)sink;
+#else
     for (size_t o = 0; o < need; o += page) sink |= vp[o];
     if (sink == 0xff) { }
+#endif
+#else
+    for (size_t o = 0; o < need; o += page) sink |= vp[o];
+    if (sink == 0xff) { }
+#endif
     id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:(void *)base
                                               length:need
                                              options:MTLResourceStorageModeShared
@@ -735,16 +1008,25 @@ int h3vm_init(void) {
                          [lib newFunctionWithName:@"gemm_f32"] error:&err];
         p_gemm_qkv = [g_dev newComputePipelineStateWithFunction:
                          [lib newFunctionWithName:@"gemm_bf16_qkv"] error:&err];
+        p_swiglu = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"swiglu"] error:&err];
+        p_qk_prep = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"qk_prep"] error:&err];
         p_attn128 = [g_dev newComputePipelineStateWithFunction:
                         [lib newFunctionWithName:@"attn128"] error:&err];
         p_attn64 = [g_dev newComputePipelineStateWithFunction:
                        [lib newFunctionWithName:@"attn64"] error:&err];
+        p_attn128_twopass = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"attn128_twopass"] error:&err];
+        p_attn64_twopass = [g_dev newComputePipelineStateWithFunction:
+                       [lib newFunctionWithName:@"attn64_twopass"] error:&err];
         p_inkling_decode_attn = [g_dev newComputePipelineStateWithFunction:
                        [lib newFunctionWithName:@"inkling_decode_attn"] error:&err];
         p_inkling_prefill_attn = [g_dev newComputePipelineStateWithFunction:
                        [lib newFunctionWithName:@"inkling_prefill_attn"] error:&err];
         if (!p_gemm_bf16 || !p_gemm_bf16_small || !p_gemm_f32 || !p_gemm_qkv ||
-            !p_attn128 || !p_attn64 || !p_inkling_decode_attn || !p_inkling_prefill_attn) {
+            !p_swiglu || !p_qk_prep || !p_attn128 || !p_attn64 || !p_attn128_twopass || !p_attn64_twopass ||
+            !p_inkling_decode_attn || !p_inkling_prefill_attn) {
             fprintf(stderr, "h3v gpu: pipeline creation failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             g_bad = 1; return 0;
@@ -770,12 +1052,14 @@ void h3vm_shutdown(void) {
 }
 
 /* ---- dispatch ----------------------------------------------------- */
-typedef struct { int rows, k, cols, lda, ldc; int64_t woff; int qpart, qhd; } h3vm_args;
+typedef struct { int rows, k, cols, lda, ldc; int64_t woff; int qpart, qhd, accum; } h3vm_args;
+typedef struct { uint n, nhalf, legacy; } h3vm_sargs;
+typedef struct { uint seq, ld, heads, hd, rope_on, rope_mode; float eps; } h3vm_qkargs;
 
 static int h3vm_gemm(const float *a, const void *w, float *c,
                      int rows, int k, int cols, int wrows, int lda, int ldc,
                      id<MTLComputePipelineState> pipe, int bf16,
-                     int qpart, int qhd) {
+                     int qpart, int qhd, int accum) {
     if (!g_dev || !pipe) return 0;
     @autoreleasepool {
         NSUInteger ao = 0, wo = 0, co = 0;
@@ -796,7 +1080,7 @@ static int h3vm_gemm(const float *a, const void *w, float *c,
         id<MTLBuffer> bc = h3vm_wrap(c, (size_t)ldc * (size_t)rows * sizeof(float), &co, 0);
         if (!ba || !bc) return 0;
 
-        h3vm_args ar = {rows, k, cols, lda, ldc, woff, qpart, qhd};
+        h3vm_args ar = {rows, k, cols, lda, ldc, woff, qpart, qhd, accum};
         int tile_rows = pipe == p_gemm_bf16_small ? 16 : 64;
         MTLSize grid = MTLSizeMake((NSUInteger)((cols + 63) / 64),
                                    (NSUInteger)((rows + tile_rows - 1) / tile_rows), 1);
@@ -841,7 +1125,7 @@ int h3vm_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n) {
             bc[i] = h3vm_wrap(it->c, (size_t)it->ldc * (size_t)it->rows * sizeof(float),
                               &co[i], 0);
             if (!ba[i] || !bc[i]) return 0;
-            ar[i] = (h3vm_args){it->rows, it->k, it->cols, it->lda, it->ldc, 0, -1, 0};
+            ar[i] = (h3vm_args){it->rows, it->k, it->cols, it->lda, it->ldc, 0, -1, 0, 0};
         }
         id<MTLCommandBuffer> cb = [g_q commandBuffer];
         id<MTLComputeCommandEncoder> e;
@@ -873,20 +1157,74 @@ int h3vm_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n) {
 int h3vm_gemm_bf16(const float *a, const void *w, float *c,
                    int rows, int k, int cols, int lda, int ldc) {
     return h3vm_gemm(a, w, c, rows, k, cols, cols, lda, ldc,
-                     rows <= 16 ? p_gemm_bf16_small : p_gemm_bf16, 1, -1, 0);
+                     rows <= 16 ? p_gemm_bf16_small : p_gemm_bf16, 1, -1, 0, 0);
 }
 
 int h3vm_gemm_bf16_qkv(const float *a, const void *w, float *c,
                        int rows, int k, int cols, int wrows, int lda, int ldc,
                        int part, int hd) {
     return h3vm_gemm(a, w, c, rows, k, cols, wrows, lda, ldc,
-                     p_gemm_qkv, 1, part, hd);
+                     p_gemm_qkv, 1, part, hd, 0);
+}
+
+int h3vm_gemm_bf16_qkv3(const float *a, const void *w, float *q, float *k,
+                        float *v, int rows, int inner, int cols, int wrows,
+                        int lda, int ldc, int hd) {
+    if (!g_dev || !p_gemm_qkv) return 0;
+    @autoreleasepool {
+        NSUInteger ao = 0, wo = 0, qo = 0, ko = 0, vo = 0;
+        size_t wb = (size_t)inner * (size_t)wrows * sizeof(uint16_t);
+        int si = h3vm_span_idx(w, wb);
+        id<MTLBuffer> bw;
+        if (si >= 0) {
+            bw = g_span[si].buf;
+            wo = (NSUInteger)((uintptr_t)w - (uintptr_t)g_span[si].base);
+        } else {
+            bw = h3vm_wrap(w, wb, &wo, 0);
+            if (!bw) return 0;
+        }
+        id<MTLBuffer> ba = h3vm_wrap(a, (size_t)lda * (size_t)rows * sizeof(float), &ao, 0);
+        id<MTLBuffer> bq = h3vm_wrap(q, (size_t)ldc * (size_t)rows * sizeof(float), &qo, 0);
+        id<MTLBuffer> bk = h3vm_wrap(k, (size_t)ldc * (size_t)rows * sizeof(float), &ko, 0);
+        id<MTLBuffer> bv = h3vm_wrap(v, (size_t)ldc * (size_t)rows * sizeof(float), &vo, 0);
+        if (!ba || !bq || !bk || !bv) return 0;
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e;
+        if (@available(macOS 12.0, *))
+            e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        else
+            e = [cb computeCommandEncoder];
+        id<MTLBuffer> outs[3] = {bq, bk, bv};
+        NSUInteger offs[3] = {qo, ko, vo};
+        MTLSize grid = MTLSizeMake((NSUInteger)((cols + 63) / 64),
+                                   (NSUInteger)((rows + 63) / 64), 1);
+        for (int p = 0; p < 3; p++) {
+            h3vm_args ar = {rows, inner, cols, lda, ldc, (int64_t)wo, p, hd, 0};
+            [e setComputePipelineState:p_gemm_qkv];
+            [e setBuffer:ba offset:ao atIndex:0];
+            [e setBuffer:bw offset:0 atIndex:1];
+            [e setBuffer:outs[p] offset:offs[p] atIndex:2];
+            [e setBytes:&ar length:sizeof(ar) atIndex:3];
+            [e dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(H3VM_TG, 1, 1)];
+        }
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
+    }
 }
 
 int h3vm_gemm_f32(const float *a, const float *w, float *c,
                   int rows, int k, int cols, int lda, int ldc) {
     return h3vm_gemm(a, w, c, rows, k, cols, cols, lda, ldc,
-                     p_gemm_f32, 0, -1, 0);
+                     p_gemm_f32, 0, -1, 0, 0);
+}
+
+/* Convolution taps accumulate into one output tile: C += A @ W^T. */
+int h3vm_gemm_f32_accum(const float *a, const float *w, float *c,
+                        int rows, int k, int cols, int lda, int ldc) {
+    return h3vm_gemm(a, w, c, rows, k, cols, cols, lda, ldc,
+                     p_gemm_f32, 0, -1, 0, 1);
 }
 
 typedef struct { int seq, ld, hoff; float scale; } h3vm_aargs;
@@ -899,10 +1237,76 @@ typedef struct {
     float scale;
 } h3vm_pargs;
 
+int h3vm_swiglu(float *x, int64_t n, int64_t half, int legacy) {
+    if (!g_dev || !p_swiglu) return 0;
+    @autoreleasepool {
+        NSUInteger off = 0;
+        id<MTLBuffer> bx = h3vm_wrap(x, (size_t)(2 * half) * sizeof(float), &off, 0);
+        if (!bx) return 0;
+        h3vm_sargs ar = {(uint)n, (uint)half, (uint)legacy};
+        MTLSize grid = MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1);
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p_swiglu];
+        [e setBuffer:bx offset:off atIndex:0];
+        [e setBytes:&ar length:sizeof(ar) atIndex:1];
+        [e dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
+    }
+}
+
+int h3vm_qk_prep(float *q, float *k, const float *wq, const float *wk,
+                 const float *cos, const float *sin, int seq, int ld,
+                 int heads, int hd, int rope_on, int rope_mode) {
+    if (!g_dev || !p_qk_prep) return 0;
+    @autoreleasepool {
+        NSUInteger qo = 0, ko = 0, qwo = 0, kwo = 0, co = 0, so = 0;
+        size_t qb = (size_t)ld * (size_t)seq * sizeof(float);
+        id<MTLBuffer> bq = h3vm_wrap(q, qb, &qo, 0);
+        id<MTLBuffer> bk = h3vm_wrap(k, qb, &ko, 0);
+        id<MTLBuffer> bwq = h3vm_wrap(wq, (size_t)hd * sizeof(float), &qwo, 0);
+        id<MTLBuffer> bwk = h3vm_wrap(wk, (size_t)hd * sizeof(float), &kwo, 0);
+        size_t rb = (size_t)seq * 96u * sizeof(float);
+        id<MTLBuffer> bc = h3vm_wrap(cos, rb, &co, 0);
+        id<MTLBuffer> bs = h3vm_wrap(sin, rb, &so, 0);
+        if (!bq || !bk || !bwq || !bwk || !bc || !bs) return 0;
+        h3vm_qkargs ar = {(uint)seq, (uint)ld, (uint)heads, (uint)hd,
+                          (uint)rope_on, (uint)rope_mode, 1e-5f};
+        MTLSize grid = MTLSizeMake((NSUInteger)seq, (NSUInteger)(heads / 8), 1);
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p_qk_prep];
+        [e setBuffer:bq offset:qo atIndex:0];
+        [e setBuffer:bk offset:ko atIndex:1];
+        [e setBuffer:bwq offset:qwo atIndex:2];
+        [e setBuffer:bwk offset:kwo atIndex:3];
+        [e setBuffer:bc offset:co atIndex:4];
+        [e setBuffer:bs offset:so atIndex:5];
+        [e setBytes:&ar length:sizeof(ar) atIndex:6];
+        [e dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return [cb status] == MTLCommandBufferStatusCompleted && !cb.error;
+    }
+}
+
 int h3vm_attention(const float *q, const float *k, const float *v, float *o,
                    int seq, int ld, int heads, int hd) {
     if (!g_dev) return 0;
-    id<MTLComputePipelineState> pipe = (hd == 128) ? p_attn128 : p_attn64;
+    static int twopass = -1;
+    if (twopass < 0) {
+        const char *online = getenv("CWICK_H3V_ATTN_ONLINE");
+        const char *legacy = getenv("CWICK_H3V_ATTN_TWOPASS");
+        twopass = !(online && *online && strcmp(online, "0") != 0);
+        if (legacy && *legacy) twopass = strcmp(legacy, "0") != 0;
+    }
+    id<MTLComputePipelineState> pipe = hd == 128
+        ? (twopass ? p_attn128_twopass : p_attn128)
+        : (twopass ? p_attn64_twopass : p_attn64);
     if (!pipe) return 0;
     @autoreleasepool {
         NSUInteger qo = 0, ko = 0, vo = 0, oo = 0;

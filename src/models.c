@@ -82,6 +82,7 @@ bool cwick_model_served_alias(const char *root, char *out, size_t cap) {
         {"GLM-5.3-Flash", "glm-5.3-flash"},
         {"DeepSeek-V4.1-Flash-1017", "deepSeek-v4.1-flash-1017"},
         {"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash"},
+        {"MiniMax-Music3", "MiniMax-Music3"},
         {"Sophon-Realtime-32B-Tag", "Sophon-Realtime-32B-Tag"},
         {"Inkling-2-Mini", "Inkling-2-Mini"},
         /* The Qwen3.5 hybrid's config.json carries a training-run artifact as
@@ -218,8 +219,38 @@ static void basename_of(const char *path, char *out, size_t cap) {
     snprintf(out, cap, "%s", name);
 }
 
+bool cwick_model_music_manifest(const char *dir) {
+    if (!dir || !*dir) return false;
+    char p[MAX_PATH];
+    return snprintf(p, sizeof(p), "%s/modular_model_index.json", dir) <
+               (int)sizeof(p) && file_readable(p);
+}
+
+bool cwick_model_music_complete(const char *dir) {
+    if (!cwick_model_music_manifest(dir)) return false;
+    static const char *const files[] = {
+        "language_model/model.safetensors.index.json",
+        "rvq_depth_decoder/diffusion_pytorch_model.safetensors",
+        "condition_encoder/diffusion_pytorch_model.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "vocoder/diffusion_pytorch_model.safetensors",
+        "tokenizer/tokenizer.json",
+        "dav.pth",
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        char p[MAX_PATH];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, files[i]) >= (int)sizeof(p) ||
+            !file_readable(p)) return false;
+    }
+    return true;
+}
+
 bool cwick_model_dir_probe(const char *dir, char *id_out, size_t id_cap) {
     if (!dir || !*dir) return false;
+    if (id_out && id_cap) id_out[0] = '\0';
+    /* Music is advertised through its dedicated fixed id and --music option.
+     * Scanning it as text would create a second, unsupported catalog row. */
+    if (cwick_model_music_manifest(dir)) return false;
 
     char cfg[MAX_PATH];
     if (snprintf(cfg, sizeof(cfg), "%s/config.json", dir) >= (int)sizeof(cfg))
@@ -315,6 +346,7 @@ bool cwick_model_root_supported(const char *root, char *why, size_t whycap) {
         if (why && whycap) snprintf(why, whycap, "empty model root");
         return false;
     }
+    if (cwick_model_music_manifest(root)) return true;
     char cfg[MAX_PATH];
     if (snprintf(cfg, sizeof(cfg), "%s/config.json", root) >= (int)sizeof(cfg)) {
         if (why && whycap) snprintf(why, whycap, "model root is too long");

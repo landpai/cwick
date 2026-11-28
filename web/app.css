@@ -667,6 +667,13 @@ a:hover { text-decoration: underline; }
 .note.ok { color: #8fdcb6; }
 .note.bad { color: #ffb3bb; }
 
+.music-progress { display: flex; align-items: center; gap: 12px; margin: 15px 0; }
+.music-progress .bar { flex: 1; }
+.music-progress > span { min-width: 42px; text-align: right; font-size: 11px; }
+#musicWavLink[hidden] { display: none; }
+#musicDir, #musicJobId { max-width: 100%; overflow-wrap: anywhere; }
+.pill.is-ready { color: var(--green); border-color: rgba(61, 220, 151, .4); }
+
 /* ---------------- API keys (settings > 安全) ---------------- */
 .key-panel { margin-top: 14px; border-top: 1px solid var(--line-soft); padding-top: 13px; }
 .key-head h4 { margin: 0; font-size: 12.5px; font-weight: 600; color: var(--text); }

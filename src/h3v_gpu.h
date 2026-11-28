@@ -14,6 +14,7 @@
 #define CWICK_H3V_GPU_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Brought up on first use. 0 means the CPU path stays in charge. */
 int h3v_gpu_ready(void);
@@ -37,6 +38,10 @@ int h3v_gpu_gemm_bf16(const float *a, const void *w, float *c,
                       int rows, int k, int cols, int lda, int ldc);
 int h3v_gpu_gemm_f32(const float *a, const float *w, float *c,
                      int rows, int k, int cols, int lda, int ldc);
+/* C += A @ W^T. Used when several convolution taps write one output tile;
+ * the plain entry point above overwrites it. */
+int h3v_gpu_gemm_f32_accum(const float *a, const float *w, float *c,
+                           int rows, int k, int cols, int lda, int ldc);
 
 typedef struct {
     const float *a;
@@ -55,6 +60,13 @@ int h3v_gpu_gemm_bf16_batch(const h3v_gpu_bf16_item *items, int n);
 int h3v_gpu_gemm_qkv(const float *a, const void *w, float *c,
                      int rows, int k, int cols, int wrows, int lda, int ldc,
                      int part, int hd);
+int h3v_gpu_gemm_qkv3(const float *a, const void *w, float *q, float *k,
+                      float *v, int rows, int inner, int cols, int wrows,
+                      int lda, int ldc, int hd);
+int h3v_gpu_swiglu(float *x, int64_t n, int64_t half, int legacy);
+int h3v_gpu_qk_prep(float *q, float *k, const float *wq, const float *wk,
+                    const float *cos, const float *sin, int seq, int ld,
+                    int heads, int hd, int rope_on, int rope_mode);
 
 /* Non-causal attention over one packed [seq][heads*hd] sequence, per head.
  * Returns 1 when the GPU wrote all heads. */

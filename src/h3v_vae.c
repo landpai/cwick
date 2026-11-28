@@ -501,29 +501,54 @@ done:
     return ok;
 }
 
-/* Tile plan along one axis: `len` cells cut into tiles of at most
- * H3V_VAE_TILE_CELLS with H3V_VAE_TILE_OVERLAP shared cells. */
-static int vl_plan(int64_t len, int64_t *starts, int64_t *sizes, int cap) {
+/* Tile plan along one axis, following the released decoder's split_tiles:
+ * every intermediate tile keeps the full tile size and the remaining length is
+ * distributed into the overlaps. A short tail tile would change the local RoPE
+ * grid and make adjacent tiles disagree about the same spatial positions. */
+static int vl_plan(int64_t len, int64_t *starts, int64_t *sizes,
+                   int64_t *overlaps, int cap) {
     int64_t tile = H3V_VAE_TILE_CELLS, ov = H3V_VAE_TILE_OVERLAP;
     { const char *e = getenv("CWICK_H3V_VAE_TILE");
       if (e && *e) { long v = strtol(e, NULL, 10); if (v >= 4 && v <= 128) {
-          tile = v; ov = v / 6; if (ov < 1) ov = 1; } } }
+          tile = v; ov = v / 4; if (ov < 1) ov = 1; } } }
     if (len <= tile) {
         starts[0] = 0;
         sizes[0] = len;
+        overlaps[0] = 0;
         return 1;
     }
-    int n = 0;
-    int64_t pos = 0;
-    while (pos < len && n < cap) {
-        int64_t take = len - pos < tile ? len - pos : tile;
-        starts[n] = pos;
-        sizes[n] = take;
+    int n = (int)((len + tile - 1) / tile);
+    int64_t remaining = 0;
+    for (;;) {
+        remaining = tile * n - ov * (n - 1) - len;
+        if (remaining >= 0) break;
         n++;
-        if (pos + take >= len) break;
-        pos += take - ov;
+        if (n >= cap) return 0;
+    }
+    for (int i = 0; i < n - 1; i++) overlaps[i] = ov;
+    for (int64_t i = 0; i < remaining; i++) overlaps[i % (n - 1)]++;
+    starts[0] = 0;
+    for (int i = 0; i < n; i++) {
+        sizes[i] = tile;
+        if (i > 0) starts[i] = starts[i - 1] + tile - overlaps[i - 1];
     }
     return n;
+}
+
+bool h3v_vae_plan_selftest(void) {
+    int64_t starts[16], sizes[16], overlaps[16];
+    int n = vl_plan(64, starts, sizes, overlaps, 16);
+    if (n != 5) return false;
+    for (int i = 0; i < n; i++)
+        if (starts[i] != i * 12 || sizes[i] != 16 || (i < n - 1 && overlaps[i] != 4))
+            return false;
+    n = vl_plan(48, starts, sizes, overlaps, 16);
+    if (n != 4 || overlaps[0] != 6 || overlaps[1] != 5 || overlaps[2] != 5)
+        return false;
+    for (int i = 0; i < n; i++)
+        if (sizes[i] != 16 || starts[i] != (int64_t[]){0, 10, 21, 32}[i])
+            return false;
+    return true;
 }
 
 /* ---- temporal chunk geometry -------------------------------------------
@@ -573,14 +598,10 @@ static bool vl_decode_spatial(const cwick_safetensors *s, const float *weff,
                               int *done_tiles, int total_tiles) {
     const int64_t frames = lt * H3V_VAE_FRAMES;
     const int64_t H = lh * H3V_VAE_PIXEL, W = lw * H3V_VAE_PIXEL;
-    int64_t ys[512], yl[512], xs[512], xl[512];
-    const int ny = vl_plan(lh, ys, yl, 512);
-    const int nx = vl_plan(lw, xs, xl, 512);
-    int64_t tile_ov = H3V_VAE_TILE_OVERLAP;
-    { const char *e = getenv("CWICK_H3V_VAE_TILE");
-      if (e && *e) { long v = strtol(e, NULL, 10); if (v >= 4 && v <= 128) {
-          tile_ov = v / 6; if (tile_ov < 1) tile_ov = 1; } } }
-    const int64_t ov_px = tile_ov * H3V_VAE_PIXEL;
+    int64_t ys[512], yl[512], yov[512], xs[512], xl[512], xov[512];
+    const int ny = vl_plan(lh, ys, yl, yov, 512);
+    const int nx = vl_plan(lw, xs, xl, xov, 512);
+    if (ny <= 0 || nx <= 0) return false;
 
     for (int i = 0; i < ny; i++) {
         for (int j = 0; j < nx; j++) {
@@ -598,12 +619,12 @@ static bool vl_decode_spatial(const cwick_safetensors *s, const float *weff,
             for (int64_t f = 0; f < frames; f++)
                 for (int64_t y = 0; y < ph; y++) {
                     const int64_t gy = gy0 + y;
-                    float ay = 1.0f;
-                    if (i > 0 && y < ov_px) ay = (float)(y + 1) / (float)ov_px;
+                    const int64_t ov_y = i > 0 ? yov[i - 1] * H3V_VAE_PIXEL : 0;
+                    float ay = (ov_y > 0 && y < ov_y) ? (float)y / (float)ov_y : 1.0f;
                     for (int64_t x = 0; x < pw; x++) {
                         const int64_t gx = gx0 + x;
-                        float ax = 1.0f;
-                        if (j > 0 && x < ov_px) ax = (float)(x + 1) / (float)ov_px;
+                        const int64_t ov_x = j > 0 ? xov[j - 1] * H3V_VAE_PIXEL : 0;
+                        float ax = (ov_x > 0 && x < ov_x) ? (float)x / (float)ov_x : 1.0f;
                         float a = (ay < 1.0f && ax < 1.0f) ? 0.5f * (ay + ax)
                                   : (ay < 1.0f ? ay : ax);
                         unsigned char *dst =
@@ -663,9 +684,14 @@ unsigned char *h3v_vae_decode(const h3v_model *m, const float *lat, int64_t lt,
     { const char *e = getenv("CWICK_H3V_TEMPORAL_XFADE");
       if (e && *e && strcmp(e, "0") == 0) chunked = false; }
 
-    int64_t ys[512], yl[512], xs[512], xl[512];
-    const int ny = vl_plan(lh, ys, yl, 512);
-    const int nx = vl_plan(lw, xs, xl, 512);
+    int64_t ys[512], yl[512], yov[512], xs[512], xl[512], xov[512];
+    const int ny = vl_plan(lh, ys, yl, yov, 512);
+    const int nx = vl_plan(lw, xs, xl, xov, 512);
+    if (ny <= 0 || nx <= 0) {
+        free(weff); free(beff); free(lat_dn);
+        cwick_error_set(err, CWICK_ERR_ARGUMENT, "video VAE tile plan is too large");
+        return NULL;
+    }
     int done_tiles = 0;
 
     if (!chunked) {

@@ -32,9 +32,9 @@ SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c src/mod
        src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
        src/rt_torch.c src/rt_thinker.c src/rt_audio.c src/rt_dsp.c src/rt_hift.c src/rt_flow.c \
        src/rt_talker.c src/rt_vad.c src/rt_realtime.c src/ws.c \
-       src/models.c src/store.c src/server.c src/jev.c src/hub.c src/main.c
+       src/models.c src/store.c src/server.c src/jev.c src/hub.c src/music.c src/main.c
 HDRS = src/cwick.h src/util.h src/json.h src/log.h src/logcap.h src/auth.h src/mem.h \
-       src/metrics.h src/models.h src/store.h src/hub.h \
+       src/metrics.h src/models.h src/store.h src/hub.h src/music.h \
        src/tools.h src/pfx.h src/webui.h src/qr.h src/jev.h \
        src/ds.h src/ds_ops.h src/ds_model.h src/ds_engine.h src/ds_prompt.h src/sample.h \
        src/mm.h src/mm_engine.h src/mm_prompt.h \
@@ -75,7 +75,7 @@ TEST_SRCS = src/util.c src/json.c src/mem.c src/log.c src/logcap.c src/auth.c sr
             src/metal_shader.c src/metal_objc.m src/qr.m src/q35_gpu.m src/webui.c src/webui_embed.c \
             src/rt_torch.c src/rt_thinker.c src/rt_audio.c src/rt_dsp.c src/rt_hift.c src/rt_flow.c \
        src/rt_talker.c src/rt_vad.c src/rt_realtime.c src/ws.c \
-            src/models.c src/store.c src/server.c src/jev.c src/hub.c tests/test_cwick.c
+            src/models.c src/store.c src/server.c src/jev.c src/hub.c src/music.c tests/test_cwick.c
 
 test: $(TEST_SRCS) $(HDRS)
 	$(CC) $(CFLAGS) -o tests/test_cwick $(TEST_SRCS) $(LDFLAGS)
@@ -168,6 +168,11 @@ h3vgpuprobe: tools/h3vgpuprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
 	$(CC) $(CFLAGS) -o tools/h3vgpuprobe tools/h3vgpuprobe.c \
 		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
 
+# Native Music3 checkpoint/open/generation probe.
+musicprobe: tools/musicprobe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) -o tools/musicprobe tools/musicprobe.c \
+		$(filter-out src/main.c,$(SRCS)) $(LDFLAGS)
+
 # Read the MiniMax-M3.1-Flash quantizer constants out of the shards and print
 # what a decoded weight looks like (see the header comment in the source).
 mmprobe: tools/mm_probe.c $(filter-out src/main.c,$(SRCS)) $(HDRS)
@@ -215,7 +220,7 @@ clean:
 	rm -f tools/h3vprobe tools/h3vencprobe tools/h3vmuxprobe tools/h3vgpuprobe
 	rm -rf /tmp/cwick-test-*
 
-.PHONY: test clean probe h3vprobe h3vencprobe h3vmuxprobe h3vgpuprobe bench layercheck mmdecodeprobe jevprobe
+.PHONY: test clean probe h3vprobe h3vencprobe h3vmuxprobe h3vgpuprobe musicprobe bench layercheck mmdecodeprobe jevprobe
 
 # Drive the MiniMax-M3.1-Flash port on its own (see the header in the source).
 # bf16/fp16 dot-product throughput, one thread. Needs -march because bf16 is an

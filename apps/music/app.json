@@ -1,0 +1,8 @@
+{
+  "id": "music",
+  "name": "音乐台",
+  "version": "2.1.0",
+  "entry": "index.html",
+  "description": "Text-driven H5 instrumental music studio: the resident text model writes an English Structured Caption with Vocals: None, then /v1/generate renders the whole track with live progress, inline playback and WAV download.",
+  "storage": "localStorage:cwick.music.v2 (recent task metadata and last text model id)"
+}

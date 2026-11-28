@@ -35,6 +35,7 @@
 
 #include <Accelerate/Accelerate.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,6 +61,34 @@ static const int AU_UP_RATE[AU_STAGES] = {5, 5, 2, 2, 2, 2, 2};
 static const int AU_UP_KERN[AU_STAGES] = {9, 9, 4, 4, 4, 4, 4};
 static const int AU_RES_KERN[AU_BLOCKS] = {3, 7, 11};
 static const int AU_RES_DIL[AU_DILS] = {1, 3, 5};
+
+static const float AU_LAT_MEAN[AU_LATENT_CH] = {
+    -0.020211687488382354f, 0.3876466479950502f, -0.04398279799186767f,
+    -0.28591514936373f, 0.08179686214561671f, -0.35782641352446604f,
+    0.040623809960919084f, -0.01552534501956604f, -0.223362481667332f,
+    0.1821006842509091f, 0.2941778783780663f, -0.07901167601970885f,
+    -0.056815072777201f, -0.3699028221860095f, -0.31616315591624855f,
+    0.5905951377425391f, -0.052139568068853864f, 0.013673160263486295f,
+    -0.03691647864630577f, 0.09732660653298163f, -0.3394662328788498f,
+    -0.30685677538541667f, -0.24504598907458763f, -0.034698524462007344f,
+    0.02868032184767538f, -0.21217779266454084f, -0.1678263169941987f,
+    0.3221287889040614f, -0.1223055851554907f, 0.4356604928128464f,
+    -0.0502599202236253f, 0.3979258376211797f
+};
+
+static const float AU_LAT_STD[AU_LATENT_CH] = {
+    1.6895524230479284f, 2.76263727217653f, 1.7945344281264435f,
+    1.6801681847309828f, 1.6390226546605453f, 2.7788298348882177f,
+    1.7659090095747236f, 1.6199757612137327f, 2.6336525640336896f,
+    1.8539356672817833f, 2.5056497896915633f, 1.811019237886178f,
+    1.9579657790720237f, 1.6685498243529284f, 1.4922469314453364f,
+    3.298670198067373f, 1.9491804496832168f, 1.8720003270431442f,
+    1.8334080103291832f, 1.6488070416529093f, 1.6176957696319716f,
+    1.9131449234774398f, 1.5695245398428617f, 1.6943659940415912f,
+    1.8318420762504692f, 1.5540637421583379f, 1.9344930328968526f,
+    1.599198216109855f, 1.718045989838149f, 1.6307219190837705f,
+    1.8661226051202384f, 1.5613768203168363f
+};
 
 static float *au_f32(int64_t n) {
     return (float *)cwick_xmalloc((size_t)n * sizeof(float));
@@ -155,8 +184,8 @@ static bool au_conv_build(const cwick_safetensors *s, au_conv *c,
                 c->w[(k * c->O + o) * I + i] = row[i * K + k] * scale;
     }
 
-    snprintf(n, sizeof(n), "%s.bias", prefix);
 bias:
+    snprintf(n, sizeof(n), "%s.bias", prefix);
     memset(&b, 0, sizeof(b));
     if (au_get(s, n, &b, err, false) && b.data && b.dtype == CWICK_ST_F32) {
         c->b = au_f32(c->O);
@@ -438,9 +467,46 @@ static void au_amp_run(const au_amp *b, const float *x, int64_t T, float *out,
         au_conv1d_run(&b->c1[d], tmp, T, res);
         au_act(res, ch, T, b->alpha[d * 2 + 1], b->beta[d * 2 + 1],
                b->up[d * 2 + 1], b->dn[d * 2 + 1], tmp);
+        memcpy(res, out, (size_t)n * sizeof(float));
         au_conv1d_run(&b->c2[d], tmp, T, out);
         for (int64_t i = 0; i < n; i++) out[i] += res[i];
     }
+}
+
+bool h3v_audio_amp_selftest(void) {
+    enum { C = 2, T = 4 };
+    au_amp b;
+    memset(&b, 0, sizeof(b));
+    b.ch = C;
+    for (int d = 0; d < AU_DILS; d++) {
+        b.c1[d].w = au_f32(3 * C * C);
+        b.c2[d].w = au_f32(3 * C * C);
+        b.c1[d].O = b.c1[d].I = C;
+        b.c2[d].O = b.c2[d].I = C;
+        b.c1[d].K = b.c2[d].K = 3;
+        b.c1[d].dil = AU_RES_DIL[d];
+        b.c2[d].dil = 1;
+        b.c1[d].pad = (3 * AU_RES_DIL[d] - AU_RES_DIL[d]) / 2;
+        b.c2[d].pad = 1;
+        for (int i = 0; i < 3 * C * C; i++) b.c1[d].w[i] = 0.05f;
+        for (int a = 0; a < 2; a++) {
+            const int idx = d * 2 + a;
+            b.alpha[idx] = au_f32(C);
+            b.beta[idx] = au_f32(C);
+            b.up[idx] = au_f32(AU_FILTER);
+            b.dn[idx] = au_f32(AU_FILTER);
+            for (int k = 0; k < AU_FILTER; k++)
+                b.up[idx][k] = b.dn[idx][k] = 1.0f / AU_FILTER;
+        }
+    }
+    float x[C * T], out[C * T], scratch[2 * C * T];
+    for (int i = 0; i < C * T; i++) x[i] = 0.1f * (float)(i + 1);
+    au_amp_run(&b, x, T, out, scratch);
+    bool ok = true;
+    for (int i = 0; i < C * T; i++)
+        if (fabsf(out[i] - x[i]) > 1e-6f) ok = false;
+    au_amp_free(&b);
+    return ok;
 }
 
 /* Decode one channel: z is [32][T], out receives T*800 mono samples. */
@@ -503,6 +569,7 @@ static bool au_decode_mono(const cwick_safetensors *s, const float *z, int64_t T
             au_amp_free(&amp);
             for (int64_t q = 0; q < ch * len; q++) acc[q] += blk[q];
         }
+        for (int64_t q = 0; q < ch * len; q++) acc[q] /= (float)AU_BLOCKS;
         free(blk);
         free(scratch);
         free(xcur);
@@ -553,6 +620,21 @@ done:
     return ok;
 }
 
+static void au_lat_denorm(float *z, int64_t t) {
+    for (int64_t c = 0; c < AU_LATENT_CH; c++)
+        for (int64_t i = 0; i < t; i++)
+            z[c * t + i] = z[c * t + i] * AU_LAT_STD[c] + AU_LAT_MEAN[c];
+}
+
+bool h3v_audio_latnorm_selftest(void) {
+    float z[AU_LATENT_CH * 2] = {0};
+    z[5 * 2] = 1.0f;
+    z[15 * 2 + 1] = -1.0f;
+    au_lat_denorm(z, 2);
+    return fabsf(z[5 * 2] - (AU_LAT_STD[5] + AU_LAT_MEAN[5])) < 1e-6f &&
+           fabsf(z[15 * 2 + 1] - (-AU_LAT_STD[15] + AU_LAT_MEAN[15])) < 1e-6f;
+}
+
 float *h3v_audio_decode(const h3v_model *m, const float *z, int64_t t,
                         int64_t *samples, h3v_progress_fn cb, void *cbctx,
                         cwick_error *err) {
@@ -568,13 +650,18 @@ float *h3v_audio_decode(const h3v_model *m, const float *z, int64_t t,
     }
     const int64_t frames = t / 2;
     const int64_t cap = frames * AU_HOP + AU_HOP;
+    float *zd = au_f32(AU_LATENT_CH * t);
+    if (!zd) return NULL;
+    memcpy(zd, z, (size_t)AU_LATENT_CH * t * sizeof(float));
+    au_lat_denorm(zd, t);
     float *left = au_f32(AU_LATENT_CH * frames);
     float *right = au_f32(AU_LATENT_CH * frames);
     for (int64_t c = 0; c < AU_LATENT_CH; c++)
         for (int64_t i = 0; i < frames; i++) {
-            left[c * frames + i] = z[c * t + 2 * i];
-            right[c * frames + i] = z[c * t + 2 * i + 1];
+            left[c * frames + i] = zd[c * t + 2 * i];
+            right[c * frames + i] = zd[c * t + 2 * i + 1];
         }
+    free(zd);
 
     int64_t llen = 0, rlen = 0;
     float *lbuf = au_f32(cap);

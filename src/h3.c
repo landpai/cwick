@@ -109,6 +109,12 @@ void h3_progress_get(h3_progress *out) {
     out->phase = phase;
 }
 
+double h3_progress_age_ms(const h3_progress *out) {
+    if (!out) return 0.0;
+    double age = (double)cwick_prof_ns() / 1e6 - out->stamp_ms;
+    return age < 0.0 ? 0.0 : age;
+}
+
 static float h3_clamp(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }

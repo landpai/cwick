@@ -37,6 +37,7 @@
 #include "h3_gpu.h"
 #include "h3v.h"
 #include "hub.h"
+#include "music.h"
 #include "rt_realtime.h"
 #include "ws.h"
 
@@ -44,11 +45,13 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -72,7 +75,8 @@
 #include "store.h"
 #include "webui.h"
 
-#define CWICK_SERVER_MAX_BODY (8u * 1024u * 1024u)
+/* Eight-minute 44.1 kHz stereo WAV data URLs need roughly 113 MiB. */
+#define CWICK_SERVER_MAX_BODY (128u * 1024u * 1024u)
 #define CWICK_SERVER_ID_BUF 64
 /* Read timeout on an accepted socket: long enough for a slow client, short
  * enough that a Ctrl+C is noticed while someone is trickling bytes at us. */
@@ -152,6 +156,69 @@ typedef struct {
     uint64_t next_seq;
 } video_book;
 
+/* ---- music jobs ------------------------------------------------------
+ * MiniMax-Music3 generation is asynchronous for the same reason as video:
+ * flow sampling and the vocoder can take minutes. The table is bounded and
+ * only one worker runs at a time (the native model owns mutable scratch), while
+ * completed resources remain pollable until a later POST recycles the oldest.
+ */
+#define CWICK_MUSIC_JOBS 8
+#define CWICK_MUSIC_STAGES 12
+
+typedef struct {
+    char phase[24];
+    int64_t started_at;       /* unix milliseconds */
+    int64_t duration_ms;      /* filled when the phase changes */
+    int64_t done;
+    int64_t total;
+} music_stage_record;
+
+typedef struct {
+    bool used;
+    char id[64];
+    uint64_t request_id;
+    char *prompt;
+    char *lyrics;
+    char *title;
+    char *style;
+    music_task task;
+    int seconds;
+    uint64_t seed;
+    int steps;
+    float cfg_scale;
+    float temperature;
+    int top_k;
+    float audio_weight;
+    bool instrumental;
+    bool custom_mode;
+    unsigned char *reference_audio;
+    size_t reference_len;
+    char status[16];          /* queued / in_progress / completed / failed / cancelled */
+    char phase[24];
+    double progress;
+    int64_t steps_done, steps_total;
+    music_stage_record stages[CWICK_MUSIC_STAGES];
+    int stage_n;
+    unsigned char *wav;
+    size_t wav_len;
+    char error[384];
+    int64_t created;
+    int64_t completed;
+    music_timing tim;
+    bool has_tim;
+    _Atomic int cancel;
+    pthread_t thread;
+    bool thread_started;
+} music_job;
+
+typedef struct {
+    pthread_mutex_t lock;
+    music_job jobs[CWICK_MUSIC_JOBS];
+    uint64_t next_seq;
+    int workers;
+    bool shutting_down;
+} music_book;
+
 typedef struct {
     /* Slot 0 owns the weight spine; the others borrow it (see
      * cwick_engine_options.shared_spine) so the 15.46 GiB mlocked spine is
@@ -172,6 +239,14 @@ typedef struct {
      * non-zero: freeing the transformer mid-clip would abort a job the client
      * is already polling. Guarded by gen_lock, like img_busy. */
     int vid_busy;
+    /* MiniMax-Music3 owns the same single resident slot. music_busy reserves it
+     * atomically with lazy opening so no second POST can slip into the gap
+     * between music_model_open() and worker startup. */
+    music_model *music;
+    char music_dir[CWICK_MODEL_ROOT_MAX];
+    music_book mbook;
+    pthread_mutex_t music_start_lock;
+    int music_busy;
     /* The full-duplex speech pipeline, NULL unless a sophon_realtime checkpoint
      * is resident. It is the third occupant of the one-model slot: thinker,
      * ear and talker are one model and are loaded and freed together. */
@@ -378,8 +453,10 @@ static const char *find_bytes(const char *buf, size_t n, const char *needle,
     return NULL;
 }
 
-static int read_http_request(int fd, char *buf, size_t cap, http_req *req,
-                             cwick_error *err) {
+static int read_http_request(int fd, char **bufp, size_t *capp, size_t max_cap,
+                             http_req *req, cwick_error *err) {
+    char *buf = *bufp;
+    size_t cap = *capp;
     size_t n = 0;
     /* read until "\r\n\r\n" (headers end) */
     for (;;) {
@@ -470,12 +547,27 @@ static int read_http_request(int fd, char *buf, size_t cap, http_req *req,
         }
         h = he + 2;
     }
-    const char *body = hdr_end + 4;
-    size_t got = (size_t)((buf + n) - body);
-    if (req->content_length < 0 || (size_t)req->content_length > cap) {
+    size_t header_bytes = (size_t)((hdr_end + 4) - buf);
+    if (req->content_length < 0 ||
+        (uint64_t)req->content_length > max_cap ||
+        header_bytes > max_cap - (size_t)req->content_length) {
         cwick_error_set(err, CWICK_ERR_ARGUMENT, "body exceeds server limit");
         return -1;
     }
+    size_t need = header_bytes + (size_t)req->content_length;
+    if (need > cap - 1) {
+        char *grown = (char *)realloc(buf, need + 1);
+        if (!grown) {
+            cwick_error_set(err, CWICK_ERR_MEMORY, "cannot allocate request body");
+            return -1;
+        }
+        buf = grown;
+        cap = need + 1;
+        *bufp = buf;
+        *capp = cap;
+    }
+    const char *body = buf + header_bytes;
+    size_t got = n - header_bytes;
     while (got < (size_t)req->content_length) {
         if (n >= cap - 1) {
             cwick_error_set(err, CWICK_ERR_ARGUMENT, "body too large");
@@ -6152,10 +6244,15 @@ static char *json_str_alloc(const char *s) {
 static const char *status_text_for(int code) {
     switch (code) {
         case 200: return "OK";
+        case 202: return "Accepted";
         case 400: return "Bad Request";
         case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
         case 409: return "Conflict";
+        case 413: return "Payload Too Large";
+        case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
         default:  return "Error";
     }
@@ -6165,7 +6262,10 @@ static const char *status_text_for(int code) {
  * the only question that matters (an id can repeat, a root cannot). */
 static const cwick_model_entry *resident_entry(server_ctx *srv) {
     const char *root = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
-                                   : (srv->rt ? srv->realtime_dir : NULL);
+                                   : (srv->rt ? srv->realtime_dir
+                                      : (srv->h3 ? srv->image_dir
+                                         : (srv->vid ? srv->video_dir
+                                            : (srv->music ? srv->music_dir : NULL))));
     if (!root) return NULL;
     for (size_t i = 0; i < srv->catalog.n; i++) {
         if (strcmp(srv->catalog.v[i].root, root) == 0) return &srv->catalog.v[i];
@@ -6189,6 +6289,8 @@ static const char *resident_served_name(server_ctx *srv) {
     if (cur) return served_name(cur);
     if (srv->rt) return rt_realtime_model(srv->rt);
     if (srv->h3) return H3_SERVED_ID;
+    if (srv->vid) return H3V_SERVED_ID;
+    if (srv->music) return MUSIC_SERVED_ID;
     const cwick_model_spec *spec =
         srv->eng[0] ? cwick_engine_spec(srv->eng[0]) : NULL;
     return spec ? spec->model_type : "";
@@ -6213,6 +6315,10 @@ static void srv_publish_nontext_gauges(server_ctx *srv) {
     } else if (srv->vid) {
         mi.model = H3V_SERVED_ID;
         mi.spine = "bf16";
+    } else if (srv->music) {
+        mi.model = MUSIC_SERVED_ID;
+        mi.spine = "bf16";
+        mi.max_context = MUSIC_MAX_PROMPT_TOKENS;
     } else {
         return;
     }
@@ -6261,6 +6367,25 @@ static char *video_model_entry_json(server_ctx *srv) {
     return b.p;
 }
 
+/* MiniMax-Music3 is a modular pipeline with a fixed served id. It is emitted
+ * separately from the text catalog, which deliberately skips its manifest. */
+static char *music_model_entry_json(server_ctx *srv) {
+    if (!srv->music_dir[0]) return NULL;
+    char *jid = json_str_alloc(MUSIC_SERVED_ID);
+    char *jroot = json_str_alloc(srv->music_dir);
+    srv_buf b = {0};
+    if (jid && jroot)
+        sbuf_putf(&b,
+                  "{\"id\":%s,\"object\":\"model\",\"created\":%lld,"
+                  "\"owned_by\":\"cwick\",\"cwick\":{\"root\":%s,"
+                  "\"loaded\":%s,\"supported\":true,\"kind\":\"music\"}}",
+                  jid, (long long)now_unix(), jroot,
+                  srv->music ? "true" : "false");
+    free(jid);
+    free(jroot);
+    return b.p;
+}
+
 static char *models_json(server_ctx *srv) {
     pthread_mutex_lock(&srv->gen_lock);
     const cwick_model_entry *cur = resident_entry(srv);
@@ -6304,6 +6429,14 @@ static char *models_json(server_ctx *srv) {
         if (any) sbuf_puts(&b, ",");
         sbuf_puts(&b, vid);
         free(vid);
+        any = true;
+    }
+    char *music = music_model_entry_json(srv);
+    if (music) {
+        if (any) sbuf_puts(&b, ",");
+        sbuf_puts(&b, music);
+        free(music);
+        any = true;
     }
     pthread_mutex_unlock(&srv->gen_lock);
     sbuf_puts(&b, "]}");
@@ -6327,6 +6460,11 @@ static char *model_json_one(server_ctx *srv, const char *id) {
         char *vid = video_model_entry_json(srv);
         pthread_mutex_unlock(&srv->gen_lock);
         return vid;
+    }
+    if (strcmp(id, MUSIC_SERVED_ID) == 0 && srv->music_dir[0]) {
+        char *music = music_model_entry_json(srv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return music;
     }
     const cwick_model_entry *cur = resident_entry(srv);
     const cwick_model_entry *hit = NULL;
@@ -6375,12 +6513,13 @@ static char *model_json_one(server_ctx *srv, const char *id) {
  * without going looking for the terminal that started the server. */
 static char *config_json(server_ctx *srv) {
     const cwick_model_entry *cur = resident_entry(srv);
-    const char *id = cur ? served_name(cur)
-                         : (srv->eng[0] ? cwick_engine_spec(srv->eng[0])->model_type
-                                        : "");
+    const char *id = resident_served_name(srv);
     const char *root = cur ? cur->root
                            : (srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
-                                          : "");
+                              : (srv->rt ? srv->realtime_dir
+                                 : (srv->h3 ? srv->image_dir
+                                    : (srv->vid ? srv->video_dir
+                                       : (srv->music ? srv->music_dir : "")))));
     char *jid = json_str_alloc(id);
     char *jroot = json_str_alloc(root);
     char *jhost = json_str_alloc(srv->host);
@@ -6388,6 +6527,7 @@ static char *config_json(server_ctx *srv) {
     char *jcat = json_str_alloc(srv->hub ? cwick_hub_endpoint(srv->hub) : "");
     char *jimg = json_str_alloc(srv->image_dir);
     char *jvid = json_str_alloc(srv->video_dir);
+    char *jmusic = json_str_alloc(srv->music_dir);
     srv_buf b = {0};
     sbuf_putf(&b,
               "{\"model\":%s,\"model_root\":%s,\"host\":%s,\"port\":%d,"
@@ -6398,6 +6538,7 @@ static char *config_json(server_ctx *srv) {
               "\"prefix_cache\":{\"enabled\":%s,\"block_tokens\":%lld},"
               "\"image_model\":{\"dir\":%s,\"loaded\":%s},"
               "\"video_model\":{\"dir\":%s,\"loaded\":%s},"
+              "\"music_model\":{\"dir\":%s,\"loaded\":%s},"
               "\"log_capture\":%s,\"log_retained\":%zu,"
               "\"model_library\":%s,\"model_catalog\":%s,"
               "\"models_dirs\":[",
@@ -6411,10 +6552,11 @@ static char *config_json(server_ctx *srv) {
               srv->pfx ? "true" : "false", (long long)srv->pfx_block,
               jimg ? jimg : "\"\"", srv->h3 ? "true" : "false",
               jvid ? jvid : "\"\"", srv->vid ? "true" : "false",
+              jmusic ? jmusic : "\"\"", srv->music ? "true" : "false",
               cwick_logcap_active() ? "true" : "false", cwick_logcap_lines(),
               jlib ? jlib : "\"\"", jcat ? jcat : "\"\"");
     free(jid); free(jroot); free(jhost); free(jlib); free(jcat); free(jimg);
-    free(jvid);
+    free(jvid); free(jmusic);
     for (int i = 0; i < srv->models_dirs_n; i++) {
         char *jd = json_str_alloc(srv->models_dirs[i]);
         sbuf_putf(&b, "%s%s", i ? "," : "", jd ? jd : "\"\"");
@@ -6465,6 +6607,9 @@ static bool path_is_resident(server_ctx *srv, const char *root) {
     pthread_mutex_lock(&srv->gen_lock);
     const cwick_model_entry *cur = resident_entry(srv);
     bool same = cur && strcmp(cur->root, root) == 0;
+    if (srv->music && strcmp(srv->music_dir, root) == 0) same = true;
+    if (srv->h3 && strcmp(srv->image_dir, root) == 0) same = true;
+    if (srv->vid && strcmp(srv->video_dir, root) == 0) same = true;
     pthread_mutex_unlock(&srv->gen_lock);
     return same;
 }
@@ -6621,6 +6766,11 @@ static bool swap_gate_open(server_ctx *srv, char *why, size_t cap) {
         snprintf(why, cap, "%d video clip(s) are still rendering", srv->vid_busy);
         return false;
     }
+    if (srv->music_busy > 0) {
+        snprintf(why, cap, "%d music generation(s) are in progress",
+                 srv->music_busy);
+        return false;
+    }
     if (rt_realtime_busy(srv->rt)) {
         snprintf(why, cap, "a realtime voice session is connected");
         return false;
@@ -6677,10 +6827,16 @@ static void srv_release_video_model(server_ctx *srv) {
     srv->vid = NULL;
 }
 
-/* The speech pipeline is the third occupant of the one-model slot. Its decoder
- * holds no-copy Metal views over the thinker shards, so it goes before the
- * mappings do, exactly like the image side. The swap gate already refused while
- * a session was connected, so nothing is mid-turn here. */
+/* The music pipeline is another occupant of the one-model slot. The swap gate
+ * refuses while music_busy is non-zero, so no worker can still be reading its
+ * model when this close runs. */
+static void srv_release_music_model(server_ctx *srv) {
+    if (!srv->music) return;
+    music_model_close(srv->music);
+    srv->music = NULL;
+    cwick_metrics_set_model_loaded(false);
+}
+
 static void srv_release_realtime_model(server_ctx *srv) {
     if (!srv->rt) return;
     rt_realtime_close(srv->rt);
@@ -6789,6 +6945,11 @@ static int srv_switch_model(server_ctx *srv, const cwick_model_entry *target,
         CWICK_INFO("model", "releasing video model %s before loading %s",
                    H3V_SERVED_ID, served_name(target));
         srv_release_video_model(srv);
+    }
+    if (srv->music) {
+        CWICK_INFO("model", "releasing music model %s before loading %s",
+                   MUSIC_SERVED_ID, served_name(target));
+        srv_release_music_model(srv);
     }
 
     /* Borrowers before the owner: they borrow the owner's mmaps. */
@@ -7029,7 +7190,8 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
      * clip is reading these shards here. */
     const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
                                   : (srv->rt ? rt_realtime_model(srv->rt)
-                                     : (srv->vid ? H3V_SERVED_ID : "(none)"));
+                                     : (srv->vid ? H3V_SERVED_ID
+                                        : (srv->music ? MUSIC_SERVED_ID : "(none)")));
     CWICK_INFO("model", "switching to image model %s (%s) — releasing %s first "
                         "(one model at a time)", H3_SERVED_ID, srv->image_dir, old);
     srv_release_text_model(srv);
@@ -7045,6 +7207,11 @@ static int srv_switch_image(server_ctx *srv, char *msg, size_t msgcap,
         CWICK_INFO("model", "releasing video model %s before loading %s",
                    H3V_SERVED_ID, H3_SERVED_ID);
         srv_release_video_model(srv);
+    }
+    if (srv->music) {
+        CWICK_INFO("model", "releasing music model %s before loading %s",
+                   MUSIC_SERVED_ID, H3_SERVED_ID);
+        srv_release_music_model(srv);
     }
 
     cwick_error ie;
@@ -7112,7 +7279,8 @@ static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
 
     const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
                                   : (srv->h3 ? H3_SERVED_ID
-                                     : (srv->vid ? H3V_SERVED_ID : "(none)"));
+                                     : (srv->vid ? H3V_SERVED_ID
+                                        : (srv->music ? MUSIC_SERVED_ID : "(none)")));
     CWICK_INFO("model", "switching to realtime model %s — releasing %s first "
                         "(one model at a time)", dir, old);
     srv_release_text_model(srv);
@@ -7128,6 +7296,11 @@ static int srv_switch_realtime(server_ctx *srv, const char *dir, char *msg,
         CWICK_INFO("model", "releasing video model %s before loading the "
                             "realtime model", H3V_SERVED_ID);
         srv_release_video_model(srv);
+    }
+    if (srv->music) {
+        CWICK_INFO("model", "releasing music model %s before loading the "
+                            "realtime model", MUSIC_SERVED_ID);
+        srv_release_music_model(srv);
     }
 
     cwick_error re;
@@ -7219,7 +7392,8 @@ static int srv_switch_video(server_ctx *srv, char *msg, size_t msgcap,
      * generation, voice session or tokenizer user was active. */
     const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
                                   : (srv->rt ? rt_realtime_model(srv->rt)
-                                     : (srv->h3 ? H3_SERVED_ID : "(none)"));
+                                     : (srv->h3 ? H3_SERVED_ID
+                                        : (srv->music ? MUSIC_SERVED_ID : "(none)")));
     CWICK_INFO("model", "switching to video model %s (%s) — releasing %s first "
                         "(one model at a time)", H3V_SERVED_ID, srv->video_dir,
                old);
@@ -7233,6 +7407,11 @@ static int srv_switch_video(server_ctx *srv, char *msg, size_t msgcap,
         CWICK_INFO("model", "releasing image model %s before loading %s",
                    H3_SERVED_ID, H3V_SERVED_ID);
         srv_release_image_model(srv);
+    }
+    if (srv->music) {
+        CWICK_INFO("model", "releasing music model %s before loading %s",
+                   MUSIC_SERVED_ID, H3V_SERVED_ID);
+        srv_release_music_model(srv);
     }
 
     cwick_error ve;
@@ -7259,6 +7438,148 @@ static int srv_switch_video(server_ctx *srv, char *msg, size_t msgcap,
              h3v_model_variant(m));
     CWICK_INFO("model", "switched to video model %s (%s)", H3V_SERVED_ID,
                srv->video_dir);
+    return 200;
+}
+
+/* Resolve the fixed served id to a complete checkpoint in the local hub. The
+ * caller holds gen_lock so concurrent switches cannot race while filling the
+ * configured-directory slot. */
+static int srv_discover_music_dir(server_ctx *srv, char *msg, size_t msgcap) {
+    if (srv->music_dir[0]) return 200;
+    if (!srv->hub) {
+        snprintf(msg, msgcap, "no music directory configured: pass --music DIR "
+                              "or set CWICK_MUSIC_MODEL");
+        return 400;
+    }
+    char *found = cwick_hub_local_path(srv->hub, MUSIC_SERVED_ID);
+    if (!found) {
+        snprintf(msg, msgcap, "no music directory configured: pass --music DIR, "
+                              "set CWICK_MUSIC_MODEL, or download "
+                              MUSIC_SERVED_ID " into the model library");
+        return 400;
+    }
+    int n = snprintf(srv->music_dir, sizeof(srv->music_dir), "%s", found);
+    free(found);
+    if (n < 0 || (size_t)n >= sizeof(srv->music_dir)) {
+        srv->music_dir[0] = '\0';
+        snprintf(msg, msgcap, "music model directory is too long");
+        return 400;
+    }
+    CWICK_INFO("model", "discovered music model at %s", srv->music_dir);
+    return 200;
+}
+
+/* Open MiniMax-Music3 into the one-model slot. `reserve` is used by the async
+ * POST: it increments music_busy before clearing `swapping`, closing the race
+ * where a second request could switch the freshly opened model away before the
+ * first worker had started. */
+static int srv_switch_music(server_ctx *srv, char *msg, size_t msgcap,
+                            bool *already, bool reserve) {
+    if (already) *already = false;
+    pthread_mutex_lock(&srv->gen_lock);
+    int discovered = srv_discover_music_dir(srv, msg, msgcap);
+    if (discovered != 200) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        return discovered;
+    }
+    if (srv->music) {
+        if (reserve) {
+            if (srv->music_busy > 0) {
+                pthread_mutex_unlock(&srv->gen_lock);
+                snprintf(msg, msgcap, "a music generation is already in progress");
+                return 409;
+            }
+            if (srv->stop_owner && *srv->stop_owner) {
+                pthread_mutex_unlock(&srv->gen_lock);
+                snprintf(msg, msgcap, "server is shutting down");
+                return 503;
+            }
+            srv->music_busy++;
+        }
+        if (already) *already = true;
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "music model already loaded from %s", srv->music_dir);
+        return 200;
+    }
+    if (!cwick_model_music_complete(srv->music_dir)) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "music checkpoint is incomplete: expected "
+                              "modular_model_index.json and language_model/, "
+                              "transformer/, vocoder/, tokenizer/ under %s",
+                 srv->music_dir);
+        return 400;
+    }
+    char why[256];
+    if (srv->swapping) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "a model swap is already in progress");
+        return 409;
+    }
+    if (!swap_gate_open(srv, why, sizeof(why))) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "cannot switch to the music model now: %s", why);
+        return 409;
+    }
+    if (srv->stop_owner && *srv->stop_owner) {
+        pthread_mutex_unlock(&srv->gen_lock);
+        snprintf(msg, msgcap, "server is shutting down");
+        return 503;
+    }
+    srv->swapping = true;
+    if (reserve) srv->music_busy++;
+    pthread_mutex_unlock(&srv->gen_lock);
+
+    const char *old = srv->eng[0] ? cwick_engine_model_root(srv->eng[0])
+                                  : (srv->rt ? rt_realtime_model(srv->rt)
+                                     : (srv->h3 ? H3_SERVED_ID
+                                        : (srv->vid ? H3V_SERVED_ID
+                                           : "(none)")));
+    CWICK_INFO("model", "switching to music model %s (%s) — releasing %s first "
+                        "(one model at a time)", MUSIC_SERVED_ID,
+               srv->music_dir, old);
+    srv_release_text_model(srv);
+    if (srv->h3) {
+        CWICK_INFO("model", "releasing image model %s before loading %s",
+                   H3_SERVED_ID, MUSIC_SERVED_ID);
+        srv_release_image_model(srv);
+    }
+    if (srv->vid) {
+        CWICK_INFO("model", "releasing video model %s before loading %s",
+                   H3V_SERVED_ID, MUSIC_SERVED_ID);
+        srv_release_video_model(srv);
+    }
+    if (srv->rt) {
+        CWICK_INFO("model", "releasing realtime model %s before loading %s",
+                   rt_realtime_model(srv->rt), MUSIC_SERVED_ID);
+        srv_release_realtime_model(srv);
+    }
+
+    cwick_error me;
+    cwick_error_clear(&me);
+    music_model *m = music_model_open(srv->music_dir, &me);
+    pthread_mutex_lock(&srv->gen_lock);
+    if (!m || !music_model_ready(m)) {
+        if (m) music_model_close(m);
+        if (reserve && srv->music_busy > 0) srv->music_busy--;
+        snprintf(msg, msgcap, "cannot load music model from %s: %s",
+                 srv->music_dir, me.message[0] ? cwick_error_message(&me)
+                                               : "model is not ready");
+        CWICK_INFO("model", "%s", msg);
+        srv->swapping = false;
+        pthread_cond_broadcast(&srv->gen_cv);
+        pthread_mutex_unlock(&srv->gen_lock);
+        return 500;
+    }
+    srv->music = m;
+    srv->swapping = false;
+    pthread_cond_broadcast(&srv->gen_cv);
+    pthread_mutex_unlock(&srv->gen_lock);
+    srv_publish_nontext_gauges(srv);
+    snprintf(msg, msgcap, "music model loaded from %s (%s) — /v1/generate is "
+                          "ready; text/image/video/realtime endpoints need a "
+                          "switch back", srv->music_dir, MUSIC_SERVED_ID);
+    CWICK_INFO("model", "switched to music model %s (%s)", MUSIC_SERVED_ID,
+               srv->music_dir);
     return 200;
 }
 
@@ -8334,8 +8655,8 @@ static int srv_image_route(server_ctx *srv, int fd, const http_req *req,
                                        "dit", "vae", "png", "done" };
         const char *name = (pr.phase >= 0 && pr.phase <= 7)
                             ? NAMES[pr.phase] : "idle";
-        double now = now_ms();
-        bool stale = (now - pr.stamp_ms) > 10000.0;
+        double age_ms = h3_progress_age_ms(&pr);
+        bool stale = age_ms > 10000.0;
         char body[512];
         snprintf(body, sizeof(body),
                  "{\"object\":\"image_progress\",\"phase\":%d,"
@@ -8343,7 +8664,7 @@ static int srv_image_route(server_ctx *srv, int fd, const http_req *req,
                  "\"idle\":%s,\"age_ms\":%.0f}",
                  pr.phase, name, pr.step, pr.steps,
                  ((pr.phase == 0 || pr.phase == 7 || stale) ? "true" : "false"),
-                 now - pr.stamp_ms);
+                 age_ms);
         http_response(fd, 200, "OK", "application/json; charset=utf-8", body,
                       false);
         return 200;
@@ -9113,6 +9434,1017 @@ static int srv_video_route(server_ctx *srv, int fd, const http_req *req,
     return 200;
 }
 
+/* ---- /v1/generate ----------------------------------------------------
+ * MiniMax-Music3 follows the video resource shape: validate and accept a job,
+ * poll it, then fetch the complete WAV. All aliases are resolved before the
+ * lazy model switch, so a malformed request can never evict the resident model.
+ */
+
+static int64_t music_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static int music_send_error(int fd, int code, const char *msg) {
+    char *jm = cwick_json_stringify(msg ? msg : "music generation error");
+    srv_buf b = {0};
+    sbuf_putf(&b,
+              "{\"code\":%d,\"msg\":%s,\"error\":{\"message\":%s,\"type\":\"%s\","
+              "\"param\":null,\"code\":\"%s\"}}",
+              code, jm ? jm : "\"music generation error\"",
+              jm ? jm : "\"music generation error\"",
+              code >= 500 ? "server_error" :
+              (code == 429 ? "rate_limit_error" : "invalid_request_error"),
+              code == 429 ? "music_busy" :
+              (code == 404 ? "music_not_found" : "music_request_failed"));
+    free(jm);
+    http_response(fd, code, status_text_for(code),
+                  "application/json; charset=utf-8", b.p ? b.p : "{}", false);
+    free(b.p);
+    return code;
+}
+
+static bool music_alias_string(json_value *root, const char *const *names,
+                               size_t nnames, bool required, const char **out,
+                               char *err, size_t errcap) {
+    *out = NULL;
+    for (size_t i = 0; i < nnames; i++) {
+        json_value *v = cwick_json_get(root, names[i]);
+        if (!v || v->kind == JSON_NULL) continue;
+        if (v->kind != JSON_STRING) {
+            snprintf(err, errcap, "%s must be a string", names[i]);
+            return false;
+        }
+        const char *s = cwick_json_str(v);
+        if (*out && strcmp(*out, s) != 0) {
+            snprintf(err, errcap, "conflicting values for %s and %s",
+                     names[0], names[i]);
+            return false;
+        }
+        *out = s;
+    }
+    if (required && (!*out || !**out)) {
+        snprintf(err, errcap, "%s is required", names[0]);
+        return false;
+    }
+    return true;
+}
+
+static bool music_alias_number(json_value *root, const char *const *names,
+                               size_t nnames, double dflt, double lo, double hi,
+                               bool integral, double *out,
+                               char *err, size_t errcap) {
+    bool have = false;
+    double value = dflt;
+    for (size_t i = 0; i < nnames; i++) {
+        json_value *v = cwick_json_get(root, names[i]);
+        if (!v || v->kind == JSON_NULL) continue;
+        if (v->kind != JSON_NUMBER || !isfinite(v->number)) {
+            snprintf(err, errcap, "%s must be a finite number", names[i]);
+            return false;
+        }
+        double x = v->number;
+        if (integral && floor(x) != x) {
+            snprintf(err, errcap, "%s must be an integer", names[i]);
+            return false;
+        }
+        if (have && x != value) {
+            snprintf(err, errcap, "conflicting values for %s and %s",
+                     names[0], names[i]);
+            return false;
+        }
+        value = x;
+        have = true;
+    }
+    if (!isfinite(value) || value < lo || value > hi) {
+        snprintf(err, errcap, "%s must be between %.6g and %.6g",
+                 names[0], lo, hi);
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+static bool music_data_url_base64(const char *s, char *mime, size_t mimecap) {
+    const char *comma = strchr(s, ',');
+    if (!comma || comma == s + 5) return false;
+    size_t hlen = (size_t)(comma - (s + 5));
+    bool base64 = false;
+    for (size_t i = 0; i + 7 <= hlen; i++)
+        if (strncmp(s + 5 + i, ";base64", 7) == 0) { base64 = true; break; }
+    if (!base64) return false;
+    size_t semicolon = hlen;
+    for (size_t i = 0; i < hlen; i++)
+        if (s[5 + i] == ';') { semicolon = i; break; }
+    if (semicolon >= mimecap) semicolon = mimecap - 1;
+    memcpy(mime, s + 5, semicolon);
+    mime[semicolon] = '\0';
+    return true;
+}
+
+static uint16_t music_u16(const unsigned char *p) {
+    return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8);
+}
+static uint32_t music_u32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Structural WAV validation belongs in the POST path, before a bad cover clip
+ * can evict the resident model. Sample-value checks remain in the native
+ * decoder; this mirrors its container/format contract without loading weights. */
+static bool music_reference_wav_valid(const unsigned char *raw, size_t len) {
+    if (len < 12 || memcmp(raw, "RIFF", 4) != 0 ||
+        memcmp(raw + 8, "WAVE", 4) != 0) return false;
+    const unsigned char *fmt = NULL, *pcm = NULL;
+    size_t fmt_len = 0, pcm_len = 0, p = 12;
+    while (p + 8 <= len) {
+        uint32_t n = music_u32(raw + p + 4);
+        size_t body = p + 8;
+        if ((size_t)n > len - body) return false;
+        if (memcmp(raw + p, "fmt ", 4) == 0) { fmt = raw + body; fmt_len = n; }
+        else if (memcmp(raw + p, "data", 4) == 0) { pcm = raw + body; pcm_len = n; }
+        size_t advance = (size_t)n + (n & 1u);
+        if (advance > len - body) break;
+        p = body + advance;
+    }
+    if (!fmt || fmt_len < 16 || !pcm || !pcm_len) return false;
+    uint16_t format = music_u16(fmt), channels = music_u16(fmt + 2);
+    uint32_t rate = music_u32(fmt + 4);
+    uint16_t align = music_u16(fmt + 12), bits = music_u16(fmt + 14);
+    if (format == 0xfffe && fmt_len >= 40) format = music_u16(fmt + 24);
+    if ((format != 1 && format != 3) || (channels != 1 && channels != 2) ||
+        rate == 0 || rate > 384000 || align < channels * (bits / 8) ||
+        (bits != 8 && bits != 16 && bits != 24 && bits != 32)) return false;
+    uint64_t frames = pcm_len / align;
+    return frames > 0 && (long double)frames / rate <= MUSIC_MAX_SECONDS;
+}
+
+static unsigned char *music_decode_reference(const char *field,
+                                              size_t *out_len,
+                                              char *err, size_t errcap) {
+    const char *b64 = field;
+    char mime[64] = "";
+    if (strncmp(field, "data:", 5) == 0) {
+        if (!music_data_url_base64(field, mime, sizeof(mime))) {
+            snprintf(err, errcap, "audio data URL must contain ;base64,");
+            return NULL;
+        }
+        if (mime[0] && strcmp(mime, "audio/wav") != 0 &&
+            strcmp(mime, "audio/wave") != 0 &&
+            strcmp(mime, "audio/x-wav") != 0 &&
+            strcmp(mime, "application/octet-stream") != 0) {
+            snprintf(err, errcap, "cover reference must be WAV audio");
+            return NULL;
+        }
+        b64 = strchr(field, ',') + 1;
+    }
+    if (!*b64) {
+        snprintf(err, errcap, "cover reference audio is empty");
+        return NULL;
+    }
+    size_t len = 0;
+    unsigned char *raw = (unsigned char *)cwick_b64_decode(b64, strlen(b64), &len);
+    if (!raw || !music_reference_wav_valid(raw, len)) {
+        free(raw);
+        snprintf(err, errcap, "cover reference must be a valid base64 or data-URL WAV");
+        return NULL;
+    }
+    *out_len = len;
+    return raw;
+}
+
+static unsigned char *music_copy_job_reference(server_ctx *srv, const char *task_id,
+                                                const char *audio_id, size_t *out_len,
+                                                char *err, size_t errcap) {
+    pthread_mutex_lock(&srv->mbook.lock);
+    music_job *found = NULL;
+    for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+        music_job *j = &srv->mbook.jobs[i];
+        if (j->used && strcmp(j->id, task_id) == 0) { found = j; break; }
+    }
+    if (!found || strcmp(found->status, "completed") != 0 || !found->wav || !found->wav_len) {
+        pthread_mutex_unlock(&srv->mbook.lock);
+        snprintf(err, errcap, "taskId does not refer to a completed local music job");
+        return NULL;
+    }
+    if (strcmp(found->id, audio_id) != 0) {
+        pthread_mutex_unlock(&srv->mbook.lock);
+        snprintf(err, errcap, "audioId must match the local job id");
+        return NULL;
+    }
+    unsigned char *copy = (unsigned char *)malloc(found->wav_len);
+    if (copy) memcpy(copy, found->wav, found->wav_len);
+    *out_len = found->wav_len;
+    pthread_mutex_unlock(&srv->mbook.lock);
+    if (!copy) snprintf(err, errcap, "out of memory reading reference audio");
+    return copy;
+}
+
+static double music_phase_progress(const char *phase, double frac) {
+    double base = 0.0, span = 0.05;
+    if (strcmp(phase, MUSIC_PHASE_TOKENIZE) == 0) { base = 0.05; span = 0.05; }
+    else if (strcmp(phase, MUSIC_PHASE_REFERENCE) == 0) { base = 0.10; span = 0.10; }
+    else if (strcmp(phase, MUSIC_PHASE_GLOBAL) == 0) { base = 0.20; span = 0.15; }
+    else if (strcmp(phase, MUSIC_PHASE_DEPTH) == 0) { base = 0.35; span = 0.15; }
+    else if (strcmp(phase, MUSIC_PHASE_CONDITION) == 0) { base = 0.50; span = 0.05; }
+    else if (strcmp(phase, MUSIC_PHASE_FLOW) == 0) { base = 0.55; span = 0.35; }
+    else if (strcmp(phase, MUSIC_PHASE_VOCODER) == 0) { base = 0.90; span = 0.07; }
+    else if (strcmp(phase, MUSIC_PHASE_WAV) == 0) { base = 0.97; span = 0.03; }
+    if (!isfinite(frac)) frac = 0;
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+    double p = base + span * frac;
+    return p > 1.0 ? 1.0 : p;
+}
+
+typedef struct {
+    server_ctx *srv;
+    int idx;
+    uint64_t rid;
+    int last_pct;
+    int stage_idx;
+    char last_phase[24];
+    double phase_started_ms;
+} music_cb_ctx;
+
+static void music_progress(void *p, const char *phase, int64_t done, int64_t total,
+                           double frac) {
+    music_cb_ctx *c = (music_cb_ctx *)p;
+    if (!phase || !*phase) phase = "unknown";
+    double mono = now_ms();
+    double progress = music_phase_progress(phase, frac);
+
+    pthread_mutex_lock(&c->srv->mbook.lock);
+    music_job *j = &c->srv->mbook.jobs[c->idx];
+    if (j->used) {
+        /* The engine emits final completion callbacks for earlier phases after
+         * flow has finished. Keep the user-visible aggregate monotonic. */
+        if (j->progress > progress) progress = j->progress;
+        if (strcmp(j->phase, phase) != 0) {
+            if (j->stage_n > 0 && c->stage_idx >= 0) {
+                music_stage_record *prev = &j->stages[c->stage_idx];
+                prev->duration_ms += (int64_t)(mono - c->phase_started_ms);
+            }
+            int stage_idx = -1;
+            for (int i = 0; i < j->stage_n; i++)
+                if (strcmp(j->stages[i].phase, phase) == 0) { stage_idx = i; break; }
+            if (stage_idx < 0 && j->stage_n < CWICK_MUSIC_STAGES) {
+                stage_idx = j->stage_n++;
+                memset(&j->stages[stage_idx], 0, sizeof(j->stages[stage_idx]));
+                snprintf(j->stages[stage_idx].phase, sizeof(j->stages[stage_idx].phase),
+                         "%s", phase);
+                j->stages[stage_idx].started_at = music_now_ms();
+            }
+            if (stage_idx >= 0) {
+                j->stages[stage_idx].done = done;
+                j->stages[stage_idx].total = total;
+            }
+            c->stage_idx = stage_idx;
+            c->phase_started_ms = mono;
+        } else if (c->stage_idx >= 0) {
+            music_stage_record *st = &j->stages[c->stage_idx];
+            st->done = done;
+            st->total = total;
+        }
+        snprintf(j->phase, sizeof(j->phase), "%s", phase);
+        j->progress = progress;
+        if (strcmp(phase, MUSIC_PHASE_FLOW) == 0) {
+            j->steps_done = done;
+            j->steps_total = total;
+        }
+        if (strcmp(j->status, "queued") == 0)
+            snprintf(j->status, sizeof(j->status), "in_progress");
+    }
+    pthread_mutex_unlock(&c->srv->mbook.lock);
+    cwick_metrics_music_progress(phase, done, total, progress);
+
+    int pct = (int)(progress * 100.0 + 0.5);
+    if (pct != c->last_pct || strcmp(phase, c->last_phase) != 0) {
+        c->last_pct = pct;
+        snprintf(c->last_phase, sizeof(c->last_phase), "%s", phase);
+        CWICK_INFO("music", "%s job %s phase=%s %d%% (%lld/%lld)",
+                   req_tag(c->rid), c->srv->mbook.jobs[c->idx].id,
+                   phase, pct, (long long)done, (long long)total);
+    }
+}
+
+static void music_job_free_contents(music_job *j) {
+    if (!j) return;
+    free(j->prompt);
+    free(j->lyrics);
+    free(j->title);
+    free(j->style);
+    free(j->reference_audio);
+    if (j->wav) music_wav_free(j->wav);
+    j->prompt = NULL;
+    j->lyrics = NULL;
+    j->title = NULL;
+    j->style = NULL;
+    j->reference_audio = NULL;
+    j->wav = NULL;
+}
+
+static void *music_worker(void *arg) {
+    music_cb_ctx *c = (music_cb_ctx *)arg;
+    server_ctx *srv = c->srv;
+    cwick_log_set_request(c->rid);
+    music_request req;
+    memset(&req, 0, sizeof(req));
+    req.task = c->srv->mbook.jobs[c->idx].task;
+    req.prompt = c->srv->mbook.jobs[c->idx].prompt;
+    req.lyrics = c->srv->mbook.jobs[c->idx].lyrics;
+    req.reference_audio = c->srv->mbook.jobs[c->idx].reference_audio;
+    req.reference_len = c->srv->mbook.jobs[c->idx].reference_len;
+    req.seconds = c->srv->mbook.jobs[c->idx].seconds;
+    req.seed = c->srv->mbook.jobs[c->idx].seed;
+    req.steps = c->srv->mbook.jobs[c->idx].steps;
+    req.cfg_scale = c->srv->mbook.jobs[c->idx].cfg_scale;
+    req.temperature = c->srv->mbook.jobs[c->idx].temperature;
+    req.top_k = c->srv->mbook.jobs[c->idx].top_k;
+    req.audio_weight = c->srv->mbook.jobs[c->idx].audio_weight;
+    req.progress = music_progress;
+    req.progress_ctx = c;
+    req.cancel = &c->srv->mbook.jobs[c->idx].cancel;
+
+    unsigned char *wav = NULL;
+    size_t wav_len = 0;
+    music_timing tim;
+    memset(&tim, 0, sizeof(tim));
+    cwick_error ge;
+    cwick_error_clear(&ge);
+    bool ok = music_generate(srv->music, &req, &wav, &wav_len, &tim, &ge);
+    bool cancelled = !ok && atomic_load_explicit(&c->srv->mbook.jobs[c->idx].cancel,
+                                                  memory_order_relaxed) != 0;
+    cwick_music_outcome outcome = ok ? CWICK_MUSIC_SUCCEEDED
+                                     : (cancelled ? CWICK_MUSIC_CANCELLED
+                                                  : CWICK_MUSIC_FAILED);
+
+    pthread_mutex_lock(&srv->mbook.lock);
+    music_job *j = &srv->mbook.jobs[c->idx];
+    if (j->used) {
+        j->tim = tim;
+        j->has_tim = true;
+        j->completed = (int64_t)time(NULL);
+        if (c->stage_idx >= 0) {
+            music_stage_record *st = &j->stages[c->stage_idx];
+            if (!st->duration_ms)
+                st->duration_ms = (int64_t)(now_ms() - c->phase_started_ms);
+        }
+        if (ok) {
+            j->wav = wav;
+            j->wav_len = wav_len;
+            j->progress = 1.0;
+            snprintf(j->phase, sizeof(j->phase), "done");
+            snprintf(j->status, sizeof(j->status), "completed");
+            j->error[0] = '\0';
+        } else {
+            if (wav) music_wav_free(wav);
+            wav = NULL;
+            j->progress = 0;
+            snprintf(j->phase, sizeof(j->phase),
+                     cancelled ? "cancelled" : "error");
+            snprintf(j->status, sizeof(j->status),
+                     cancelled ? "cancelled" : "failed");
+            snprintf(j->error, sizeof(j->error), "%s",
+                     cancelled ? "music generation cancelled" :
+                     (ge.message[0] ? ge.message : "music generation failed"));
+        }
+        double output_seconds = MUSIC_SAMPLE_RATE
+                              ? (double)tim.audio_samples / MUSIC_SAMPLE_RATE : 0.0;
+        double duration_ratio = j->seconds > 0 ? output_seconds / j->seconds : 0.0;
+        CWICK_INFO("music", "%s job %s %s: %.1f ms, %zu bytes, %.3f s, "
+                           "requested=%d s duration_ratio=%.1f%% %lld samples "
+                           "(load %.1f, tokenize %.1f, reference %.1f, "
+                   "global %.1f, depth %.1f, condition %.1f, flow %.1f, "
+                   "vocoder %.1f, wav %.1f)",
+                   req_tag(c->rid), j->id, j->status, tim.total_ms, wav_len,
+                   output_seconds, j->seconds, duration_ratio * 100.0,
+                   (long long)tim.audio_samples, tim.load_ms, tim.tokenize_ms,
+                   tim.reference_encode_ms, tim.global_lm_ms, tim.depth_ms,
+                   tim.condition_ms, tim.flow_ms, tim.vocoder_ms, tim.wav_ms);
+    } else if (wav) {
+        music_wav_free(wav);
+    }
+    pthread_mutex_unlock(&srv->mbook.lock);
+
+    cwick_metrics_music_observe(&tim, outcome);
+    pthread_mutex_lock(&srv->gen_lock);
+    if (srv->music_busy > 0) srv->music_busy--;
+    pthread_cond_broadcast(&srv->gen_cv);
+    pthread_mutex_unlock(&srv->gen_lock);
+    pthread_mutex_lock(&srv->mbook.lock);
+    if (srv->mbook.workers > 0) srv->mbook.workers--;
+    pthread_mutex_unlock(&srv->mbook.lock);
+    free(c);
+    cwick_log_set_request(0);
+    return NULL;
+}
+
+static double music_time_safe(double ms) {
+    return isfinite(ms) && ms >= 0.0 ? ms : 0.0;
+}
+
+static double music_stage_time_ms(const music_timing *tim, const char *phase) {
+    if (strcmp(phase, MUSIC_PHASE_LOAD) == 0) return tim->load_ms;
+    if (strcmp(phase, MUSIC_PHASE_TOKENIZE) == 0) return tim->tokenize_ms;
+    if (strcmp(phase, MUSIC_PHASE_REFERENCE) == 0) return tim->reference_encode_ms;
+    if (strcmp(phase, MUSIC_PHASE_GLOBAL) == 0) return tim->global_lm_ms;
+    if (strcmp(phase, MUSIC_PHASE_DEPTH) == 0) return tim->depth_ms;
+    if (strcmp(phase, MUSIC_PHASE_CONDITION) == 0) return tim->condition_ms;
+    if (strcmp(phase, MUSIC_PHASE_FLOW) == 0) return tim->flow_ms;
+    if (strcmp(phase, MUSIC_PHASE_VOCODER) == 0) return tim->vocoder_ms;
+    if (strcmp(phase, MUSIC_PHASE_WAV) == 0) return tim->wav_ms;
+    return 0.0;
+}
+
+static char *music_job_json(const music_job *j, bool detail) {
+    char *jp = cwick_json_stringify(j->prompt ? j->prompt : "");
+    char *jl = cwick_json_stringify(j->lyrics ? j->lyrics : "");
+    char *jt = cwick_json_stringify(j->title ? j->title : "");
+    char *js = cwick_json_stringify(j->style ? j->style : "");
+    char *jphase = cwick_json_stringify(j->phase);
+    char *jerr = cwick_json_stringify(j->error);
+    char *jid = cwick_json_stringify(j->id);
+    srv_buf b = {0};
+    sbuf_putf(&b,
+              "{\"id\":%s,\"object\":\"music\",\"created_at\":%lld,"
+              "\"request_id\":%llu,\"model\":\"%s\",\"task\":\"%s\","
+              "\"status\":\"%s\",\"phase\":%s,\"progress\":%.6f,"
+              "\"progress_percent\":%d,\"steps_done\":%lld,\"steps_total\":%lld,"
+              "\"prompt\":%s,\"lyrics\":%s,\"seconds\":%d,\"seed\":%llu,"
+              "\"steps\":%d,\"cfg_scale\":%.6g,\"temperature\":%.6g,"
+              "\"top_k\":%d,\"audio_weight\":%.6g,"
+              "\"instrumental\":%s,\"custom_mode\":%s,"
+              "\"sample_rate\":%d,\"channels\":%d",
+              jid ? jid : "\"\"", (long long)j->created,
+              (unsigned long long)j->request_id, MUSIC_SERVED_ID,
+              j->task == MUSIC_TASK_COVER ? "cover" : "generate",
+              j->status, jphase ? jphase : "\"\"", j->progress,
+              (int)(j->progress * 100.0 + 0.5),
+              (long long)j->steps_done, (long long)j->steps_total,
+              jp ? jp : "\"\"", jl ? jl : "\"\"", j->seconds,
+              (unsigned long long)j->seed, j->steps, j->cfg_scale,
+              j->temperature, j->top_k, j->audio_weight,
+              j->instrumental ? "true" : "false",
+              j->custom_mode ? "true" : "false", MUSIC_SAMPLE_RATE, MUSIC_CHANNELS);
+    if (j->title && *j->title) sbuf_putf(&b, ",\"title\":%s", jt ? jt : "\"\"");
+    if (j->style && *j->style) sbuf_putf(&b, ",\"style\":%s", js ? js : "\"\"");
+    if (j->completed)
+        sbuf_putf(&b, ",\"completed_at\":%lld", (long long)j->completed);
+    if (j->wav && j->wav_len) {
+        double seconds = MUSIC_SAMPLE_RATE
+                       ? (double)j->tim.audio_samples / MUSIC_SAMPLE_RATE : 0.0;
+        sbuf_putf(&b,
+                  ",\"output_bytes\":%zu,\"duration_seconds\":%.6f,"
+                  "\"output\":{\"bytes\":%zu,\"duration_seconds\":%.6f,"
+                  "\"sample_rate\":%d,\"channels\":%d,\"samples\":%lld,"
+                  "\"format\":\"wav\"},\"content_url\":\"/v1/generate/%s/content\"",
+                  j->wav_len, seconds, j->wav_len, seconds, MUSIC_SAMPLE_RATE,
+                  MUSIC_CHANNELS, (long long)j->tim.audio_samples,
+                  j->id);
+    }
+    if ((strcmp(j->status, "failed") == 0 ||
+         strcmp(j->status, "cancelled") == 0) && j->error[0]) {
+        sbuf_putf(&b,
+                  ",\"error\":{\"message\":%s,\"type\":\"%s\","
+                  "\"code\":\"%s\"}",
+                  jerr ? jerr : "\"music generation failed\"",
+                  strcmp(j->status, "cancelled") == 0 ? "cancelled" : "server_error",
+                  strcmp(j->status, "cancelled") == 0 ? "music_cancelled"
+                                                       : "music_failed");
+    }
+    if (detail) {
+        sbuf_putf(&b, ",\"reference_audio\":{\"bytes\":%zu},"
+                      "\"stage_history\":[", j->reference_len);
+        bool stage_first = true;
+        if (j->has_tim && j->tim.load_ms > 0.0) {
+            sbuf_putf(&b, "{\"phase\":\"load\",\"started_at\":0,"
+                          "\"duration_ms\":%.0f,\"done\":1,\"total\":1}",
+                      music_time_safe(j->tim.load_ms));
+            stage_first = false;
+        }
+        for (int i = 0; i < j->stage_n; i++) {
+            const music_stage_record *st = &j->stages[i];
+            char *sp = cwick_json_stringify(st->phase);
+            double stage_ms = j->has_tim ? music_stage_time_ms(&j->tim, st->phase) : st->duration_ms;
+            if (j->has_tim && stage_ms == 0.0 && st->duration_ms > 0) stage_ms = st->duration_ms;
+            sbuf_putf(&b, "%s{\"phase\":%s,\"started_at\":%lld,"
+                          "\"duration_ms\":%.0f,\"done\":%lld,\"total\":%lld}",
+                      stage_first ? "" : ",", sp ? sp : "\"\"",
+                      (long long)st->started_at, music_time_safe(stage_ms),
+                      (long long)st->done, (long long)st->total);
+            stage_first = false;
+            free(sp);
+        }
+        sbuf_puts(&b, "]");
+        if (j->has_tim) {
+            sbuf_putf(&b,
+                      ",\"timing\":{\"total_ms\":%.3f,\"load_ms\":%.3f,"
+                      "\"tokenize_ms\":%.3f,\"reference_encode_ms\":%.3f,"
+                      "\"global_lm_ms\":%.3f,\"depth_ms\":%.3f,"
+                      "\"condition_ms\":%.3f,\"flow_ms\":%.3f,"
+                      "\"vocoder_ms\":%.3f,\"wav_ms\":%.3f,"
+                      "\"prompt_tokens\":%lld,\"frames\":%lld,"
+                      "\"requested_frames\":%lld,\"ended_early\":%s,"
+                      "\"ar_attempts\":%d,\"flow_steps\":%lld,\"audio_samples\":%lld,"
+                      "\"output_bytes\":%lld,\"cover\":%s}",
+                      music_time_safe(j->tim.total_ms), music_time_safe(j->tim.load_ms),
+                      music_time_safe(j->tim.tokenize_ms),
+                      music_time_safe(j->tim.reference_encode_ms),
+                      music_time_safe(j->tim.global_lm_ms), music_time_safe(j->tim.depth_ms),
+                      music_time_safe(j->tim.condition_ms), music_time_safe(j->tim.flow_ms),
+                      music_time_safe(j->tim.vocoder_ms), music_time_safe(j->tim.wav_ms),
+                      (long long)j->tim.prompt_tokens, (long long)j->tim.frames,
+                      (long long)j->tim.requested_frames, j->tim.ended_early ? "true" : "false",
+                      j->tim.ar_attempts,
+                      (long long)j->tim.flow_steps, (long long)j->tim.audio_samples,
+                      (long long)j->tim.output_bytes, j->tim.cover ? "true" : "false");
+        }
+    }
+    sbuf_puts(&b, "}");
+    free(jp); free(jl); free(jt); free(js); free(jphase); free(jerr); free(jid);
+    return b.p;
+}
+
+static char *music_envelope_json(const char *job_json, const char *id) {
+    char *jid = cwick_json_stringify(id ? id : "");
+    srv_buf b = {0};
+    sbuf_putf(&b, "{\"code\":200,\"msg\":\"success\",\"data\":{\"taskId\":%s",
+              jid ? jid : "\"\"");
+    if (job_json && job_json[0] == '{') {
+        sbuf_putf(&b, ",%s", job_json + 1);
+        sbuf_puts(&b, "}");
+    } else {
+        sbuf_puts(&b, "}}");
+    }
+    free(jid);
+    return b.p;
+}
+
+static int srv_music_route(server_ctx *srv, int fd, const http_req *req,
+                           const char *ponly, uint64_t rid) {
+    const char *idpart = NULL;
+    if (strncmp(ponly, "/v1/generate/", 13) == 0) idpart = ponly + 13;
+    else if (strncmp(ponly, "/generate/", 10) == 0) idpart = ponly + 10;
+    bool upload_cover = strcmp(ponly, "/v1/generate/upload-cover") == 0 ||
+                        strcmp(ponly, "/generate/upload-cover") == 0;
+    bool record_generation = strcmp(ponly, "/v1/generate/record-generation") == 0 ||
+                             strcmp(ponly, "/generate/record-generation") == 0;
+    char record_id[96];
+    if (record_generation) {
+        const char *q = strstr(req->path, "?id=");
+        if (!q) q = strstr(req->path, "&id=");
+        if (!q) return music_send_error(fd, 400, "id query parameter is required");
+        q += 4;
+        size_t n = 0;
+        while (q[n] && q[n] != '&' && q[n] != '#' && n + 1 < sizeof(record_id)) {
+            record_id[n] = q[n];
+            n++;
+        }
+        record_id[n] = '\0';
+        if (!n) return music_send_error(fd, 400, "id query parameter is required");
+        idpart = record_id;
+    }
+    bool collection = upload_cover || strcmp(ponly, "/v1/generate") == 0 ||
+                      strcmp(ponly, "/generate") == 0;
+    if (!collection && !idpart) return -1;
+    if (collection && strcmp(req->method, "GET") != 0 &&
+        strcmp(req->method, "POST") != 0) return -1;
+
+    if (collection && strcmp(req->method, "GET") == 0) {
+        srv_buf b = {0};
+        sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");
+        pthread_mutex_lock(&srv->mbook.lock);
+        bool first = true;
+        for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+            music_job *j = &srv->mbook.jobs[i];
+            if (!j->used) continue;
+            char *one = music_job_json(j, false);
+            if (!one) continue;
+            if (!first) sbuf_puts(&b, ",");
+            sbuf_puts(&b, one);
+            free(one);
+            first = false;
+        }
+        pthread_mutex_unlock(&srv->mbook.lock);
+        sbuf_puts(&b, "]}");
+        http_response(fd, 200, "OK", "application/json; charset=utf-8",
+                      b.p ? b.p : "{}", false);
+        free(b.p);
+        return 200;
+    }
+
+    if (collection) {
+        if (!req->body_len)
+            return music_send_error(fd, 400, "empty request body");
+        cwick_error je;
+        cwick_error_clear(&je);
+        json_value *root = cwick_json_parse(req->body, req->body_len, &je);
+        if (!root)
+            return music_send_error(fd, 400, cwick_error_message(&je));
+        if (root->kind != JSON_OBJECT) {
+            cwick_json_free(root);
+            return music_send_error(fd, 400, "request body must be a JSON object");
+        }
+        char err[256] = "";
+        const char *prompt = NULL, *lyrics = NULL, *task_s = NULL, *ref_s = NULL;
+        const char *task_id = NULL, *audio_id = NULL;
+        const char *const prompt_names[] = {"prompt", "gpt_description_prompt"};
+        const char *const lyric_names[] = {"lyrics"};
+        const char *const style_names[] = {"style"};
+        const char *const title_names[] = {"title"};
+        const char *const duration_names[] = {"duration", "seconds"};
+        const char *const reference_names[] = {"audio", "reference_audio", "audio_url", "uploadUrl"};
+        const char *const seed_names[] = {"seed"};
+        const char *const steps_names[] = {"steps"};
+        const char *const cfg_names[] = {"cfg_scale"};
+        const char *const temperature_names[] = {"temperature"};
+        const char *const topk_names[] = {"top_k"};
+        const char *const audio_weight_names[] = {"audioWeight", "audio_weight"};
+        const char *const task_id_names[] = {"taskId"};
+        const char *const audio_id_names[] = {"audioId"};
+        const char *style = NULL, *title = NULL;
+        double duration = 20.0, seed_d = 0.0, steps_d = MUSIC_DEFAULT_STEPS;
+        double cfg_d = 1.7, temperature_d = 1.0, topk_d = 50.0, audio_weight_d = 0.85;
+        bool custom_mode = false, instrumental = false;
+        bool valid = true;
+        valid = valid && music_alias_string(root, prompt_names, 2, false, &prompt,
+                                             err, sizeof(err));
+        if (valid && prompt && strlen(prompt) > 65536) {
+            snprintf(err, sizeof(err), "prompt is too long (maximum 65536 bytes)");
+            valid = false;
+        }
+        valid = valid && music_alias_string(root, lyric_names, 1, false, &lyrics,
+                                             err, sizeof(err));
+        if (valid && lyrics && strlen(lyrics) > 65536) {
+            snprintf(err, sizeof(err), "lyrics is too long (maximum 65536 bytes)");
+            valid = false;
+        }
+        valid = valid && music_alias_string(root, style_names, 1, false, &style,
+                                             err, sizeof(err));
+        if (valid && style && strlen(style) > 4000) {
+            snprintf(err, sizeof(err), "style is too long (maximum 4000 bytes)");
+            valid = false;
+        }
+        valid = valid && music_alias_string(root, title_names, 1, false, &title,
+                                             err, sizeof(err));
+        if (valid && title && strlen(title) > 80) {
+            snprintf(err, sizeof(err), "title is too long (maximum 80 bytes)");
+            valid = false;
+        }
+        json_value *customv = cwick_json_get(root, "customMode");
+        if (valid && customv && customv->kind != JSON_NULL) {
+            if (customv->kind != JSON_BOOL) {
+                snprintf(err, sizeof(err), "customMode must be a boolean");
+                valid = false;
+            } else custom_mode = cwick_json_bool(customv, false);
+        }
+        json_value *instrumentalv = cwick_json_get(root, "instrumental");
+        if (valid && instrumentalv && instrumentalv->kind != JSON_NULL) {
+            if (instrumentalv->kind != JSON_BOOL) {
+                snprintf(err, sizeof(err), "instrumental must be a boolean");
+                valid = false;
+            } else instrumental = cwick_json_bool(instrumentalv, false);
+        }
+        json_value *taskv = cwick_json_get(root, "task");
+        if (valid && taskv && taskv->kind != JSON_NULL) {
+            if (taskv->kind != JSON_STRING) {
+                snprintf(err, sizeof(err), "task must be generate or cover");
+                valid = false;
+            } else {
+                task_s = cwick_json_str(taskv);
+                if (!task_s || (strcmp(task_s, "generate") != 0 &&
+                                strcmp(task_s, "cover") != 0)) {
+                    snprintf(err, sizeof(err), "task must be generate or cover");
+                    valid = false;
+                }
+            }
+        }
+        json_value *modelv = cwick_json_get(root, "model");
+        if (valid && modelv && modelv->kind != JSON_NULL) {
+            if (modelv->kind != JSON_STRING) {
+                snprintf(err, sizeof(err), "model must be %s", MUSIC_SERVED_ID);
+                valid = false;
+            } else {
+                const char *model = cwick_json_str(modelv);
+                if (model && *model && strcmp(model, MUSIC_SERVED_ID) != 0) {
+                    snprintf(err, sizeof(err), "unsupported music model '%s'", model);
+                    valid = false;
+                }
+            }
+        }
+        static const char *const unsupported_fields[] = {
+            "callBackUrl", "negativeTags", "vocalGender", "styleWeight",
+            "weirdnessConstraint", "variety", "personaId", "personaModel",
+            "imageUrls", "videoUrls", "audioUrls", "midiUrls"
+        };
+        for (size_t i = 0; valid && i < sizeof(unsupported_fields) / sizeof(unsupported_fields[0]); i++) {
+            json_value *v = cwick_json_get(root, unsupported_fields[i]);
+            if (v && v->kind != JSON_NULL) {
+                snprintf(err, sizeof(err), "%s is not supported by the local Music3 adapter",
+                         unsupported_fields[i]);
+                valid = false;
+            }
+        }
+        valid = valid && music_alias_number(root, duration_names, 2, 15.0,
+                                             MUSIC_MIN_SECONDS, MUSIC_MAX_SECONDS,
+                                             true, &duration, err, sizeof(err));
+        valid = valid && music_alias_number(root, seed_names, 1, 0.0, 0.0,
+                                             9007199254740991.0, true,
+                                             &seed_d, err, sizeof(err));
+        valid = valid && music_alias_number(root, steps_names, 1, MUSIC_DEFAULT_STEPS,
+                                             1.0, 100.0, true,
+                                             &steps_d, err, sizeof(err));
+        valid = valid && music_alias_number(root, cfg_names, 1, 1.7, 0.000001, 10.0,
+                                             false, &cfg_d, err, sizeof(err));
+        valid = valid && music_alias_number(root, temperature_names, 1, 1.0,
+                                             0.0, 5.0, false,
+                                             &temperature_d, err, sizeof(err));
+        valid = valid && music_alias_number(root, topk_names, 1, 50.0, 0.0,
+                                             10000.0, true, &topk_d, err, sizeof(err));
+        valid = valid && music_alias_number(root, audio_weight_names, 2, 0.85, 0.0,
+                                             1.0, false, &audio_weight_d, err, sizeof(err));
+        valid = valid && music_alias_string(root, reference_names, 4, false, &ref_s,
+                                             err, sizeof(err));
+        valid = valid && music_alias_string(root, task_id_names, 1, false, &task_id,
+                                             err, sizeof(err));
+        valid = valid && music_alias_string(root, audio_id_names, 1, false, &audio_id,
+                                             err, sizeof(err));
+        music_task task = task_s && strcmp(task_s, "cover") == 0
+                        ? MUSIC_TASK_COVER : MUSIC_TASK_GENERATE;
+        if (upload_cover) task = MUSIC_TASK_COVER;
+        unsigned char *reference = NULL;
+        size_t reference_len = 0;
+        if (valid && task == MUSIC_TASK_COVER) {
+            if (ref_s && (task_id || audio_id)) {
+                snprintf(err, sizeof(err), "uploadUrl/audio and taskId/audioId are mutually exclusive");
+                valid = false;
+            } else if (ref_s && *ref_s) {
+                reference = music_decode_reference(ref_s, &reference_len, err, sizeof(err));
+                valid = reference != NULL;
+            } else if (task_id && *task_id && audio_id && *audio_id) {
+                reference = music_copy_job_reference(srv, task_id, audio_id,
+                                                     &reference_len, err, sizeof(err));
+                valid = reference != NULL;
+            } else {
+                snprintf(err, sizeof(err), "cover requires audio/uploadUrl or taskId and audioId");
+                valid = false;
+            }
+        } else if (valid && (ref_s || task_id || audio_id)) {
+            snprintf(err, sizeof(err), "reference audio is only valid for task=cover");
+            valid = false;
+        }
+        if (!valid) {
+            free(reference);
+            cwick_json_free(root);
+            return music_send_error(fd, 400, err);
+        }
+        if (valid && !instrumentalv && music_lyrics_are_instrumental(lyrics))
+            instrumental = true;
+        if (valid && !prompt && !style) {
+            snprintf(err, sizeof(err), "prompt or style is required");
+            valid = false;
+        }
+        if (valid && instrumental && music_has_sung_text(lyrics)) {
+            snprintf(err, sizeof(err), "instrumental generation accepts section tags only; remove sung text");
+            valid = false;
+        }
+        if (valid && !instrumental && !music_has_sung_text(lyrics)) {
+            snprintf(err, sizeof(err), "vocal generation requires lyric text; set instrumental=true for pure music");
+            valid = false;
+        }
+        char *prompt_copy = NULL, *lyrics_copy = NULL;
+        char *title_copy = NULL, *style_copy = NULL;
+        if (valid) {
+            if (custom_mode) {
+                const char *description = style && *style ? style : prompt;
+                prompt_copy = strdup(description && *description ? description : "music");
+            } else if (prompt && *prompt && style && *style) {
+                size_t n = strlen(prompt) + strlen(style) + 16;
+                prompt_copy = (char *)malloc(n);
+                if (prompt_copy)
+                    snprintf(prompt_copy, n, "%s\n\nStyle: %s", prompt, style);
+            } else {
+                const char *description = prompt && *prompt ? prompt : style;
+                prompt_copy = strdup(description && *description ? description : "music");
+            }
+            lyrics_copy = strdup(instrumental
+                                     ? (lyrics && *lyrics ? lyrics : "[Instrumental]")
+                                     : lyrics);
+            title_copy = strdup(title ? title : "");
+            style_copy = strdup(style ? style : "");
+        }
+        cwick_json_free(root);
+        if (!valid || !prompt_copy || !lyrics_copy || !title_copy || !style_copy) {
+            free(prompt_copy); free(lyrics_copy); free(title_copy); free(style_copy); free(reference);
+            return music_send_error(fd, valid ? 500 : 400,
+                                     valid ? "out of memory accepting music job" : err);
+        }
+
+        /* Serialize acceptance itself. A successful lazy open reserves the
+         * render slot before returning; a second POST then gets 429 rather than
+         * loading a second model or mutating the resident one concurrently. */
+        pthread_mutex_lock(&srv->music_start_lock);
+        pthread_mutex_lock(&srv->mbook.lock);
+        bool stopping = srv->mbook.shutting_down;
+        pthread_mutex_unlock(&srv->mbook.lock);
+        int status = 200;
+        bool already = false;
+        char smsg[512] = "";
+        if (!stopping)
+            status = srv_switch_music(srv, smsg, sizeof(smsg), &already, true);
+        if (stopping || status != 200) {
+            pthread_mutex_unlock(&srv->music_start_lock);
+            free(prompt_copy); free(lyrics_copy); free(title_copy); free(style_copy); free(reference);
+            return music_send_error(fd, status == 409 ? 429 : status,
+                                     status == 409 ? "music worker is busy" :
+                                     (stopping ? "server is shutting down" : smsg));
+        }
+
+        pthread_mutex_lock(&srv->mbook.lock);
+        int idx = -1;
+        for (int i = 0; i < CWICK_MUSIC_JOBS; i++)
+            if (!srv->mbook.jobs[i].used) { idx = i; break; }
+        if (idx < 0) {
+            for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+                music_job *j = &srv->mbook.jobs[i];
+                if (j->thread_started &&
+                    (strcmp(j->status, "completed") == 0 ||
+                     strcmp(j->status, "failed") == 0 ||
+                     strcmp(j->status, "cancelled") == 0)) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&srv->mbook.lock);
+        if (idx < 0) {
+            pthread_mutex_lock(&srv->gen_lock);
+            if (srv->music_busy > 0) srv->music_busy--;
+            pthread_cond_broadcast(&srv->gen_cv);
+            pthread_mutex_unlock(&srv->gen_lock);
+            pthread_mutex_unlock(&srv->music_start_lock);
+            free(prompt_copy); free(lyrics_copy); free(title_copy); free(style_copy); free(reference);
+            return music_send_error(fd, 429, "music job history is full; retry shortly");
+        }
+
+        music_job *j = &srv->mbook.jobs[idx];
+        if (j->thread_started) {
+            int jr = pthread_join(j->thread, NULL);
+            if (jr != 0)
+                CWICK_INFO("music", "job %s worker join failed: %d", j->id, jr);
+        }
+        pthread_mutex_lock(&srv->mbook.lock);
+        music_job_free_contents(j);
+        memset(j, 0, sizeof(*j));
+        char idbuf[64];
+        uint64_t seq = ++srv->mbook.next_seq;
+        snprintf(idbuf, sizeof(idbuf), "music_%llu_%llu",
+                 (unsigned long long)rid, (unsigned long long)seq);
+        snprintf(j->id, sizeof(j->id), "%s", idbuf);
+        j->used = true;
+        j->request_id = rid;
+        j->prompt = prompt_copy;
+        j->lyrics = lyrics_copy;
+        j->title = title_copy;
+        j->style = style_copy;
+        j->task = task;
+        j->seconds = (int)duration;
+        j->seed = (uint64_t)seed_d;
+        j->steps = (int)steps_d;
+        j->cfg_scale = (float)cfg_d;
+        j->temperature = (float)temperature_d;
+        j->top_k = (int)topk_d;
+        j->audio_weight = (float)audio_weight_d;
+        j->instrumental = instrumental;
+        j->custom_mode = custom_mode;
+        j->reference_audio = reference;
+        j->reference_len = reference_len;
+        snprintf(j->status, sizeof(j->status), "queued");
+        snprintf(j->phase, sizeof(j->phase), "queued");
+        j->created = (int64_t)time(NULL);
+        atomic_init(&j->cancel, 0);
+        music_lyric_stats lyric_stats;
+        music_lyric_stats_measure(j->lyrics, j->seconds, &lyric_stats);
+        bool dense_lyrics = !j->instrumental &&
+                            lyric_stats.units_per_second > MUSIC_LYRIC_MAX_RATE;
+        if (dense_lyrics)
+            CWICK_INFO("music", "%s dense lyrics: %lld sung units in %d s (%.2f/s); "
+                               "the vocal model may rush or lose phrasing",
+                       req_tag(rid), (long long)lyric_stats.units, j->seconds,
+                       lyric_stats.units_per_second);
+
+        music_cb_ctx *cb = (music_cb_ctx *)calloc(1, sizeof(*cb));
+        if (!cb) {
+            music_job_free_contents(j);
+            memset(j, 0, sizeof(*j));
+            pthread_mutex_unlock(&srv->mbook.lock);
+            pthread_mutex_lock(&srv->gen_lock);
+            if (srv->music_busy > 0) srv->music_busy--;
+            pthread_cond_broadcast(&srv->gen_cv);
+            pthread_mutex_unlock(&srv->gen_lock);
+            pthread_mutex_unlock(&srv->music_start_lock);
+            return music_send_error(fd, 500, "out of memory accepting music job");
+        }
+        cb->srv = srv;
+        cb->idx = idx;
+        cb->rid = rid;
+        int trc = pthread_create(&j->thread, NULL, music_worker, cb);
+        if (trc != 0) {
+            free(cb);
+            music_job_free_contents(j);
+            memset(j, 0, sizeof(*j));
+            pthread_mutex_unlock(&srv->mbook.lock);
+            pthread_mutex_lock(&srv->gen_lock);
+            if (srv->music_busy > 0) srv->music_busy--;
+            pthread_cond_broadcast(&srv->gen_cv);
+            pthread_mutex_unlock(&srv->gen_lock);
+            pthread_mutex_unlock(&srv->music_start_lock);
+            return music_send_error(fd, 500, "cannot start music worker");
+        }
+        j->thread_started = true;
+        srv->mbook.workers++;
+        char *job_json = music_job_json(j, false);
+        char *response = music_envelope_json(job_json, j->id);
+        free(job_json);
+        cwick_metrics_music_accept(task == MUSIC_TASK_COVER, instrumental);
+        if (dense_lyrics) cwick_metrics_music_dense_lyrics();
+        CWICK_INFO("music", "%s accepted job %s task=%s mode=%s seconds=%d steps=%d "
+                              "caption_bytes=%zu lyric_bytes=%zu lyric_units=%lld "
+                              "lyric_rate=%.2f/s dense=%s sung_text=%s seed=%llu cfg=%.3g",
+                   req_tag(rid), j->id,
+                   task == MUSIC_TASK_COVER ? "cover" : "generate",
+                   instrumental ? "instrumental" : "vocal",
+                   j->seconds, j->steps, strlen(j->prompt), strlen(j->lyrics),
+                   (long long)lyric_stats.units, lyric_stats.units_per_second,
+                   dense_lyrics ? "yes" : "no",
+                   music_has_sung_text(j->lyrics) ? "yes" : "no",
+                   (unsigned long long)j->seed, j->cfg_scale);
+        pthread_mutex_unlock(&srv->mbook.lock);
+        pthread_mutex_unlock(&srv->music_start_lock);
+        http_response(fd, 200, "OK", "application/json; charset=utf-8",
+                      response ? response : "{}", false);
+        free(response);
+        return 200;
+    }
+
+    char id[96];
+    size_t idlen = 0;
+    bool content = false;
+    while (idpart[idlen] && idpart[idlen] != '/' && idlen + 1 < sizeof(id)) {
+        id[idlen] = idpart[idlen];
+        idlen++;
+    }
+    id[idlen] = '\0';
+    if (idpart[idlen] == '/') content = strcmp(idpart + idlen, "/content") == 0;
+    if (!idlen || (idpart[idlen] && !content))
+        return music_send_error(fd, 404, "music job not found");
+    if (strcmp(req->method, "GET") != 0)
+        return music_send_error(fd, 405, "method not allowed");
+
+    int idx = -1;
+    pthread_mutex_lock(&srv->mbook.lock);
+    for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+        music_job *j = &srv->mbook.jobs[i];
+        if (j->used && strcmp(j->id, id) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        pthread_mutex_unlock(&srv->mbook.lock);
+        return music_send_error(fd, 404, "music job not found");
+    }
+    music_job *j = &srv->mbook.jobs[idx];
+    if (content) {
+        if (strcmp(j->status, "completed") != 0 || !j->wav || !j->wav_len) {
+            const char *why = strcmp(j->status, "failed") == 0 ? j->error
+                            : (strcmp(j->status, "cancelled") == 0 ? j->error
+                            : "music output is not ready");
+            char msg[384];
+            snprintf(msg, sizeof(msg), "%s", why && *why ? why : "music output is not ready");
+            pthread_mutex_unlock(&srv->mbook.lock);
+            return music_send_error(fd, 409, msg);
+        }
+        unsigned char *copy = (unsigned char *)malloc(j->wav_len);
+        size_t len = j->wav_len;
+        if (copy) memcpy(copy, j->wav, len);
+        pthread_mutex_unlock(&srv->mbook.lock);
+        if (!copy)
+            return music_send_error(fd, 500, "out of memory reading music output");
+        http_response_bytes(fd, 200, "OK", "audio/wav", copy, len);
+        free(copy);
+        return 200;
+    }
+    char *job_json = music_job_json(j, true);
+    char *body = record_generation ? music_envelope_json(job_json, j->id) : job_json;
+    if (record_generation) free(job_json);
+    pthread_mutex_unlock(&srv->mbook.lock);
+    http_response(fd, 200, "OK", "application/json; charset=utf-8",
+                  body ? body : "{}", false);
+    free(body);
+    return 200;
+}
+
 static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
     cwick_error err;
     cwick_error_clear(&err);
@@ -9124,7 +10456,8 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         close(fd);
         return;
     }
-    size_t request_cap = (size_t)srv->max_request_bytes + 4096u;
+    size_t request_max = (size_t)srv->max_request_bytes + 4096u;
+    size_t request_cap = 64u * 1024u;
     char *rbuf = cwick_xmalloc(request_cap);
     http_req req;
     memset(&req, 0, sizeof(req));
@@ -9158,7 +10491,7 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         return; \
     } while (0)
 
-    if (read_http_request(fd, rbuf, request_cap, &req, &err) != 0) {
+    if (read_http_request(fd, &rbuf, &request_cap, request_max, &req, &err) != 0) {
         /* A body over the configured cap is not a malformed request: it is a
          * request this server will not read, and the reference protocols say
          * 413 for that (a client retrying the same body gets the same 400
@@ -9368,6 +10701,17 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
         }
     }
 
+    /* MiniMax-Music3 generation routes: async job creation, polling, and WAV
+     * content retrieval. They are independent of the resident text engine and
+     * lazily open through the same one-model switch gate as video. */
+    {
+        int code = srv_music_route(srv, fd, &req, ponly, rid);
+        if (code >= 0) {
+            snprintf(detail, sizeof(detail), "music route -> %d", code);
+            DONE(code);
+        }
+    }
+
     /* Every local model this instance knows about. The resident one is first
      * (what an OpenAI client reading data[0] expects); each entry carries the
      * cwick extras — where its weights are and whether it is the one loaded —
@@ -9515,6 +10859,24 @@ static void handle_client(server_ctx *srv, int fd, uint64_t rid) {
                           "application/json; charset=utf-8", body, false);
             snprintf(detail, sizeof(detail), "video model switch -> %d", vst);
             DONE(vst);
+        }
+
+        if (strcmp(wanted, MUSIC_SERVED_ID) == 0) {
+            char msg[512];
+            bool already = false;
+            int mst = srv_switch_music(srv, msg, sizeof(msg), &already, false);
+            char *jmsg = json_str_alloc(msg);
+            char body[1024];
+            snprintf(body, sizeof(body),
+                     "{\"status\":%s,\"model\":\"%s\",\"detail\":%s}",
+                     mst != 200 ? "\"error\"" :
+                       (already ? "\"already_resident\"" : "\"switched\""),
+                     MUSIC_SERVED_ID, jmsg ? jmsg : "\"\"");
+            free(jmsg);
+            http_response(fd, mst, status_text_for(mst),
+                          "application/json; charset=utf-8", body, false);
+            snprintf(detail, sizeof(detail), "music model switch -> %d", mst);
+            DONE(mst);
         }
 
         const cwick_model_entry *target = NULL;
@@ -10377,6 +11739,15 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
         }
     }
     {
+        const char *dir = (opt && opt->music_dir && *opt->music_dir)
+                        ? opt->music_dir : getenv("CWICK_MUSIC_MODEL");
+        if (dir && *dir) {
+            snprintf(srv.music_dir, sizeof(srv.music_dir), "%s", dir);
+            CWICK_INFO("init", "music %s registered: POST /v1/generate loads it "
+                       "on first use (one model at a time)", dir);
+        }
+    }
+    {
         /* A speech checkpoint is a resident model of its own: thinker + ear +
          * talker, no text engine. Opened here so the metrics registry and the
          * catalog below can name it. */
@@ -10452,6 +11823,8 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     cwick_status terminal = CWICK_OK;
     pthread_mutex_init(&srv.gen_lock, NULL);
     pthread_mutex_init(&srv.vbook.lock, NULL);
+    pthread_mutex_init(&srv.mbook.lock, NULL);
+    pthread_mutex_init(&srv.music_start_lock, NULL);
     pthread_mutex_init(&srv.pfx_mtx, NULL);
     pthread_mutex_init(&srv.client_mtx, NULL);
     pthread_cond_init(&srv.client_cv, NULL);
@@ -10578,6 +11951,13 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
             const char *ep = getenv("CWICK_HUB_ENDPOINT");
             if (!ep || !*ep) ep = getenv("HF_ENDPOINT");
             srv.hub = cwick_hub_open("./models", ep);
+        }
+        /* A downloaded music pipeline has no config.json for the text scanner.
+         * Resolve its fixed served id once so /v1/models and /v1/config advertise
+         * it even before the first lazy open; the weights remain unloaded. */
+        if (!srv.music_dir[0]) {
+            char music_msg[256];
+            (void)srv_discover_music_dir(&srv, music_msg, sizeof(music_msg));
         }
         if (srv.hub && srv.models_dirs_n < 8) {
             bool have = false;
@@ -10829,7 +12209,7 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     }
     CWICK_INFO("init", "endpoints: GET /v1/models, POST /v1/completions, "
               "POST /v1/chat/completions, POST /v1/responses, "
-              "POST /v1/messages, GET /metrics%s  "
+              "POST /v1/messages, POST /v1/generate, GET /metrics%s  "
               "(press Ctrl+C to stop)", srv.trace ? " [trace on]" : "");
     /* The control surface the built-in UI is built on, for anyone driving it
      * from curl instead: without this line the only way to discover that the
@@ -10981,6 +12361,45 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
     cwick_metrics_log_summary("metrics");
     close(fd);
     if (srv.wake_w >= 0) { close(srv.wake_w); close(srv.wake_r); }
+    /* Stop music acceptance before tearing down the model. Every worker is
+     * joinable (never detached), gets its cancellation flag set, and is joined
+     * before either its job buffers or the resident model can be freed. Holding
+     * music_start_lock closes the race with a connection thread that validated
+     * a request just before shutdown and was waiting to reserve the model. */
+    pthread_mutex_lock(&srv.music_start_lock);
+    pthread_mutex_lock(&srv.mbook.lock);
+    srv.mbook.shutting_down = true;
+    for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+        music_job *j = &srv.mbook.jobs[i];
+        if (j->used && j->thread_started)
+            atomic_store_explicit(&j->cancel, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&srv.mbook.lock);
+    for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+        music_job *j = &srv.mbook.jobs[i];
+        if (!j->thread_started) continue;
+        int jr = pthread_join(j->thread, NULL);
+        if (jr != 0)
+            CWICK_INFO("music", "shutdown join for job %s failed: %d", j->id, jr);
+        j->thread_started = false;
+    }
+    pthread_mutex_lock(&srv.mbook.lock);
+    for (int i = 0; i < CWICK_MUSIC_JOBS; i++) {
+        music_job_free_contents(&srv.mbook.jobs[i]);
+        srv.mbook.jobs[i].used = false;
+    }
+    srv.mbook.workers = 0;
+    pthread_mutex_unlock(&srv.mbook.lock);
+    pthread_mutex_unlock(&srv.music_start_lock);
+
+    /* A control-plane switch does not use music_start_lock. If its client was
+     * among the timed-out drains, let the already-started open/close finish
+     * before touching the resident pointers. New switches see stop_owner. */
+    pthread_mutex_lock(&srv.gen_lock);
+    while (srv.swapping)
+        pthread_cond_wait(&srv.gen_cv, &srv.gen_lock);
+    pthread_mutex_unlock(&srv.gen_lock);
+
     /* Not `tok`: that is the *startup* tokenizer, and a runtime model switch
      * already freed it before loading the new one into srv.tok. Freeing the
      * local here is a double free — it segfaults on every Ctrl+C that follows
@@ -10988,7 +12407,10 @@ cwick_status cwick_server_run(cwick_engine *eng, const cwick_server_options *opt
      * is resident, once. */
     if (srv.h3) { h3_model_close(srv.h3); srv.h3 = NULL; }
     if (srv.rt) { rt_realtime_close(srv.rt); srv.rt = NULL; }
+    if (srv.music) { music_model_close(srv.music); srv.music = NULL; }
     if (srv.tok) { cwick_tokenizer_free(srv.tok); srv.tok = NULL; }
+    pthread_mutex_destroy(&srv.mbook.lock);
+    pthread_mutex_destroy(&srv.music_start_lock);
     pthread_mutex_destroy(&srv.gen_lock); pthread_mutex_destroy(&srv.pfx_mtx);
     pthread_cond_destroy(&srv.gen_cv);
     pthread_mutex_destroy(&srv.client_mtx);

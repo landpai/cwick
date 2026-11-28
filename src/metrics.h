@@ -35,6 +35,7 @@
 #include <stdint.h>
 
 #include "cwick.h"
+#include "music.h"
 
 /* ------------------------------------------------------------------ */
 /* Static configuration (published as an info metric)                  */
@@ -208,6 +209,28 @@ void cwick_metrics_video_start(int steps_done, int steps_total);
 void cwick_metrics_video_step(int steps_done, int steps_total);
 /* Every job that reached the muxer, successful or not. */
 void cwick_metrics_video_observe(const cwick_video_job_metrics *m);
+
+/* ------------------------------------------------------------------ */
+/* Music generation jobs                                               */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    CWICK_MUSIC_SUCCEEDED = 0,
+    CWICK_MUSIC_FAILED = 1,
+    CWICK_MUSIC_CANCELLED = 2,
+} cwick_music_outcome;
+
+/* Count a fully validated job when the API accepts it. `cover` labels the
+ * task counter and `instrumental` labels the vocal-mode counter; acceptance
+ * happens before lazy model loading. */
+void cwick_metrics_music_accept(bool cover, bool instrumental);
+void cwick_metrics_music_dense_lyrics(void);
+/* Live phase/steps. Phase names are the MUSIC_PHASE_* constants from music.h. */
+void cwick_metrics_music_progress(const char *phase, int64_t done, int64_t total,
+                                  double frac);
+/* Every accepted job calls this exactly once. The engine's music_timing is the
+ * single source for stage/total/output metrics, just as it is for JSON/logs. */
+void cwick_metrics_music_observe(const music_timing *tim,
+                                 cwick_music_outcome outcome);
 
 /* ------------------------------------------------------------------ */
 /* Exposition                                                          */
